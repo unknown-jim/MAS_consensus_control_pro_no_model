@@ -1,5 +1,5 @@
 """
-训练脚本 - 速度优化版
+训练脚本 - 修复版
 """
 import torch
 import time
@@ -9,7 +9,7 @@ from config import (
     NUM_EPISODES, VIS_INTERVAL, SAVE_MODEL_PATH, 
     print_config, set_seed, SEED,
     NUM_PARALLEL_ENVS, UPDATE_FREQUENCY, GRADIENT_STEPS,
-    USE_AMP
+    USE_AMP, DEVICE
 )
 from topology import DirectedSpanningTreeTopology
 from environment import BatchedLeaderFollowerEnv, LeaderFollowerMASEnv
@@ -26,7 +26,7 @@ torch.backends.cudnn.allow_tf32 = True
 
 def train(num_episodes=NUM_EPISODES, vis_interval=VIS_INTERVAL, 
           show_dashboard=True, seed=SEED):
-    """速度优化训练"""
+    """速度优化训练 - 修复版"""
     set_seed(seed)
     print_config()
     
@@ -59,12 +59,16 @@ def train(num_episodes=NUM_EPISODES, vis_interval=VIS_INTERVAL,
         for step in range(MAX_STEPS):
             global_step += NUM_PARALLEL_ENVS
             
+            # 🔧 更新 Episode 进度条
+            if dashboard and step % 10 == 0:  # 每10步更新一次，避免太频繁
+                dashboard.update_step(step, MAX_STEPS)
+            
             actions = agent.select_action(states, deterministic=False)
             next_states, rewards, dones, infos = batched_env.step(actions)
             
             agent.store_transitions_batch(states, actions, rewards, next_states, dones)
             
-            # 关键：减少更新频率
+            # 减少更新频率
             if step % UPDATE_FREQUENCY == 0 and step > 0:
                 agent.update(BATCH_SIZE, GRADIENT_STEPS)
             
@@ -113,9 +117,6 @@ def train(num_episodes=NUM_EPISODES, vis_interval=VIS_INTERVAL,
     
     return agent, topology, dashboard
 
-
-# 需要导入 DEVICE
-from config import DEVICE
 
 if __name__ == '__main__':
     agent, topology, _ = train(show_dashboard=False)

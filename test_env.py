@@ -1,0 +1,121 @@
+"""测试修复后的环境 - 更新判断标准"""
+import torch
+from topology import DirectedSpanningTreeTopology
+from environment import LeaderFollowerMASEnv, BatchedLeaderFollowerEnv
+from config import NUM_FOLLOWERS, MAX_STEPS, DEVICE
+
+def test_zero_control():
+    """测试零调整控制下系统是否稳定"""
+    topology = DirectedSpanningTreeTopology(NUM_FOLLOWERS)
+    env = LeaderFollowerMASEnv(topology)
+    
+    state = env.reset()
+    errors = []
+    
+    for step in range(MAX_STEPS):
+        action = torch.zeros(env.num_followers, 2, device=DEVICE)
+        action[:, 1] = 0.15  # 中等阈值
+        state, reward, done, info = env.step(action)
+        errors.append(info['tracking_error'])
+    
+    init_err = errors[0]
+    final_err = errors[-1]
+    max_err = max(errors)
+    avg_err = sum(errors) / len(errors)
+    
+    print(f"零调整控制:")
+    print(f"  初始误差: {init_err:.4f}")
+    print(f"  最终误差: {final_err:.4f}")
+    print(f"  最大误差: {max_err:.4f}")
+    print(f"  平均误差: {avg_err:.4f}")
+    
+    # 更新的判断标准：最终误差 < 1.0 且没有发散
+    stable = final_err < 1.0 and max_err < 5.0
+    print(f"系统是否稳定: {'是 ✅' if stable else '否 ⚠️'}")
+    return stable
+
+def test_optimal_threshold():
+    """寻找最优阈值"""
+    topology = DirectedSpanningTreeTopology(NUM_FOLLOWERS)
+    
+    print("\n寻找最优阈值:")
+    print("-" * 60)
+    
+    best_threshold = None
+    best_score = float('inf')
+    
+    for threshold in [0.05, 0.08, 0.10, 0.12, 0.15, 0.18, 0.20, 0.25]:
+        env = LeaderFollowerMASEnv(topology)
+        state = env.reset()
+        
+        total_comm = 0
+        errors = []
+        
+        for step in range(MAX_STEPS):
+            action = torch.zeros(env.num_followers, 2, device=DEVICE)
+            action[:, 1] = threshold
+            state, reward, done, info = env.step(action)
+            total_comm += info['comm_rate']
+            errors.append(info['tracking_error'])
+        
+        avg_comm = total_comm / MAX_STEPS
+        avg_err = sum(errors) / len(errors)
+        final_err = errors[-1]
+        
+        # 综合评分 = 误差 + 通信惩罚
+        score = avg_err + avg_comm * 0.5
+        
+        marker = ""
+        if score < best_score:
+            best_score = score
+            best_threshold = threshold
+            marker = " ← Best"
+        
+        print(f"阈值={threshold:.2f} | 平均误差={avg_err:.4f} | 最终误差={final_err:.4f} | "
+              f"通信率={avg_comm*100:.1f}% | Score={score:.4f}{marker}")
+    
+    print(f"\n最优阈值: {best_threshold:.2f}")
+    return best_threshold
+
+def test_trajectory_tracking():
+    """测试轨迹跟踪效果"""
+    topology = DirectedSpanningTreeTopology(NUM_FOLLOWERS)
+    env = LeaderFollowerMASEnv(topology)
+    
+    state = env.reset()
+    
+    leader_pos = []
+    avg_follower_pos = []
+    
+    for step in range(MAX_STEPS):
+        action = torch.zeros(env.num_followers, 2, device=DEVICE)
+        action[:, 1] = 0.15
+        state, reward, done, info = env.step(action)
+        
+        leader_pos.append(env.positions[0].item())
+        avg_follower_pos.append(env.positions[1:].mean().item())
+    
+    # 计算相关系数
+    import numpy as np
+    correlation = np.corrcoef(leader_pos, avg_follower_pos)[0, 1]
+    
+    print(f"\n轨迹跟踪效果:")
+    print(f"  领导者-跟随者相关系数: {correlation:.4f}")
+    print(f"  跟踪质量: {'优秀 ✅' if correlation > 0.95 else '良好 ✓' if correlation > 0.8 else '需改进 ⚠️'}")
+
+if __name__ == '__main__':
+    print("=" * 60)
+    print("环境稳定性测试 (更新版)")
+    print("=" * 60)
+    
+    stable = test_zero_control()
+    best_th = test_optimal_threshold()
+    test_trajectory_tracking()
+    
+    print("\n" + "=" * 60)
+    if stable:
+        print("✅ 环境稳定，可以开始训练！")
+        print(f"   建议初始阈值范围: [{best_th-0.05:.2f}, {best_th+0.05:.2f}]")
+    else:
+        print("⚠️ 需要进一步调整增益参数")
+    print("=" * 60)

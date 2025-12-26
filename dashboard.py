@@ -1,11 +1,13 @@
 """
-训练可视化仪表盘
+训练可视化仪表盘 - 修复版
 """
 import time
 import numpy as np
 
 try:
     import matplotlib.pyplot as plt
+    import matplotlib
+    matplotlib.rcParams['figure.max_open_warning'] = 50
     HAS_MATPLOTLIB = True
 except ImportError:
     HAS_MATPLOTLIB = False
@@ -19,7 +21,7 @@ except ImportError:
 
 
 class TrainingDashboard:
-    """训练仪表盘"""
+    """训练仪表盘 - 修复版"""
     
     def __init__(self, total_episodes, vis_interval=10):
         self.total_episodes = total_episodes
@@ -65,7 +67,7 @@ class TrainingDashboard:
         self.stats_html = widgets.HTML(value="")
         self.plot_output = widgets.Output()
         self.log_output = widgets.Output(layout=widgets.Layout(
-            height='120px', overflow='auto', border='1px solid #ddd', padding='10px'
+            height='150px', overflow='auto', border='1px solid #ddd', padding='10px'
         ))
     
     def _format_time(self, seconds):
@@ -92,8 +94,7 @@ class TrainingDashboard:
     
     def _generate_stats_html(self, episode, reward, tracking_err, comm, best, losses, elapsed):
         """生成统计信息 HTML"""
-        # 根据数值选择颜色
-        r_color = "#48bb78" if reward > -5 else "#f56565" if reward < -15 else "#ed8936"
+        r_color = "#48bb78" if reward > -500 else "#f56565" if reward < -1500 else "#ed8936"
         e_color = "#48bb78" if tracking_err < 0.5 else "#f56565" if tracking_err > 2 else "#ed8936"
         c_color = "#48bb78" if comm < 0.3 else "#f56565" if comm > 0.6 else "#ed8936"
         
@@ -191,83 +192,153 @@ class TrainingDashboard:
                 print(f"Ep {episode:4d} | R:{reward:7.2f} | Err:{tracking_err:.4f} | Comm:{comm*100:.1f}%")
     
     def _update_plots(self):
-        """更新训练图表"""
+        """更新训练图表 - 修复版"""
         if not HAS_MATPLOTLIB:
             return
-            
+        
         with self.plot_output:
             clear_output(wait=True)
-            fig, axes = plt.subplots(2, 2, figsize=(12, 8))
             
-            # 子图 1: 位置跟踪
+            # 🔧 使用 constrained_layout 替代 tight_layout
+            fig, axes = plt.subplots(2, 2, figsize=(14, 10), constrained_layout=True)
+            
+            # 颜色定义
+            leader_color = '#e74c3c'
+            raw_color = '#95a5a6'
+            smooth_color = '#11998e'
+            error_color = '#f39c12'
+            comm_color = '#e74c3c'
+            
+            # ========== 子图 1: 位置跟踪 ==========
             ax1 = axes[0, 0]
             if self.best_trajectory is not None:
                 t = self.best_trajectory['times']
-                ax1.plot(t, self.best_trajectory['leader_pos'], 'r-', lw=2, label='Leader')
                 fp = self.best_trajectory['follower_pos']
-                colors = plt.cm.Blues(np.linspace(0.3, 0.9, fp.shape[1]))
-                for i in range(min(5, fp.shape[1])):
-                    ax1.plot(t, fp[:, i], color=colors[i], alpha=0.7, lw=1)
-            ax1.set_title(f'Position Tracking (Best R={self.best_reward:.2f})')
-            ax1.set_xlabel('Time (s)')
-            ax1.set_ylabel('Position')
-            ax1.legend(loc='upper right')
+                lp = self.best_trajectory['leader_pos']
+                num_followers = fp.shape[1]
+                
+                # 绘制 followers
+                colors = plt.cm.Blues(np.linspace(0.4, 0.9, num_followers))
+                for i in range(num_followers):
+                    label = 'Followers' if i == 0 else None
+                    ax1.plot(t, fp[:, i], color=colors[i], alpha=0.6, lw=1.0, label=label)
+                
+                # 绘制 leader
+                ax1.plot(t, lp, color=leader_color, lw=2.5, label='Leader', zorder=10)
+                
+                # 绘制平均 follower
+                avg_fp = fp.mean(axis=1)
+                ax1.plot(t, avg_fp, color='#2ecc71', lw=2, linestyle='--', 
+                        label='Avg Follower', alpha=0.8, zorder=9)
+            
+            ax1.set_title(f'Position Tracking (Best R={self.best_reward:.2f})', fontsize=12, fontweight='bold')
+            ax1.set_xlabel('Time (s)', fontsize=10)
+            ax1.set_ylabel('Position', fontsize=10)
+            ax1.legend(loc='upper right', fontsize=9)
             ax1.grid(True, alpha=0.3)
             
-            # 子图 2: 速度跟踪
+            # ========== 子图 2: 速度跟踪 ==========
             ax2 = axes[0, 1]
             if self.best_trajectory is not None:
-                ax2.plot(t, self.best_trajectory['leader_vel'], 'r-', lw=2, label='Leader')
+                t = self.best_trajectory['times']
                 fv = self.best_trajectory['follower_vel']
-                for i in range(min(5, fv.shape[1])):
-                    ax2.plot(t, fv[:, i], color=colors[i], alpha=0.7, lw=1)
-            ax2.set_title('Velocity Tracking')
-            ax2.set_xlabel('Time (s)')
-            ax2.set_ylabel('Velocity')
+                lv = self.best_trajectory['leader_vel']
+                num_followers = fv.shape[1]
+                
+                colors = plt.cm.Blues(np.linspace(0.4, 0.9, num_followers))
+                for i in range(num_followers):
+                    label = 'Followers' if i == 0 else None
+                    ax2.plot(t, fv[:, i], color=colors[i], alpha=0.6, lw=1.0, label=label)
+                
+                ax2.plot(t, lv, color=leader_color, lw=2.5, label='Leader', zorder=10)
+                
+                avg_fv = fv.mean(axis=1)
+                ax2.plot(t, avg_fv, color='#2ecc71', lw=2, linestyle='--', 
+                        label='Avg Follower', alpha=0.8, zorder=9)
+            
+            ax2.set_title('Velocity Tracking', fontsize=12, fontweight='bold')
+            ax2.set_xlabel('Time (s)', fontsize=10)
+            ax2.set_ylabel('Velocity', fontsize=10)
+            ax2.legend(loc='upper right', fontsize=9)
             ax2.grid(True, alpha=0.3)
             
-            # 子图 3: 奖励曲线
+            # ========== 子图 3: 奖励曲线 ==========
             ax3 = axes[1, 0]
-            eps = list(range(1, len(self.reward_history) + 1))
-            ax3.plot(eps, self.reward_history, color='#11998e', alpha=0.3, lw=1)
-            if len(self.reward_history) > 10:
-                w = min(20, len(self.reward_history))
-                sm = np.convolve(self.reward_history, np.ones(w)/w, mode='valid')
-                ax3.plot(range(w, len(self.reward_history)+1), sm, color='#11998e', lw=2, label='Smoothed')
-            ax3.set_title('Episode Reward')
-            ax3.set_xlabel('Episode')
-            ax3.set_ylabel('Reward')
+            num_eps = len(self.reward_history)
+            
+            if num_eps > 0:
+                eps = np.arange(1, num_eps + 1)
+                
+                # 绘制原始奖励
+                ax3.plot(eps, self.reward_history, color=raw_color, alpha=0.5, lw=1, 
+                        label='Raw Reward')
+                
+                # 绘制平滑奖励
+                if num_eps >= 10:
+                    w = min(20, num_eps // 2)
+                    if w >= 2:
+                        sm = np.convolve(self.reward_history, np.ones(w)/w, mode='valid')
+                        sm_eps = np.arange(w, num_eps + 1)
+                        ax3.plot(sm_eps, sm, color=smooth_color, lw=2.5, label=f'Smoothed (w={w})')
+                
+                # 标记最佳
+                best_idx = np.argmax(self.reward_history)
+                ax3.scatter([best_idx + 1], [self.reward_history[best_idx]], 
+                           color='gold', s=150, marker='*', zorder=15,
+                           edgecolors='black', linewidths=0.5, label=f'Best: {self.best_reward:.2f}')
+                
+                # 🔧 修复 x 轴刻度
+                ax3.set_xlim(0, max(num_eps + 1, 10))
+                ax3.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
+            
+            ax3.set_title('Episode Reward', fontsize=12, fontweight='bold')
+            ax3.set_xlabel('Episode', fontsize=10)
+            ax3.set_ylabel('Reward', fontsize=10)
+            ax3.legend(loc='best', fontsize=9)
             ax3.grid(True, alpha=0.3)
-            ax3.legend()
             
             # 添加通信率副轴
-            ax3t = ax3.twinx()
-            ax3t.plot(eps, [c*100 for c in self.comm_history], 'r--', lw=1.5, alpha=0.7, label='Comm Rate')
-            ax3t.set_ylabel('Comm Rate (%)', color='r')
-            ax3t.set_ylim(0, 100)
-            ax3t.tick_params(axis='y', labelcolor='r')
+            if num_eps > 0:
+                ax3t = ax3.twinx()
+                ax3t.plot(eps, [c*100 for c in self.comm_history], color=comm_color, 
+                         linestyle=':', lw=1.5, alpha=0.7)
+                ax3t.set_ylabel('Comm Rate (%)', color=comm_color, fontsize=10)
+                ax3t.set_ylim(0, 100)
+                ax3t.tick_params(axis='y', labelcolor=comm_color)
             
-            # 子图 4: 跟踪误差
+            # ========== 子图 4: 跟踪误差 ==========
             ax4 = axes[1, 1]
-            ax4.plot(eps, self.tracking_error_history, color='#38ef7d', alpha=0.3, lw=1)
-            if len(self.tracking_error_history) > 10:
-                w = min(20, len(self.tracking_error_history))
-                sme = np.convolve(self.tracking_error_history, np.ones(w)/w, mode='valid')
-                ax4.plot(range(w, len(self.tracking_error_history)+1), sme, color='#38ef7d', lw=2, label='Smoothed')
-            ax4.set_title('Tracking Error')
-            ax4.set_xlabel('Episode')
-            ax4.set_ylabel('Error')
+            
+            if num_eps > 0:
+                eps = np.arange(1, num_eps + 1)
+                
+                ax4.plot(eps, self.tracking_error_history, color=error_color, alpha=0.5, lw=1, 
+                        label='Raw Error')
+                
+                if num_eps >= 10:
+                    w = min(20, num_eps // 2)
+                    if w >= 2:
+                        sme = np.convolve(self.tracking_error_history, np.ones(w)/w, mode='valid')
+                        sme_eps = np.arange(w, num_eps + 1)
+                        ax4.plot(sme_eps, sme, color='#38ef7d', lw=2.5, label=f'Smoothed (w={w})')
+                
+                # 标记最小误差
+                min_idx = np.argmin(self.tracking_error_history)
+                min_err = self.tracking_error_history[min_idx]
+                ax4.scatter([min_idx + 1], [min_err], 
+                           color='lime', s=150, marker='*', zorder=15,
+                           edgecolors='black', linewidths=0.5, label=f'Min: {min_err:.4f}')
+                
+                # 🔧 修复 x 轴刻度
+                ax4.set_xlim(0, max(num_eps + 1, 10))
+                ax4.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
+            
+            ax4.set_title('Tracking Error', fontsize=12, fontweight='bold')
+            ax4.set_xlabel('Episode', fontsize=10)
+            ax4.set_ylabel('Error', fontsize=10)
+            ax4.legend(loc='best', fontsize=9)
             ax4.grid(True, alpha=0.3)
-            ax4.legend()
             
-            # 使用对数刻度（如果误差范围较大）
-            if len(self.tracking_error_history) > 0:
-                max_err = max(self.tracking_error_history)
-                min_err = min(self.tracking_error_history) + 1e-8
-                if max_err / min_err > 10:
-                    ax4.set_yscale('log')
-            
-            plt.tight_layout()
             plt.show()
     
     def finish(self):
@@ -281,8 +352,10 @@ class TrainingDashboard:
                 print(f"✅ Training Complete!")
                 print(f"   Total Time: {self._format_time(elapsed)}")
                 print(f"   Best Reward: {self.best_reward:.2f}")
-                print(f"   Final Tracking Error: {self.tracking_error_history[-1]:.4f}")
-                print(f"   Final Comm Rate: {self.comm_history[-1]*100:.1f}%")
+                if self.tracking_error_history:
+                    print(f"   Final Tracking Error: {self.tracking_error_history[-1]:.4f}")
+                if self.comm_history:
+                    print(f"   Final Comm Rate: {self.comm_history[-1]*100:.1f}%")
                 print("=" * 50)
         else:
             print(f"\n✅ Training complete!")

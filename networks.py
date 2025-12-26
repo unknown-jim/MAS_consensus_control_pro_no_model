@@ -92,8 +92,8 @@ class GaussianActor(nn.Module):
             nn.Linear(hidden_dim // 2, 1)
         )
         
-        self.u_scale = 3.0
-        self.th_scale = 0.5
+        self.u_scale = 5.0
+        self.th_scale = 0.8
         
         # 数值稳定性常数
         self._eps = 1e-6

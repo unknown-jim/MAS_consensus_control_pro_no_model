@@ -40,7 +40,7 @@ ACTION_DIM = 2
 # ==========================================
 DT = 0.05
 MAX_STEPS = 300
-COMM_PENALTY = 0.03
+COMM_PENALTY = 0.1
 
 LEADER_AMPLITUDE = 2.0
 LEADER_OMEGA = 0.5
@@ -49,15 +49,15 @@ LEADER_PHASE = 0.0
 POS_LIMIT = 10.0
 VEL_LIMIT = 5.0
 
-REWARD_MIN = -20.0
-REWARD_MAX = 5.0
+REWARD_MIN = -10.0
+REWARD_MAX = 2.0
 USE_SOFT_REWARD_SCALING = True
 
 # ==========================================
 # SAC 超参数
 # ==========================================
 BUFFER_SIZE = 500000
-BATCH_SIZE = 2048           # 增大批量以提高GPU利用率
+BATCH_SIZE = 512           #
 GAMMA = 0.99
 TAU = 0.005
 LEARNING_RATE = 3e-4
@@ -73,9 +73,9 @@ NUM_EPISODES = 400
 VIS_INTERVAL = 20           # 减少可视化频率
 SAVE_MODEL_PATH = 'best_leader_follower_model.pth'
 
-NUM_PARALLEL_ENVS = 64      # 32 -> 64 ⬆️
-UPDATE_FREQUENCY = 32       # 8 -> 32  ⬆️ (关键！减少更新次数)
-GRADIENT_STEPS = 1          # 4 -> 1   ⬇️ (关键！每次只更新1步)
+NUM_PARALLEL_ENVS = 32
+UPDATE_FREQUENCY = 4
+GRADIENT_STEPS = 4   
 
 # 混合精度
 USE_AMP = True
