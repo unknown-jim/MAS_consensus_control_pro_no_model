@@ -13,6 +13,7 @@ except ImportError:
 from config import DEVICE, MAX_STEPS
 
 
+@torch.no_grad()
 def collect_trajectory(agent, env, max_steps=MAX_STEPS):
     """收集轨迹用于可视化"""
     state = env.reset()
@@ -42,6 +43,7 @@ def collect_trajectory(agent, env, max_steps=MAX_STEPS):
     }
 
 
+@torch.no_grad()
 def evaluate_agent(agent, env, num_episodes=5):
     """评估智能体性能"""
     results = {

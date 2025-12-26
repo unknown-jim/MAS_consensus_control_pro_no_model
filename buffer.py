@@ -1,68 +1,105 @@
 """
-经验回放缓冲区
+经验回放缓冲区 - GPU 优化版
 """
 import torch
-import random
-from collections import deque
-
-from config import DEVICE, BUFFER_SIZE
+from config import DEVICE, BUFFER_SIZE, STATE_DIM, ACTION_DIM, NUM_AGENTS
 
 
-class ReplayBuffer:
-    """Off-policy 经验回放缓冲区"""
+class OptimizedReplayBuffer:
+    """
+    GPU 预分配的高效经验回放缓冲区
     
-    def __init__(self, capacity=BUFFER_SIZE):
-        self.buffer = deque(maxlen=capacity)
-        self.device = DEVICE
+    支持批量存储和采样
+    """
+    
+    def __init__(self, capacity=BUFFER_SIZE, num_agents=NUM_AGENTS, 
+                 state_dim=STATE_DIM, action_dim=ACTION_DIM):
+        self.capacity = capacity
+        self.num_agents = num_agents
+        self.num_followers = num_agents - 1
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        
+        self.ptr = 0
+        self.size = 0
+        
+        # 预分配 GPU 内存
+        self.states = torch.zeros(capacity, num_agents, state_dim, device=DEVICE)
+        self.actions = torch.zeros(capacity, self.num_followers, action_dim, device=DEVICE)
+        self.rewards = torch.zeros(capacity, device=DEVICE)
+        self.next_states = torch.zeros(capacity, num_agents, state_dim, device=DEVICE)
+        self.dones = torch.zeros(capacity, device=DEVICE)
     
     def push(self, state, action, reward, next_state, done):
-        """存储一条经验
+        """存储单条经验"""
+        self.states[self.ptr] = state
+        self.actions[self.ptr] = action
+        self.rewards[self.ptr] = reward
+        self.next_states[self.ptr] = next_state
+        self.dones[self.ptr] = float(done)
+        
+        self.ptr = (self.ptr + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
+    
+    def push_batch(self, states, actions, rewards, next_states, dones):
+        """
+        批量存储经验
         
         Args:
-            state: 状态张量
-            action: 动作张量
-            reward: 奖励值 (float)
-            next_state: 下一状态张量
-            done: 是否终止 (bool or float)
+            states: (batch, num_agents, state_dim)
+            actions: (batch, num_followers, action_dim)
+            rewards: (batch,)
+            next_states: (batch, num_agents, state_dim)
+            dones: (batch,)
         """
-        # 确保数据在 CPU 上存储以节省 GPU 内存
-        if isinstance(state, torch.Tensor):
-            state = state.detach().cpu()
-        if isinstance(action, torch.Tensor):
-            action = action.detach().cpu()
-        if isinstance(next_state, torch.Tensor):
-            next_state = next_state.detach().cpu()
+        batch_size = states.shape[0]
         
-        self.buffer.append((state, action, reward, next_state, done))
+        # 计算存储位置
+        if self.ptr + batch_size <= self.capacity:
+            # 不需要环绕
+            idx = slice(self.ptr, self.ptr + batch_size)
+            self.states[idx] = states
+            self.actions[idx] = actions
+            self.rewards[idx] = rewards
+            self.next_states[idx] = next_states
+            self.dones[idx] = dones.float()
+        else:
+            # 需要环绕处理
+            first_part = self.capacity - self.ptr
+            second_part = batch_size - first_part
+            
+            self.states[self.ptr:] = states[:first_part]
+            self.states[:second_part] = states[first_part:]
+            
+            self.actions[self.ptr:] = actions[:first_part]
+            self.actions[:second_part] = actions[first_part:]
+            
+            self.rewards[self.ptr:] = rewards[:first_part]
+            self.rewards[:second_part] = rewards[first_part:]
+            
+            self.next_states[self.ptr:] = next_states[:first_part]
+            self.next_states[:second_part] = next_states[first_part:]
+            
+            self.dones[self.ptr:] = dones[:first_part].float()
+            self.dones[:second_part] = dones[first_part:].float()
+        
+        self.ptr = (self.ptr + batch_size) % self.capacity
+        self.size = min(self.size + batch_size, self.capacity)
     
     def sample(self, batch_size):
-        """随机采样一批经验
+        """随机采样"""
+        indices = torch.randint(0, self.size, (batch_size,), device=DEVICE)
         
-        Args:
-            batch_size: 批量大小
-            
-        Returns:
-            states, actions, rewards, next_states, dones (都在正确的设备上)
-        """
-        batch = random.sample(self.buffer, batch_size)
-        states, actions, rewards, next_states, dones = zip(*batch)
-        
-        # 确保所有数据都转移到正确的设备
         return (
-            torch.stack(states).to(self.device),
-            torch.stack(actions).to(self.device),
-            torch.tensor(rewards, dtype=torch.float32, device=self.device),
-            torch.stack(next_states).to(self.device),
-            torch.tensor(dones, dtype=torch.float32, device=self.device)
+            self.states[indices],
+            self.actions[indices],
+            self.rewards[indices],
+            self.next_states[indices],
+            self.dones[indices]
         )
     
     def __len__(self):
-        return len(self.buffer)
+        return self.size
     
     def is_ready(self, batch_size):
-        """检查缓冲区是否有足够的样本"""
-        return len(self.buffer) >= batch_size
-    
-    def clear(self):
-        """清空缓冲区"""
-        self.buffer.clear()
+        return self.size >= batch_size

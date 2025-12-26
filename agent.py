@@ -1,5 +1,5 @@
 """
-SAC 智能体
+SAC 智能体 - 优化版 (修复 PyG 兼容性)
 """
 import torch
 import torch.optim as optim
@@ -7,27 +7,23 @@ import torch.nn.functional as F
 import numpy as np
 
 from config import (
-    DEVICE, STATE_DIM, HIDDEN_DIM, ACTION_DIM,
+    DEVICE, STATE_DIM, HIDDEN_DIM, ACTION_DIM, NUM_AGENTS,
     LEARNING_RATE, ALPHA_LR, GAMMA, TAU, BATCH_SIZE,
-    INIT_ALPHA
+    INIT_ALPHA, GRADIENT_STEPS
 )
-from buffer import ReplayBuffer
+from buffer import OptimizedReplayBuffer
 from networks import GaussianActor, SoftQNetwork
 
 
 class SACAgent:
-    """Soft Actor-Critic 智能体"""
+    """Soft Actor-Critic 智能体 (PyG 兼容版)"""
     
-    def __init__(self, topology, auto_entropy=True):
-        """
-        Args:
-            topology: DirectedSpanningTreeTopology 对象
-            auto_entropy: 是否自动调整熵系数
-        """
+    def __init__(self, topology, auto_entropy=True, use_amp=True):
         self.topology = topology
         self.num_followers = topology.num_followers
         self.num_agents = topology.num_agents
         self.auto_entropy = auto_entropy
+        self.use_amp = use_amp and torch.cuda.is_available()
         
         # 网络初始化
         self.actor = GaussianActor(STATE_DIM, HIDDEN_DIM).to(DEVICE)
@@ -36,7 +32,6 @@ class SACAgent:
         self.q1_target = SoftQNetwork(STATE_DIM, HIDDEN_DIM).to(DEVICE)
         self.q2_target = SoftQNetwork(STATE_DIM, HIDDEN_DIM).to(DEVICE)
         
-        # 复制目标网络参数
         self.q1_target.load_state_dict(self.q1.state_dict())
         self.q2_target.load_state_dict(self.q2.state_dict())
         
@@ -46,8 +41,16 @@ class SACAgent:
         for param in self.q2_target.parameters():
             param.requires_grad = False
         
-        # 熵系数 (动态计算目标熵)
-        self.target_entropy = -float(ACTION_DIM)  # 动态设置，而非硬编码
+        # 混合精度训练
+        if self.use_amp:
+            from torch.cuda.amp import GradScaler
+            self.scaler = GradScaler()
+            print("🚀 AMP (混合精度训练) 已启用")
+        else:
+            self.scaler = None
+        
+        # 熵系数
+        self.target_entropy = -float(ACTION_DIM)
         self.log_alpha = torch.tensor(np.log(INIT_ALPHA), requires_grad=True, device=DEVICE)
         self.alpha = self.log_alpha.exp().item()
         
@@ -58,182 +61,204 @@ class SACAgent:
         self.alpha_optimizer = optim.Adam([self.log_alpha], lr=ALPHA_LR)
         
         # 经验回放
-        self.buffer = ReplayBuffer()
+        self.buffer = OptimizedReplayBuffer(num_agents=NUM_AGENTS)
         
-        # 角色 ID
+        # 预计算
         self.role_ids = torch.zeros(self.num_agents, dtype=torch.long, device=DEVICE)
         self.role_ids[1:] = 1
         
-        # 损失记录
-        self.last_losses = {'q1': 0, 'q2': 0, 'actor': 0, 'alpha': INIT_ALPHA}
+        # 缓存
+        self._edge_index_cache = {}
+        self._role_ids_cache = {}
         
-        # 更新计数器
+        self.last_losses = {'q1': 0, 'q2': 0, 'actor': 0, 'alpha': INIT_ALPHA}
         self.update_count = 0
     
+    def _get_batch_graph_data(self, batch_size):
+        """获取批量图数据 (缓存)"""
+        if batch_size not in self._edge_index_cache:
+            num_nodes = self.num_agents
+            edge_indices = [self.topology.edge_index + i * num_nodes for i in range(batch_size)]
+            self._edge_index_cache[batch_size] = torch.cat(edge_indices, dim=1)
+            self._role_ids_cache[batch_size] = self.role_ids.repeat(batch_size)
+        return self._edge_index_cache[batch_size], self._role_ids_cache[batch_size]
+    
+    @torch.no_grad()
     def select_action(self, state, deterministic=False):
-        """选择动作
+        """选择动作"""
+        is_batched = state.dim() == 3
         
-        Args:
-            state: 状态张量
-            deterministic: 是否使用确定性策略
+        if is_batched:
+            batch_size = state.shape[0]
+            flat_state = state.view(-1, STATE_DIM)
+            batch_edge_index, batch_role_ids = self._get_batch_graph_data(batch_size)
             
-        Returns:
-            action: 动作张量 (num_followers, action_dim)
-        """
-        with torch.no_grad():
-            action, _, _ = self.actor(
-                state,
-                self.topology.edge_index,
-                self.role_ids,
-                deterministic=deterministic
-            )
-        return action
-    
-    def store_transition(self, state, action, reward, next_state, done):
-        """存储经验
+            if self.use_amp:
+                with torch.cuda.amp.autocast():
+                    action, _, _ = self.actor(
+                        flat_state, batch_edge_index, batch_role_ids, deterministic=deterministic
+                    )
+            else:
+                action, _, _ = self.actor(
+                    flat_state, batch_edge_index, batch_role_ids, deterministic=deterministic
+                )
+            action = action.view(batch_size, self.num_followers, ACTION_DIM)
+        else:
+            if self.use_amp:
+                with torch.cuda.amp.autocast():
+                    action, _, _ = self.actor(
+                        state, self.topology.edge_index, self.role_ids, deterministic=deterministic
+                    )
+            else:
+                action, _, _ = self.actor(
+                    state, self.topology.edge_index, self.role_ids, deterministic=deterministic
+                )
         
-        Args:
-            state, action, next_state: 张量
-            reward: float
-            done: bool or float
-        """
-        self.buffer.push(state.clone(), action.clone(), reward, next_state.clone(), float(done))
+        return action.float()
     
-    def update(self, batch_size=BATCH_SIZE):
-        """更新网络
-        
-        Args:
-            batch_size: 批量大小
-            
-        Returns:
-            losses: 损失字典
-        """
+    def store_transitions_batch(self, states, actions, rewards, next_states, dones):
+        """批量存储"""
+        self.buffer.push_batch(states, actions, rewards, next_states, dones)
+    
+    def update(self, batch_size=BATCH_SIZE, gradient_steps=GRADIENT_STEPS):
+        """更新网络"""
         if not self.buffer.is_ready(batch_size):
             return {}
         
-        self.update_count += 1
+        total_q1_loss = 0
+        total_q2_loss = 0
+        total_actor_loss = 0
         
-        # 采样
-        states, actions, rewards, next_states, dones = self.buffer.sample(batch_size)
-        
-        batch_size_actual = states.shape[0]
-        
-        # 展平批量数据
-        flat_states = states.view(-1, STATE_DIM)
-        flat_next_states = next_states.view(-1, STATE_DIM)
-        flat_actions = actions.view(-1, ACTION_DIM)
-        
-        # 构建批量边索引和角色 ID
-        batch_edge_index = self._batch_edge_index(batch_size_actual)
-        batch_role_ids = self.role_ids.repeat(batch_size_actual)
-        
-        # ========== 更新 Critic ==========
-        with torch.no_grad():
-            next_actions, next_log_probs, _ = self.actor(
-                flat_next_states, batch_edge_index, batch_role_ids
-            )
+        for _ in range(gradient_steps):
+            self.update_count += 1
             
-            q1_next = self.q1_target(flat_next_states, batch_edge_index, batch_role_ids, next_actions)
-            q2_next = self.q2_target(flat_next_states, batch_edge_index, batch_role_ids, next_actions)
-            q_next = torch.min(q1_next, q2_next)
+            states, actions, rewards, next_states, dones = self.buffer.sample(batch_size)
             
-            # 聚合每个样本的 Q 值
-            q_next = q_next.view(batch_size_actual, self.num_followers).mean(dim=1, keepdim=True)
-            next_log_probs = next_log_probs.view(batch_size_actual, self.num_followers).mean(dim=1, keepdim=True)
+            flat_states = states.view(-1, STATE_DIM)
+            flat_next_states = next_states.view(-1, STATE_DIM)
+            flat_actions = actions.view(-1, ACTION_DIM)
             
-            # TD 目标
-            target_q = rewards.unsqueeze(1) + GAMMA * (1 - dones.unsqueeze(1)) * (q_next - self.alpha * next_log_probs)
-        
-        # 当前 Q 值
-        q1_curr = self.q1(flat_states, batch_edge_index, batch_role_ids, flat_actions)
-        q2_curr = self.q2(flat_states, batch_edge_index, batch_role_ids, flat_actions)
-        
-        q1_curr = q1_curr.view(batch_size_actual, self.num_followers).mean(dim=1, keepdim=True)
-        q2_curr = q2_curr.view(batch_size_actual, self.num_followers).mean(dim=1, keepdim=True)
-        
-        # Critic 损失
-        q1_loss = F.mse_loss(q1_curr, target_q)
-        q2_loss = F.mse_loss(q2_curr, target_q)
-        
-        # 更新 Q1
-        self.q1_optimizer.zero_grad()
-        q1_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.q1.parameters(), 1.0)
-        self.q1_optimizer.step()
-        
-        # 更新 Q2
-        self.q2_optimizer.zero_grad()
-        q2_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.q2.parameters(), 1.0)
-        self.q2_optimizer.step()
-        
-        # ========== 更新 Actor ==========
-        new_actions, log_probs, _ = self.actor(flat_states, batch_edge_index, batch_role_ids)
-        
-        q1_new = self.q1(flat_states, batch_edge_index, batch_role_ids, new_actions)
-        q2_new = self.q2(flat_states, batch_edge_index, batch_role_ids, new_actions)
-        q_new = torch.min(q1_new, q2_new)
-        
-        actor_loss = (self.alpha * log_probs - q_new).mean()
-        
-        self.actor_optimizer.zero_grad()
-        actor_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
-        self.actor_optimizer.step()
-        
-        # ========== 更新 Alpha (熵系数) ==========
-        if self.auto_entropy:
-            alpha_loss = -(self.log_alpha * (log_probs.detach() + self.target_entropy)).mean()
+            batch_edge_index, batch_role_ids = self._get_batch_graph_data(batch_size)
             
-            self.alpha_optimizer.zero_grad()
-            alpha_loss.backward()
-            self.alpha_optimizer.step()
+            # ========== Critic 更新 ==========
+            with torch.no_grad():
+                if self.use_amp:
+                    with torch.cuda.amp.autocast():
+                        next_actions, next_log_probs, _ = self.actor(
+                            flat_next_states, batch_edge_index, batch_role_ids
+                        )
+                        q1_next = self.q1_target(flat_next_states, batch_edge_index, batch_role_ids, next_actions)
+                        q2_next = self.q2_target(flat_next_states, batch_edge_index, batch_role_ids, next_actions)
+                else:
+                    next_actions, next_log_probs, _ = self.actor(
+                        flat_next_states, batch_edge_index, batch_role_ids
+                    )
+                    q1_next = self.q1_target(flat_next_states, batch_edge_index, batch_role_ids, next_actions)
+                    q2_next = self.q2_target(flat_next_states, batch_edge_index, batch_role_ids, next_actions)
+                
+                q_next = torch.min(q1_next, q2_next)
+                q_next = q_next.view(batch_size, self.num_followers).mean(dim=1, keepdim=True)
+                next_log_probs = next_log_probs.view(batch_size, self.num_followers).mean(dim=1, keepdim=True)
+                
+                target_q = rewards.unsqueeze(1) + GAMMA * (1 - dones.unsqueeze(1)) * (q_next - self.alpha * next_log_probs)
+                target_q = target_q.float()
             
-            self.alpha = self.log_alpha.exp().item()
-        else:
-            alpha_loss = torch.tensor(0.0)
+            # Q1 更新
+            self.q1_optimizer.zero_grad(set_to_none=True)
+            if self.use_amp:
+                with torch.cuda.amp.autocast():
+                    q1_curr = self.q1(flat_states, batch_edge_index, batch_role_ids, flat_actions)
+                    q1_curr = q1_curr.view(batch_size, self.num_followers).mean(dim=1, keepdim=True)
+                    q1_loss = F.mse_loss(q1_curr.float(), target_q)
+                self.scaler.scale(q1_loss).backward()
+                self.scaler.unscale_(self.q1_optimizer)
+                torch.nn.utils.clip_grad_norm_(self.q1.parameters(), 1.0)
+                self.scaler.step(self.q1_optimizer)
+            else:
+                q1_curr = self.q1(flat_states, batch_edge_index, batch_role_ids, flat_actions)
+                q1_curr = q1_curr.view(batch_size, self.num_followers).mean(dim=1, keepdim=True)
+                q1_loss = F.mse_loss(q1_curr, target_q)
+                q1_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.q1.parameters(), 1.0)
+                self.q1_optimizer.step()
+            
+            # Q2 更新
+            self.q2_optimizer.zero_grad(set_to_none=True)
+            if self.use_amp:
+                with torch.cuda.amp.autocast():
+                    q2_curr = self.q2(flat_states, batch_edge_index, batch_role_ids, flat_actions)
+                    q2_curr = q2_curr.view(batch_size, self.num_followers).mean(dim=1, keepdim=True)
+                    q2_loss = F.mse_loss(q2_curr.float(), target_q)
+                self.scaler.scale(q2_loss).backward()
+                self.scaler.unscale_(self.q2_optimizer)
+                torch.nn.utils.clip_grad_norm_(self.q2.parameters(), 1.0)
+                self.scaler.step(self.q2_optimizer)
+            else:
+                q2_curr = self.q2(flat_states, batch_edge_index, batch_role_ids, flat_actions)
+                q2_curr = q2_curr.view(batch_size, self.num_followers).mean(dim=1, keepdim=True)
+                q2_loss = F.mse_loss(q2_curr, target_q)
+                q2_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.q2.parameters(), 1.0)
+                self.q2_optimizer.step()
+            
+            # ========== Actor 更新 ==========
+            self.actor_optimizer.zero_grad(set_to_none=True)
+            if self.use_amp:
+                with torch.cuda.amp.autocast():
+                    new_actions, log_probs, _ = self.actor(flat_states, batch_edge_index, batch_role_ids)
+                    q1_new = self.q1(flat_states, batch_edge_index, batch_role_ids, new_actions)
+                    q2_new = self.q2(flat_states, batch_edge_index, batch_role_ids, new_actions)
+                    q_new = torch.min(q1_new, q2_new)
+                    actor_loss = (self.alpha * log_probs - q_new).mean()
+                self.scaler.scale(actor_loss).backward()
+                self.scaler.unscale_(self.actor_optimizer)
+                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
+                self.scaler.step(self.actor_optimizer)
+            else:
+                new_actions, log_probs, _ = self.actor(flat_states, batch_edge_index, batch_role_ids)
+                q1_new = self.q1(flat_states, batch_edge_index, batch_role_ids, new_actions)
+                q2_new = self.q2(flat_states, batch_edge_index, batch_role_ids, new_actions)
+                q_new = torch.min(q1_new, q2_new)
+                actor_loss = (self.alpha * log_probs - q_new).mean()
+                actor_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
+                self.actor_optimizer.step()
+            
+            # ========== Alpha 更新 ==========
+            if self.auto_entropy:
+                self.alpha_optimizer.zero_grad(set_to_none=True)
+                alpha_loss = -(self.log_alpha * (log_probs.detach() + self.target_entropy)).mean()
+                alpha_loss.backward()
+                self.alpha_optimizer.step()
+                self.alpha = self.log_alpha.exp().item()
+            
+            # ========== 软更新 ==========
+            self._soft_update(self.q1, self.q1_target)
+            self._soft_update(self.q2, self.q2_target)
+            
+            # 更新 scaler
+            if self.use_amp:
+                self.scaler.update()
+            
+            total_q1_loss += q1_loss.item()
+            total_q2_loss += q2_loss.item()
+            total_actor_loss += actor_loss.item()
         
-        # ========== 软更新目标网络 ==========
-        self._soft_update(self.q1, self.q1_target)
-        self._soft_update(self.q2, self.q2_target)
-        
-        # 记录损失
         self.last_losses = {
-            'q1': q1_loss.item(),
-            'q2': q2_loss.item(),
-            'actor': actor_loss.item(),
+            'q1': total_q1_loss / gradient_steps,
+            'q2': total_q2_loss / gradient_steps,
+            'actor': total_actor_loss / gradient_steps,
             'alpha': self.alpha
         }
         
         return self.last_losses
     
-    def _batch_edge_index(self, batch_size):
-        """为批量数据构建边索引
-        
-        Args:
-            batch_size: 批量大小
-            
-        Returns:
-            batch_edge_index: 拼接后的边索引
-        """
-        num_nodes = self.num_agents
-        edge_indices = []
-        for i in range(batch_size):
-            edge_indices.append(self.topology.edge_index + i * num_nodes)
-        return torch.cat(edge_indices, dim=1)
-    
+    @torch.no_grad()
     def _soft_update(self, source, target):
-        """软更新目标网络
-        
-        Args:
-            source: 源网络
-            target: 目标网络
-        """
         for param, target_param in zip(source.parameters(), target.parameters()):
-            target_param.data.copy_(TAU * param.data + (1 - TAU) * target_param.data)
+            target_param.data.lerp_(param.data, TAU)
     
     def save(self, path):
-        """保存模型"""
         torch.save({
             'actor': self.actor.state_dict(),
             'q1': self.q1.state_dict(),
@@ -246,7 +271,6 @@ class SACAgent:
         print(f"✅ Model saved to {path}")
     
     def load(self, path):
-        """加载模型"""
         checkpoint = torch.load(path, map_location=DEVICE, weights_only=False)
         self.actor.load_state_dict(checkpoint['actor'])
         self.q1.load_state_dict(checkpoint['q1'])
@@ -256,6 +280,4 @@ class SACAgent:
         if 'log_alpha' in checkpoint:
             self.log_alpha = checkpoint['log_alpha']
             self.alpha = self.log_alpha.exp().item()
-        if 'update_count' in checkpoint:
-            self.update_count = checkpoint['update_count']
         print(f"✅ Model loaded from {path}")

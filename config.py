@@ -1,5 +1,5 @@
 """
-配置文件 - 所有超参数和全局配置
+配置文件 - 速度优化版
 """
 import torch
 import random
@@ -16,7 +16,6 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SEED = 42
 
 def set_seed(seed=SEED):
-    """设置全局随机种子"""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -43,25 +42,22 @@ DT = 0.05
 MAX_STEPS = 300
 COMM_PENALTY = 0.03
 
-# 领导者轨迹参数
 LEADER_AMPLITUDE = 2.0
 LEADER_OMEGA = 0.5
 LEADER_PHASE = 0.0
 
-# 状态边界
 POS_LIMIT = 10.0
 VEL_LIMIT = 5.0
 
-# 奖励配置
 REWARD_MIN = -20.0
 REWARD_MAX = 5.0
-USE_SOFT_REWARD_SCALING = True  # 使用软缩放而非硬截断
+USE_SOFT_REWARD_SCALING = True
 
 # ==========================================
 # SAC 超参数
 # ==========================================
-BUFFER_SIZE = 200000
-BATCH_SIZE = 256
+BUFFER_SIZE = 500000
+BATCH_SIZE = 2048           # 增大批量以提高GPU利用率
 GAMMA = 0.99
 TAU = 0.005
 LEARNING_RATE = 3e-4
@@ -71,11 +67,18 @@ LOG_STD_MAX = 2
 INIT_ALPHA = 0.2
 
 # ==========================================
-# 训练配置
+# 训练配置 (速度优化) ⬇️ 关键修改
 # ==========================================
 NUM_EPISODES = 400
-VIS_INTERVAL = 5
+VIS_INTERVAL = 20           # 减少可视化频率
 SAVE_MODEL_PATH = 'best_leader_follower_model.pth'
+
+NUM_PARALLEL_ENVS = 64      # 32 -> 64 ⬆️
+UPDATE_FREQUENCY = 32       # 8 -> 32  ⬆️ (关键！减少更新次数)
+GRADIENT_STEPS = 1          # 4 -> 1   ⬇️ (关键！每次只更新1步)
+
+# 混合精度
+USE_AMP = True
 
 # ==========================================
 # 拓扑配置
@@ -85,15 +88,19 @@ TOPOLOGY_SEED = 42
 
 
 def print_config():
-    """打印配置信息"""
+    # 计算每 episode 的更新次数
+    updates_per_ep = MAX_STEPS // UPDATE_FREQUENCY
+    total_gradient_steps = updates_per_ep * GRADIENT_STEPS
+    
     print("=" * 60)
-    print("🔧 Configuration")
+    print("🔧 Configuration (Speed Optimized)")
     print("=" * 60)
     print(f"  Device: {DEVICE}")
-    print(f"  Random Seed: {SEED}")
-    print(f"  Followers: {NUM_FOLLOWERS}, Pinned: {NUM_PINNED}")
-    print(f"  State Dim: {STATE_DIM}, Hidden Dim: {HIDDEN_DIM}")
-    print(f"  Max Steps: {MAX_STEPS}, Episodes: {NUM_EPISODES}")
-    print(f"  Batch Size: {BATCH_SIZE}, Buffer Size: {BUFFER_SIZE}")
-    print(f"  Position Limit: ±{POS_LIMIT}, Velocity Limit: ±{VEL_LIMIT}")
+    print(f"  Parallel Envs: {NUM_PARALLEL_ENVS}")
+    print(f"  Batch Size: {BATCH_SIZE}")
+    print(f"  Update Frequency: every {UPDATE_FREQUENCY} steps")
+    print(f"  Gradient Steps: {GRADIENT_STEPS}")
+    print(f"  Updates per Episode: {updates_per_ep}")
+    print(f"  Total Gradient Steps per Episode: {total_gradient_steps}")
+    print(f"  AMP Training: {USE_AMP}")
     print("=" * 60)

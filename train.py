@@ -1,114 +1,121 @@
 """
-训练脚本
+训练脚本 - 速度优化版
 """
+import torch
+import time
+
 from config import (
     NUM_FOLLOWERS, NUM_PINNED, MAX_STEPS, BATCH_SIZE,
     NUM_EPISODES, VIS_INTERVAL, SAVE_MODEL_PATH, 
-    print_config, set_seed, SEED
+    print_config, set_seed, SEED,
+    NUM_PARALLEL_ENVS, UPDATE_FREQUENCY, GRADIENT_STEPS,
+    USE_AMP
 )
 from topology import DirectedSpanningTreeTopology
-from environment import LeaderFollowerMASEnv
+from environment import BatchedLeaderFollowerEnv, LeaderFollowerMASEnv
 from agent import SACAgent
 from dashboard import TrainingDashboard
 from utils import collect_trajectory, plot_evaluation
 
 
+# CUDA 优化
+torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+
 def train(num_episodes=NUM_EPISODES, vis_interval=VIS_INTERVAL, 
           show_dashboard=True, seed=SEED):
-    """训练主函数
-    
-    Args:
-        num_episodes: 训练回合数
-        vis_interval: 可视化间隔
-        show_dashboard: 是否显示仪表盘
-        seed: 随机种子
-        
-    Returns:
-        agent: 训练好的智能体
-        topology: 拓扑结构
-        dashboard: 仪表盘对象
-    """
-    # 设置随机种子
+    """速度优化训练"""
     set_seed(seed)
-    
-    # 打印配置
     print_config()
     
     # 初始化
     topology = DirectedSpanningTreeTopology(NUM_FOLLOWERS, num_pinned=NUM_PINNED)
-    env = LeaderFollowerMASEnv(topology)
-    agent = SACAgent(topology)
+    batched_env = BatchedLeaderFollowerEnv(topology, num_envs=NUM_PARALLEL_ENVS)
+    eval_env = LeaderFollowerMASEnv(topology)
     
-    # 仪表盘
+    agent = SACAgent(topology, use_amp=USE_AMP)
+    
     dashboard = None
     if show_dashboard:
         dashboard = TrainingDashboard(num_episodes, vis_interval)
         dashboard.display()
     
     best_reward = -float('inf')
+    global_step = 0
+    
+    start_time = time.time()
+    log_interval = 10
     
     # 训练循环
     for episode in range(1, num_episodes + 1):
-        state = env.reset()
-        episode_reward = 0
-        episode_tracking_err = 0
-        episode_comm = 0
+        states = batched_env.reset()
+        
+        episode_rewards = torch.zeros(NUM_PARALLEL_ENVS, device=DEVICE)
+        episode_tracking_err = torch.zeros(NUM_PARALLEL_ENVS, device=DEVICE)
+        episode_comm = torch.zeros(NUM_PARALLEL_ENVS, device=DEVICE)
         
         for step in range(MAX_STEPS):
-            if dashboard:
-                dashboard.update_step(step + 1, MAX_STEPS)
+            global_step += NUM_PARALLEL_ENVS
             
-            # 选择动作 (训练时使用随机策略)
-            action = agent.select_action(state, deterministic=False)
+            actions = agent.select_action(states, deterministic=False)
+            next_states, rewards, dones, infos = batched_env.step(actions)
             
-            # 环境交互
-            next_state, reward, done, info = env.step(action)
+            agent.store_transitions_batch(states, actions, rewards, next_states, dones)
             
-            # 存储经验
-            agent.store_transition(state, action, reward, next_state, done)
+            # 关键：减少更新频率
+            if step % UPDATE_FREQUENCY == 0 and step > 0:
+                agent.update(BATCH_SIZE, GRADIENT_STEPS)
             
-            # 更新网络
-            agent.update(BATCH_SIZE)
-            
-            # 统计
-            episode_reward += reward
-            episode_tracking_err += info['tracking_error']
-            episode_comm += info['comm_rate']
-            state = next_state
-            
-            if done:
-                break
+            episode_rewards += rewards
+            episode_tracking_err += infos['tracking_error']
+            episode_comm += infos['comm_rate']
+            states = next_states
         
-        # 计算平均值
-        avg_tracking_err = episode_tracking_err / MAX_STEPS
-        avg_comm = episode_comm / MAX_STEPS
+        avg_reward = episode_rewards.mean().item()
+        avg_tracking_err = (episode_tracking_err / MAX_STEPS).mean().item()
+        avg_comm = (episode_comm / MAX_STEPS).mean().item()
         
-        # 收集轨迹用于可视化
+        # 减少可视化频率
         trajectory_data = None
-        if episode % vis_interval == 0 or episode == 1 or episode_reward > best_reward:
-            trajectory_data = collect_trajectory(agent, env, MAX_STEPS)
+        if episode % vis_interval == 0 or episode == 1:
+            trajectory_data = collect_trajectory(agent, eval_env, MAX_STEPS)
         
-        # 保存最佳模型
-        if episode_reward > best_reward:
-            best_reward = episode_reward
+        if avg_reward > best_reward:
+            best_reward = avg_reward
             agent.save(SAVE_MODEL_PATH)
+            trajectory_data = collect_trajectory(agent, eval_env, MAX_STEPS)
         
-        # 更新仪表盘
         if dashboard:
             dashboard.update_episode(
-                episode, episode_reward, avg_tracking_err, avg_comm,
+                episode, avg_reward, avg_tracking_err, avg_comm,
                 agent.last_losses, trajectory_data
             )
-        elif episode % 20 == 0:
-            print(f"Ep {episode:4d} | R:{episode_reward:7.2f} | Err:{avg_tracking_err:.4f} | Comm:{avg_comm*100:.1f}%")
+        elif episode % log_interval == 0:
+            elapsed = time.time() - start_time
+            speed = episode / elapsed
+            print(f"Ep {episode:4d} | R:{avg_reward:7.2f} | Err:{avg_tracking_err:.4f} | "
+                  f"Comm:{avg_comm*100:.1f}% | Speed:{speed:.2f} ep/s | "
+                  f"Steps:{global_step/1e6:.2f}M")
     
-    # 训练完成
     if dashboard:
         dashboard.finish()
     
-    print(f"\n✅ Training complete! Best reward: {best_reward:.2f}")
+    elapsed = time.time() - start_time
+    print(f"\n{'='*60}")
+    print(f"✅ Training Complete!")
+    print(f"   Total time: {elapsed:.1f}s ({elapsed/60:.1f} min)")
+    print(f"   Speed: {num_episodes/elapsed:.2f} ep/s")
+    print(f"   Total steps: {global_step:,}")
+    print(f"   Best reward: {best_reward:.2f}")
+    print(f"{'='*60}")
+    
     return agent, topology, dashboard
 
+
+# 需要导入 DEVICE
+from config import DEVICE
 
 if __name__ == '__main__':
     agent, topology, _ = train(show_dashboard=False)
