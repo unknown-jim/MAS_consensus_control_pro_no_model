@@ -1,0 +1,1204 @@
+"""
+配置文件 - 所有超参数和全局配置
+"""
+import torch
+
+# ==========================================
+# 设备配置
+# ==========================================
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ==========================================
+# 系统配置
+# ==========================================
+NUM_FOLLOWERS = 9
+NUM_AGENTS = NUM_FOLLOWERS + 1
+LEADER_ID = 0
+STATE_DIM = 4
+HIDDEN_DIM = 128
+ACTION_DIM = 2
+
+# ==========================================
+# 环境配置
+# ==========================================
+DT = 0.05
+MAX_STEPS = 300
+COMM_PENALTY = 0.03
+
+# 领导者轨迹参数
+LEADER_AMPLITUDE = 2.0
+LEADER_OMEGA = 0.5
+LEADER_PHASE = 0.0
+
+# ==========================================
+# SAC 超参数
+# ==========================================
+BUFFER_SIZE = 200000
+BATCH_SIZE = 256
+GAMMA = 0.99
+TAU = 0.005
+LEARNING_RATE = 3e-4
+ALPHA_LR = 3e-4
+LOG_STD_MIN = -20
+LOG_STD_MAX = 2
+
+# ==========================================
+# 训练配置
+# ==========================================
+NUM_EPISODES = 400
+VIS_INTERVAL = 5
+SAVE_MODEL_PATH = 'best_leader_follower_model.pth'
+
+# ==========================================
+# 拓扑配置
+# ==========================================
+NUM_PINNED = 3
+TOPOLOGY_SEED = 42
+
+
+def print_config():
+    """打印配置信息"""
+    print("=" * 60)
+    print("🔧 Configuration")
+    print("=" * 60)
+    print(f"  Device: {DEVICE}")
+    print(f"  Followers: {NUM_FOLLOWERS}, Pinned: {NUM_PINNED}")
+    print(f"  State Dim: {STATE_DIM}, Hidden Dim: {HIDDEN_DIM}")
+    print(f"  Max Steps: {MAX_STEPS}, Episodes: {NUM_EPISODES}")
+    print(f"  Batch Size: {BATCH_SIZE}, Buffer Size: {BUFFER_SIZE}")
+    print("=" * 60)"""
+有向生成树通信拓扑
+"""
+import torch
+import numpy as np
+
+try:
+    import matplotlib.pyplot as plt
+    HAS_MATPLOTLIB = True
+except ImportError:
+    HAS_MATPLOTLIB = False
+
+from config import DEVICE, NUM_PINNED, TOPOLOGY_SEED
+
+
+class DirectedSpanningTreeTopology:
+    r"""
+    有向生成树通信拓扑
+    
+    拓扑结构示意 (领导者为根节点):
+    
+                    Leader (0)
+                   /    |    \
+                 F1    F2    F3     <- Pinned Followers
+                / \     |     \
+              F4  F5   F6    F7     <- Other Followers
+                       / \
+                     F8  F9
+    """
+    
+    def __init__(self, num_followers, num_pinned=NUM_PINNED, seed=TOPOLOGY_SEED):
+        self.num_followers = num_followers
+        self.num_agents = num_followers + 1
+        self.num_pinned = min(num_pinned, num_followers)
+        self.leader_id = 0
+        
+        np.random.seed(seed)
+        self._build_topology()
+        
+    def _build_topology(self):
+        """构建有向生成树"""
+        edges = []
+        follower_ids = list(range(1, self.num_agents))
+        
+        # 随机选择 pinned followers
+        self.pinned_followers = sorted(np.random.choice(
+            follower_ids, self.num_pinned, replace=False
+        ).tolist())
+        
+        # 领导者 -> pinned followers
+        for f in self.pinned_followers:
+            edges.append((self.leader_id, f))
+        
+        # 构建生成树
+        unpinned = [f for f in follower_ids if f not in self.pinned_followers]
+        connected = set(self.pinned_followers)
+        
+        for f in unpinned:
+            parent = np.random.choice(list(connected))
+            edges.append((parent, f))
+            connected.add(f)
+        
+        # 添加额外边
+        for f in follower_ids:
+            potential_neighbors = [n for n in follower_ids if n != f]
+            if potential_neighbors and np.random.random() < 0.3:
+                neighbor = np.random.choice(potential_neighbors)
+                if (neighbor, f) not in edges and (f, neighbor) not in edges:
+                    edges.append((neighbor, f))
+        
+        # 转换为 PyTorch 格式
+        src, dst = zip(*edges)
+        self.edge_index = torch.tensor([src, dst], dtype=torch.long).to(DEVICE)
+        self._compute_degrees()
+        
+    def _compute_degrees(self):
+        """计算节点度数"""
+        self.in_degree = torch.zeros(self.num_agents, device=DEVICE)
+        self.out_degree = torch.zeros(self.num_agents, device=DEVICE)
+        
+        for i in range(self.edge_index.shape[1]):
+            src, dst = self.edge_index[0, i].item(), self.edge_index[1, i].item()
+            self.out_degree[src] += 1
+            self.in_degree[dst] += 1
+    
+    def get_neighbors(self, node_id):
+        """获取节点的入边邻居"""
+        mask = self.edge_index[1] == node_id
+        return self.edge_index[0, mask].tolist()
+    
+    def has_leader_access(self, node_id):
+        """检查节点是否直接连接领导者"""
+        return node_id in self.pinned_followers
+    
+    def visualize(self, save_path=None):
+        """可视化拓扑结构"""
+        if not HAS_MATPLOTLIB:
+            print("matplotlib not available")
+            return
+            
+        try:
+            import networkx as nx
+        except ImportError:
+            print("Please install networkx: pip install networkx")
+            return
+        
+        G = nx.DiGraph()
+        G.add_nodes_from(range(self.num_agents))
+        
+        edges = list(zip(
+            self.edge_index[0].cpu().numpy(),
+            self.edge_index[1].cpu().numpy()
+        ))
+        G.add_edges_from(edges)
+        
+        pos = nx.spring_layout(G, seed=42, k=2)
+        pos[0] = np.array([0.5, 1.0])
+        
+        plt.figure(figsize=(10, 8))
+        
+        nx.draw_networkx_nodes(G, pos, nodelist=[0], 
+                              node_color='gold', node_size=800, label='Leader')
+        nx.draw_networkx_nodes(G, pos, nodelist=self.pinned_followers,
+                              node_color='lightgreen', node_size=500, label='Pinned')
+        other_nodes = [n for n in range(1, self.num_agents) if n not in self.pinned_followers]
+        nx.draw_networkx_nodes(G, pos, nodelist=other_nodes,
+                              node_color='lightblue', node_size=400, label='Others')
+        
+        nx.draw_networkx_edges(G, pos, edge_color='gray', arrows=True, arrowsize=20, alpha=0.7)
+        
+        labels = {0: 'L'}
+        labels.update({i: f'F{i}' for i in range(1, self.num_agents)})
+        nx.draw_networkx_labels(G, pos, labels, font_size=10)
+        
+        plt.title('Directed Spanning Tree Topology', fontsize=12)
+        plt.legend(loc='upper left')
+        plt.axis('off')
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.show()
+        
+        print(f"\n📊 Topology Statistics:")
+        print(f"   Nodes: {self.num_agents}, Edges: {self.edge_index.shape[1]}")
+        print(f"   Pinned Followers: {self.pinned_followers}")"""
+经验回放缓冲区
+"""
+import torch
+import random
+from collections import deque
+
+from config import DEVICE, BUFFER_SIZE
+
+
+class ReplayBuffer:
+    """Off-policy 经验回放缓冲区"""
+    
+    def __init__(self, capacity=BUFFER_SIZE):
+        self.buffer = deque(maxlen=capacity)
+    
+    def push(self, state, action, reward, next_state, done):
+        """存储一条经验"""
+        self.buffer.append((state, action, reward, next_state, done))
+    
+    def sample(self, batch_size):
+        """随机采样一批经验"""
+        batch = random.sample(self.buffer, batch_size)
+        states, actions, rewards, next_states, dones = zip(*batch)
+        
+        return (
+            torch.stack(states),
+            torch.stack(actions),
+            torch.tensor(rewards, dtype=torch.float32, device=DEVICE),
+            torch.stack(next_states),
+            torch.tensor(dones, dtype=torch.float32, device=DEVICE)
+        )
+    
+    def __len__(self):
+        return len(self.buffer)
+    
+    def is_ready(self, batch_size):
+        """检查缓冲区是否有足够的样本"""
+        return len(self.buffer) >= batch_size"""
+神经网络模型 - GAT 编码器、Actor、Critic
+"""
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.distributions import Normal
+from torch_geometric.nn import GATConv
+
+from config import (
+    STATE_DIM, HIDDEN_DIM, ACTION_DIM,
+    LOG_STD_MIN, LOG_STD_MAX
+)
+
+
+class TopologyAwareGATEncoder(nn.Module):
+    """拓扑感知的图注意力编码器"""
+    
+    def __init__(self, in_dim=STATE_DIM, hidden_dim=HIDDEN_DIM, num_heads=4):
+        super(TopologyAwareGATEncoder, self).__init__()
+        
+        self.gat1 = GATConv(in_dim, hidden_dim, heads=num_heads, concat=True, 
+                           add_self_loops=True, dropout=0.1)
+        self.gat2 = GATConv(hidden_dim * num_heads, hidden_dim, heads=num_heads, 
+                           concat=True, add_self_loops=True, dropout=0.1)
+        self.gat3 = GATConv(hidden_dim * num_heads, hidden_dim, heads=1, 
+                           concat=False, add_self_loops=True)
+        
+        self.norm1 = nn.LayerNorm(hidden_dim * num_heads)
+        self.norm2 = nn.LayerNorm(hidden_dim * num_heads)
+        self.norm3 = nn.LayerNorm(hidden_dim)
+        
+        self.role_embedding = nn.Embedding(2, hidden_dim)
+        
+        self.output_proj = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+    
+    def forward(self, x, edge_index, role_ids):
+        h = F.elu(self.gat1(x, edge_index))
+        h = self.norm1(h)
+        
+        h = F.elu(self.gat2(h, edge_index))
+        h = self.norm2(h)
+        
+        h = self.gat3(h, edge_index)
+        h = self.norm3(h)
+        
+        role_emb = self.role_embedding(role_ids)
+        h = self.output_proj(torch.cat([h, role_emb], dim=-1))
+        
+        return h
+
+
+class GaussianActor(nn.Module):
+    """高斯策略 Actor 网络"""
+    
+    def __init__(self, state_dim=STATE_DIM, hidden_dim=HIDDEN_DIM, num_heads=4):
+        super(GaussianActor, self).__init__()
+        
+        self.encoder = TopologyAwareGATEncoder(state_dim, hidden_dim, num_heads)
+        
+        self.u_mean = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 1)
+        )
+        self.u_log_std = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 1)
+        )
+        
+        self.th_mean = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 1)
+        )
+        self.th_log_std = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 1)
+        )
+        
+        self.u_scale = 3.0
+        self.th_scale = 0.5
+    
+    def forward(self, x, edge_index, role_ids, deterministic=False):
+        feat = self.encoder(x, edge_index, role_ids)
+        
+        follower_mask = role_ids == 1
+        follower_feat = feat[follower_mask]
+        
+        u_mean = self.u_mean(follower_feat)
+        u_log_std = torch.clamp(self.u_log_std(follower_feat), LOG_STD_MIN, LOG_STD_MAX)
+        u_std = torch.exp(u_log_std)
+        
+        th_mean = self.th_mean(follower_feat)
+        th_log_std = torch.clamp(self.th_log_std(follower_feat), LOG_STD_MIN, LOG_STD_MAX)
+        th_std = torch.exp(th_log_std)
+        
+        if deterministic:
+            u = torch.tanh(u_mean) * self.u_scale
+            th = torch.sigmoid(th_mean) * self.th_scale
+            log_prob = None
+        else:
+            u_dist = Normal(u_mean, u_std)
+            th_dist = Normal(th_mean, th_std)
+            
+            u_sample = u_dist.rsample()
+            th_sample = th_dist.rsample()
+            
+            u = torch.tanh(u_sample) * self.u_scale
+            th = torch.sigmoid(th_sample) * self.th_scale
+            
+            log_prob_u = u_dist.log_prob(u_sample) - torch.log(1 - torch.tanh(u_sample).pow(2) + 1e-6)
+            log_prob_th = th_dist.log_prob(th_sample) - torch.log(th * (1 - th / self.th_scale) + 1e-6)
+            log_prob = (log_prob_u + log_prob_th).sum(dim=-1, keepdim=True)
+        
+        action = torch.cat([u, th], dim=-1)
+        return action, log_prob, follower_mask
+
+
+class SoftQNetwork(nn.Module):
+    """Soft Q 网络"""
+    
+    def __init__(self, state_dim=STATE_DIM, hidden_dim=HIDDEN_DIM, 
+                 action_dim=ACTION_DIM, num_heads=4):
+        super(SoftQNetwork, self).__init__()
+        
+        self.encoder = TopologyAwareGATEncoder(state_dim, hidden_dim, num_heads)
+        
+        self.q_net = nn.Sequential(
+            nn.Linear(hidden_dim + action_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 1)
+        )
+    
+    def forward(self, x, edge_index, role_ids, action):
+        feat = self.encoder(x, edge_index, role_ids)
+        
+        follower_mask = role_ids == 1
+        follower_feat = feat[follower_mask]
+        
+        q_input = torch.cat([follower_feat, action], dim=-1)
+        q_value = self.q_net(q_input)
+        
+        return q_value"""
+领导者-跟随者多智能体系统环境
+"""
+import torch
+import numpy as np
+
+from config import (
+    DEVICE, STATE_DIM, DT, COMM_PENALTY,
+    LEADER_AMPLITUDE, LEADER_OMEGA, LEADER_PHASE
+)
+
+
+class LeaderFollowerMASEnv:
+    r"""
+    领导者-跟随者多智能体系统环境
+    
+    领导者动力学 (非线性正弦轨迹):
+        pos_L(t) = A * sin(omega * t + phi)
+        vel_L(t) = A * omega * cos(omega * t + phi)
+    
+    跟随者动力学 (二阶非线性):
+        x_ddot_i = u_i + sin(x_i) - 0.5 * x_dot_i
+    """
+    
+    def __init__(self, topology):
+        """
+        Args:
+            topology: DirectedSpanningTreeTopology 对象
+        """
+        self.topology = topology
+        self.num_agents = topology.num_agents
+        self.num_followers = topology.num_followers
+        self.leader_id = topology.leader_id
+        
+        self.leader_amplitude = LEADER_AMPLITUDE
+        self.leader_omega = LEADER_OMEGA
+        self.leader_phase = LEADER_PHASE
+        
+        self.role_ids = torch.zeros(self.num_agents, dtype=torch.long, device=DEVICE)
+        self.role_ids[1:] = 1
+        
+        self.reset()
+    
+    def _leader_state(self, t):
+        """计算领导者在时间 t 的状态"""
+        pos = self.leader_amplitude * np.sin(self.leader_omega * t + self.leader_phase)
+        vel = self.leader_amplitude * self.leader_omega * np.cos(self.leader_omega * t + self.leader_phase)
+        return pos, vel
+    
+    def reset(self):
+        """重置环境"""
+        self.t = 0.0
+        
+        leader_pos, leader_vel = self._leader_state(0)
+        
+        follower_pos = torch.randn(self.num_followers, device=DEVICE) * 1.5
+        follower_vel = torch.randn(self.num_followers, device=DEVICE) * 0.5
+        
+        self.positions = torch.zeros(self.num_agents, device=DEVICE)
+        self.velocities = torch.zeros(self.num_agents, device=DEVICE)
+        
+        self.positions[0] = leader_pos
+        self.velocities[0] = leader_vel
+        self.positions[1:] = follower_pos
+        self.velocities[1:] = follower_vel
+        
+        self.last_broadcast_pos = self.positions.clone()
+        self.last_broadcast_vel = self.velocities.clone()
+        
+        return self._get_state()
+    
+    def _get_state(self):
+        """构建观测状态"""
+        state = torch.zeros(self.num_agents, STATE_DIM, device=DEVICE)
+        
+        state[0, 0] = self.positions[0]
+        state[0, 1] = self.velocities[0]
+        
+        for i in range(1, self.num_agents):
+            state[i, 0] = self.positions[i]
+            state[i, 1] = self.velocities[i]
+            
+            neighbors = self.topology.get_neighbors(i)
+            if neighbors:
+                neighbor_pos = torch.stack([self.last_broadcast_pos[n] for n in neighbors])
+                neighbor_vel = torch.stack([self.last_broadcast_vel[n] for n in neighbors])
+                state[i, 2] = neighbor_pos.mean()
+                state[i, 3] = neighbor_vel.mean()
+        
+        return state
+    
+    def step(self, action):
+        """执行一步"""
+        self.t += DT
+        
+        leader_pos, leader_vel = self._leader_state(self.t)
+        self.positions[0] = leader_pos
+        self.velocities[0] = leader_vel
+        
+        u = action[:, 0]
+        threshold = action[:, 1]
+        
+        follower_pos = self.positions[1:]
+        follower_vel = self.velocities[1:]
+        
+        nonlinear_term = torch.sin(follower_pos) - 0.5 * follower_vel
+        acc = u + nonlinear_term
+        
+        new_vel = follower_vel + acc * DT
+        new_pos = follower_pos + new_vel * DT
+        
+        new_pos = torch.clamp(new_pos, -10, 10)
+        new_vel = torch.clamp(new_vel, -5, 5)
+        
+        self.positions[1:] = new_pos
+        self.velocities[1:] = new_vel
+        
+        trigger_error = torch.abs(new_pos - self.last_broadcast_pos[1:])
+        is_triggered = (trigger_error > threshold).float()
+        
+        for i in range(self.num_followers):
+            if is_triggered[i] > 0.5:
+                self.last_broadcast_pos[i + 1] = self.positions[i + 1]
+                self.last_broadcast_vel[i + 1] = self.velocities[i + 1]
+        
+        self.last_broadcast_pos[0] = self.positions[0]
+        self.last_broadcast_vel[0] = self.velocities[0]
+        
+        tracking_error = torch.mean(
+            (self.positions[1:] - self.positions[0])**2 + 
+            (self.velocities[1:] - self.velocities[0])**2
+        )
+        comm_rate = is_triggered.mean()
+        reward = -tracking_error - comm_rate * COMM_PENALTY
+        reward = torch.clamp(reward, -20.0, 5.0)
+        
+        info = {
+            'tracking_error': tracking_error.item(),
+            'comm_rate': comm_rate.item(),
+            'leader_pos': self.positions[0].item(),
+            'leader_vel': self.velocities[0].item(),
+            'avg_follower_pos': self.positions[1:].mean().item()
+        }
+        
+        return self._get_state(), reward.item(), False, info"""
+SAC 智能体
+"""
+import torch
+import torch.optim as optim
+import torch.nn.functional as F
+import numpy as np
+
+from config import (
+    DEVICE, STATE_DIM, HIDDEN_DIM,
+    LEARNING_RATE, ALPHA_LR, GAMMA, TAU, BATCH_SIZE
+)
+from buffer import ReplayBuffer
+from networks import GaussianActor, SoftQNetwork
+
+
+class SACAgent:
+    """Soft Actor-Critic 智能体"""
+    
+    def __init__(self, topology):
+        """
+        Args:
+            topology: DirectedSpanningTreeTopology 对象
+        """
+        self.topology = topology
+        self.num_followers = topology.num_followers
+        self.num_agents = topology.num_agents
+        
+        # 网络初始化
+        self.actor = GaussianActor(STATE_DIM, HIDDEN_DIM).to(DEVICE)
+        self.q1 = SoftQNetwork(STATE_DIM, HIDDEN_DIM).to(DEVICE)
+        self.q2 = SoftQNetwork(STATE_DIM, HIDDEN_DIM).to(DEVICE)
+        self.q1_target = SoftQNetwork(STATE_DIM, HIDDEN_DIM).to(DEVICE)
+        self.q2_target = SoftQNetwork(STATE_DIM, HIDDEN_DIM).to(DEVICE)
+        
+        # 复制目标网络参数
+        self.q1_target.load_state_dict(self.q1.state_dict())
+        self.q2_target.load_state_dict(self.q2.state_dict())
+        
+        # 熵系数
+        self.target_entropy = -2.0
+        self.log_alpha = torch.tensor(np.log(0.2), requires_grad=True, device=DEVICE)
+        self.alpha = self.log_alpha.exp()
+        
+        # 优化器
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=LEARNING_RATE)
+        self.q1_optimizer = optim.Adam(self.q1.parameters(), lr=LEARNING_RATE)
+        self.q2_optimizer = optim.Adam(self.q2.parameters(), lr=LEARNING_RATE)
+        self.alpha_optimizer = optim.Adam([self.log_alpha], lr=ALPHA_LR)
+        
+        # 经验回放
+        self.buffer = ReplayBuffer()
+        
+        # 角色 ID
+        self.role_ids = torch.zeros(self.num_agents, dtype=torch.long, device=DEVICE)
+        self.role_ids[1:] = 1
+        
+        # 损失记录
+        self.last_losses = {'q1': 0, 'q2': 0, 'actor': 0, 'alpha': 0.2}
+    
+    def select_action(self, state, deterministic=False):
+        """选择动作"""
+        with torch.no_grad():
+            action, _, _ = self.actor(
+                state,
+                self.topology.edge_index,
+                self.role_ids,
+                deterministic=deterministic
+            )
+        return action
+    
+    def store_transition(self, state, action, reward, next_state, done):
+        """存储经验"""
+        self.buffer.push(state.clone(), action.clone(), reward, next_state.clone(), float(done))
+    
+    def update(self, batch_size=BATCH_SIZE):
+        """更新网络"""
+        if not self.buffer.is_ready(batch_size):
+            return {}
+        
+        # 采样
+        states, actions, rewards, next_states, dones = self.buffer.sample(batch_size)
+        
+        batch_size_actual = states.shape[0]
+        
+        # 展平
+        flat_states = states.view(-1, STATE_DIM)
+        flat_next_states = next_states.view(-1, STATE_DIM)
+        flat_actions = actions.view(-1, 2)
+        
+        # 批量索引
+        batch_edge_index = self._batch_edge_index(batch_size_actual)
+        batch_role_ids = self.role_ids.repeat(batch_size_actual)
+        
+        # ========== 更新 Critic ==========
+        with torch.no_grad():
+            next_actions, next_log_probs, _ = self.actor(
+                flat_next_states, batch_edge_index, batch_role_ids
+            )
+            
+            q1_next = self.q1_target(flat_next_states, batch_edge_index, batch_role_ids, next_actions)
+            q2_next = self.q2_target(flat_next_states, batch_edge_index, batch_role_ids, next_actions)
+            q_next = torch.min(q1_next, q2_next)
+            
+            q_next = q_next.view(batch_size_actual, self.num_followers).mean(dim=1, keepdim=True)
+            next_log_probs = next_log_probs.view(batch_size_actual, self.num_followers).mean(dim=1, keepdim=True)
+            
+            target_q = rewards.unsqueeze(1) + GAMMA * (1 - dones.unsqueeze(1)) * (q_next - self.alpha * next_log_probs)
+        
+        # 当前 Q 值
+        q1_curr = self.q1(flat_states, batch_edge_index, batch_role_ids, flat_actions)
+        q2_curr = self.q2(flat_states, batch_edge_index, batch_role_ids, flat_actions)
+        
+        q1_curr = q1_curr.view(batch_size_actual, self.num_followers).mean(dim=1, keepdim=True)
+        q2_curr = q2_curr.view(batch_size_actual, self.num_followers).mean(dim=1, keepdim=True)
+        
+        q1_loss = F.mse_loss(q1_curr, target_q)
+        q2_loss = F.mse_loss(q2_curr, target_q)
+        
+        self.q1_optimizer.zero_grad()
+        q1_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.q1.parameters(), 1.0)
+        self.q1_optimizer.step()
+        
+        self.q2_optimizer.zero_grad()
+        q2_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.q2.parameters(), 1.0)
+        self.q2_optimizer.step()
+        
+        # ========== 更新 Actor ==========
+        new_actions, log_probs, _ = self.actor(flat_states, batch_edge_index, batch_role_ids)
+        
+        q1_new = self.q1(flat_states, batch_edge_index, batch_role_ids, new_actions)
+        q2_new = self.q2(flat_states, batch_edge_index, batch_role_ids, new_actions)
+        q_new = torch.min(q1_new, q2_new)
+        
+        actor_loss = (self.alpha * log_probs - q_new).mean()
+        
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
+        self.actor_optimizer.step()
+        
+        # ========== 更新 Alpha ==========
+        alpha_loss = -(self.log_alpha * (log_probs.detach() + self.target_entropy)).mean()
+        
+        self.alpha_optimizer.zero_grad()
+        alpha_loss.backward()
+        self.alpha_optimizer.step()
+        
+        self.alpha = self.log_alpha.exp()
+        
+        # ========== 软更新 ==========
+        self._soft_update(self.q1, self.q1_target)
+        self._soft_update(self.q2, self.q2_target)
+        
+        self.last_losses = {
+            'q1': q1_loss.item(),
+            'q2': q2_loss.item(),
+            'actor': actor_loss.item(),
+            'alpha': self.alpha.item()
+        }
+        
+        return self.last_losses
+    
+    def _batch_edge_index(self, batch_size):
+        """为批量数据构建边索引"""
+        num_nodes = self.num_agents
+        edge_indices = []
+        for i in range(batch_size):
+            edge_indices.append(self.topology.edge_index + i * num_nodes)
+        return torch.cat(edge_indices, dim=1)
+    
+    def _soft_update(self, source, target):
+        """软更新目标网络"""
+        for param, target_param in zip(source.parameters(), target.parameters()):
+            target_param.data.copy_(TAU * param.data + (1 - TAU) * target_param.data)
+    
+    def save(self, path):
+        """保存模型"""
+        torch.save({
+            'actor': self.actor.state_dict(),
+            'q1': self.q1.state_dict(),
+            'q2': self.q2.state_dict(),
+            'q1_target': self.q1_target.state_dict(),
+            'q2_target': self.q2_target.state_dict(),
+            'log_alpha': self.log_alpha,
+        }, path)
+        print(f"✅ Model saved to {path}")
+    
+    def load(self, path):
+        """加载模型"""
+        checkpoint = torch.load(path, map_location=DEVICE)
+        self.actor.load_state_dict(checkpoint['actor'])
+        self.q1.load_state_dict(checkpoint['q1'])
+        self.q2.load_state_dict(checkpoint['q2'])
+        self.q1_target.load_state_dict(checkpoint['q1_target'])
+        self.q2_target.load_state_dict(checkpoint['q2_target'])
+        if 'log_alpha' in checkpoint:
+            self.log_alpha = checkpoint['log_alpha']
+            self.alpha = self.log_alpha.exp()
+        print(f"✅ Model loaded from {path}")"""
+工具函数
+"""
+import torch
+import numpy as np
+
+try:
+    import matplotlib.pyplot as plt
+    HAS_MATPLOTLIB = True
+except ImportError:
+    HAS_MATPLOTLIB = False
+
+from config import DEVICE, MAX_STEPS
+
+
+def collect_trajectory(agent, env, max_steps=MAX_STEPS):
+    """收集轨迹用于可视化"""
+    state = env.reset()
+    
+    times = [0]
+    leader_pos = [env.positions[0].item()]
+    leader_vel = [env.velocities[0].item()]
+    follower_pos = [env.positions[1:].cpu().numpy()]
+    follower_vel = [env.velocities[1:].cpu().numpy()]
+    
+    for step in range(max_steps):
+        action = agent.select_action(state, deterministic=True)
+        state, _, _, _ = env.step(action)
+        
+        times.append(env.t)
+        leader_pos.append(env.positions[0].item())
+        leader_vel.append(env.velocities[0].item())
+        follower_pos.append(env.positions[1:].cpu().numpy())
+        follower_vel.append(env.velocities[1:].cpu().numpy())
+    
+    return {
+        'times': np.array(times),
+        'leader_pos': np.array(leader_pos),
+        'leader_vel': np.array(leader_vel),
+        'follower_pos': np.array(follower_pos),
+        'follower_vel': np.array(follower_vel)
+    }
+
+
+def evaluate_agent(agent, env, num_episodes=5):
+    """评估智能体性能"""
+    results = {
+        'rewards': [],
+        'tracking_errors': [],
+        'comm_rates': []
+    }
+    
+    for _ in range(num_episodes):
+        state = env.reset()
+        episode_reward = 0
+        episode_tracking_err = 0
+        episode_comm = 0
+        
+        for step in range(MAX_STEPS):
+            action = agent.select_action(state, deterministic=True)
+            state, reward, _, info = env.step(action)
+            
+            episode_reward += reward
+            episode_tracking_err += info['tracking_error']
+            episode_comm += info['comm_rate']
+        
+        results['rewards'].append(episode_reward)
+        results['tracking_errors'].append(episode_tracking_err / MAX_STEPS)
+        results['comm_rates'].append(episode_comm / MAX_STEPS)
+    
+    return {
+        'mean_reward': np.mean(results['rewards']),
+        'std_reward': np.std(results['rewards']),
+        'mean_tracking_error': np.mean(results['tracking_errors']),
+        'mean_comm_rate': np.mean(results['comm_rates'])
+    }
+
+
+def plot_evaluation(agent, topology, num_tests=3, save_path=None):
+    """绘制评估结果"""
+    if not HAS_MATPLOTLIB:
+        print("matplotlib not available")
+        return
+    
+    from environment import LeaderFollowerMASEnv
+    
+    env = LeaderFollowerMASEnv(topology)
+    
+    fig, axes = plt.subplots(num_tests, 2, figsize=(14, 4 * num_tests))
+    if num_tests == 1:
+        axes = axes.reshape(1, -1)
+    
+    results = []
+    
+    for test_idx in range(num_tests):
+        traj = collect_trajectory(agent, env, MAX_STEPS)
+        
+        pos_errors = (traj['follower_pos'] - traj['leader_pos'][:, np.newaxis])**2
+        final_error = np.mean(pos_errors[-1])
+        avg_error = np.mean(pos_errors)
+        
+        results.append({'final_error': final_error, 'avg_error': avg_error})
+        
+        ax1 = axes[test_idx, 0]
+        ax1.plot(traj['times'], traj['leader_pos'], 'r-', linewidth=2.5, label='Leader')
+        colors = plt.cm.Blues(np.linspace(0.3, 0.9, traj['follower_pos'].shape[1]))
+        for i in range(min(5, traj['follower_pos'].shape[1])):
+            ax1.plot(traj['times'], traj['follower_pos'][:, i], color=colors[i], 
+                    alpha=0.8, linewidth=1.2, label=f'F{i+1}')
+        ax1.set_xlabel('Time (s)')
+        ax1.set_ylabel('Position')
+        ax1.set_title(f'Test {test_idx+1}: Position (Final Err: {final_error:.4f})')
+        ax1.legend(loc='upper right', fontsize=8)
+        ax1.grid(True, alpha=0.3)
+        
+        ax2 = axes[test_idx, 1]
+        ax2.plot(traj['times'], traj['leader_vel'], 'r-', linewidth=2.5, label='Leader')
+        for i in range(min(5, traj['follower_vel'].shape[1])):
+            ax2.plot(traj['times'], traj['follower_vel'][:, i], color=colors[i], 
+                    alpha=0.8, linewidth=1.2)
+        ax2.set_xlabel('Time (s)')
+        ax2.set_ylabel('Velocity')
+        ax2.set_title(f'Test {test_idx+1}: Velocity')
+        ax2.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"📁 Figure saved to {save_path}")
+    
+    plt.show()
+    
+    print("\n📊 Evaluation Results:")
+    print("-" * 40)
+    for i, r in enumerate(results):
+        print(f"Test {i+1}: Final Err = {r['final_error']:.4f}, Avg Err = {r['avg_error']:.4f}")
+    
+    return results"""
+训练可视化仪表盘
+"""
+import time
+import numpy as np
+
+try:
+    import matplotlib.pyplot as plt
+    HAS_MATPLOTLIB = True
+except ImportError:
+    HAS_MATPLOTLIB = False
+
+try:
+    import ipywidgets as widgets
+    from IPython.display import display, clear_output
+    HAS_WIDGETS = True
+except ImportError:
+    HAS_WIDGETS = False
+
+
+class TrainingDashboard:
+    """训练仪表盘"""
+    
+    def __init__(self, total_episodes, vis_interval=10):
+        self.total_episodes = total_episodes
+        self.vis_interval = vis_interval
+        self.start_time = None
+        
+        self.reward_history = []
+        self.tracking_error_history = []
+        self.comm_history = []
+        self.best_reward = -float('inf')
+        self.best_trajectory = None
+        
+        self.use_widgets = HAS_WIDGETS and HAS_MATPLOTLIB
+        
+        if self.use_widgets:
+            self._create_widgets()
+    
+    def _create_widgets(self):
+        """创建 UI 组件"""
+        self.title_html = widgets.HTML(value="""
+            <div style="background: linear-gradient(90deg, #11998e 0%, #38ef7d 100%); 
+                        padding: 15px; border-radius: 10px; margin-bottom: 10px;">
+                <h2 style="color: white; margin: 0; text-align: center;">
+                    🎯 Leader-Follower MAS Consensus Control
+                </h2>
+            </div>
+        """)
+        
+        self.main_progress = widgets.FloatProgress(
+            value=0, min=0, max=100, description='Total:',
+            bar_style='info', style={'bar_color': '#11998e', 'description_width': '60px'},
+            layout=widgets.Layout(width='100%', height='30px')
+        )
+        
+        self.step_progress = widgets.FloatProgress(
+            value=0, min=0, max=100, description='Episode:',
+            bar_style='success', style={'bar_color': '#38ef7d', 'description_width': '60px'},
+            layout=widgets.Layout(width='100%', height='20px')
+        )
+        
+        self.progress_text = widgets.HTML(value="<p>Initializing...</p>")
+        self.stats_html = widgets.HTML(value="")
+        self.plot_output = widgets.Output()
+        self.log_output = widgets.Output(layout=widgets.Layout(
+            height='120px', overflow='auto', border='1px solid #ddd', padding='10px'
+        ))
+    
+    def _format_time(self, seconds):
+        if seconds < 60:
+            return f"{seconds:.0f}s"
+        elif seconds < 3600:
+            return f"{seconds//60:.0f}m {seconds%60:.0f}s"
+        return f"{seconds//3600:.0f}h {(seconds%3600)//60:.0f}m"
+    
+    def _estimate_remaining(self, episode, elapsed):
+        if episode == 0:
+            return "..."
+        return self._format_time((elapsed / episode) * (self.total_episodes - episode))
+    
+    def _generate_stats_html(self, episode, reward, tracking_err, comm, best, losses, elapsed):
+        r_color = "#48bb78" if reward > -5 else "#f56565" if reward < -15 else "#ed8936"
+        e_color = "#48bb78" if tracking_err < 0.5 else "#f56565" if tracking_err > 2 else "#ed8936"
+        c_color = "#48bb78" if comm < 0.3 else "#f56565" if comm > 0.6 else "#ed8936"
+        
+        return f"""
+        <div style="display: flex; flex-wrap: wrap; gap: 10px; margin: 10px 0;">
+            <div style="flex:1;min-width:100px;background:linear-gradient(135deg,#11998e,#38ef7d);padding:10px;border-radius:8px;color:white;text-align:center;">
+                <div style="font-size:11px;">📍 Episode</div>
+                <div style="font-size:18px;font-weight:bold;">{episode}/{self.total_episodes}</div>
+            </div>
+            <div style="flex:1;min-width:100px;background:{r_color};padding:10px;border-radius:8px;color:white;text-align:center;">
+                <div style="font-size:11px;">🏆 Reward</div>
+                <div style="font-size:18px;font-weight:bold;">{reward:.2f}</div>
+                <div style="font-size:9px;">Best: {best:.2f}</div>
+            </div>
+            <div style="flex:1;min-width:100px;background:{e_color};padding:10px;border-radius:8px;color:white;text-align:center;">
+                <div style="font-size:11px;">🎯 Error</div>
+                <div style="font-size:18px;font-weight:bold;">{tracking_err:.4f}</div>
+            </div>
+            <div style="flex:1;min-width:100px;background:{c_color};padding:10px;border-radius:8px;color:white;text-align:center;">
+                <div style="font-size:11px;">📡 Comm</div>
+                <div style="font-size:18px;font-weight:bold;">{comm*100:.1f}%</div>
+            </div>
+            <div style="flex:1;min-width:100px;background:#4a5568;padding:10px;border-radius:8px;color:white;text-align:center;">
+                <div style="font-size:11px;">⏱️ Time</div>
+                <div style="font-size:18px;font-weight:bold;">{self._format_time(elapsed)}</div>
+                <div style="font-size:9px;">ETA: {self._estimate_remaining(episode, elapsed)}</div>
+            </div>
+        </div>
+        <div style="background:#f7fafc;padding:6px;border-radius:6px;font-size:11px;">
+            Q1: <b>{losses.get('q1',0):.4f}</b> | Q2: <b>{losses.get('q2',0):.4f}</b> | 
+            Actor: <b>{losses.get('actor',0):.4f}</b> | α: <b>{losses.get('alpha',0.2):.4f}</b>
+        </div>
+        """
+    
+    def display(self):
+        """显示仪表盘"""
+        self.start_time = time.time()
+        if self.use_widgets:
+            dashboard = widgets.VBox([
+                self.title_html, self.main_progress, self.step_progress,
+                self.progress_text, self.stats_html,
+                widgets.HTML("<h4>📈 Training Progress</h4>"),
+                self.plot_output,
+                widgets.HTML("<h4>📝 Log</h4>"),
+                self.log_output
+            ])
+            display(dashboard)
+        else:
+            print("Dashboard requires ipywidgets in Jupyter environment")
+    
+    def update_step(self, step, max_steps):
+        if self.use_widgets:
+            self.step_progress.value = (step / max_steps) * 100
+    
+    def update_episode(self, episode, reward, tracking_err, comm, losses, trajectory_data=None):
+        elapsed = time.time() - self.start_time
+        
+        self.reward_history.append(reward)
+        self.tracking_error_history.append(tracking_err)
+        self.comm_history.append(comm)
+        
+        if reward > self.best_reward:
+            self.best_reward = reward
+            if trajectory_data is not None:
+                self.best_trajectory = trajectory_data
+        
+        if self.use_widgets:
+            self.main_progress.value = (episode / self.total_episodes) * 100
+            self.step_progress.value = 0
+            
+            speed = episode / elapsed if elapsed > 0 else 0
+            self.progress_text.value = f"<p>🚀 <b>Ep {episode}</b> | {speed:.2f} ep/s</p>"
+            self.stats_html.value = self._generate_stats_html(
+                episode, reward, tracking_err, comm, self.best_reward, losses, elapsed
+            )
+            
+            with self.log_output:
+                ts = time.strftime("%H:%M:%S")
+                st = "🏆" if reward >= self.best_reward - 0.1 else "✅" if reward > -10 else "⚠️"
+                print(f"[{ts}] {st} Ep {episode:4d} | R:{reward:7.2f} | Err:{tracking_err:.4f} | Comm:{comm*100:.1f}%")
+            
+            if episode % self.vis_interval == 0 or episode == 1:
+                self._update_plots()
+        else:
+            if episode % 20 == 0:
+                print(f"Ep {episode:4d} | R:{reward:7.2f} | Err:{tracking_err:.4f} | Comm:{comm*100:.1f}%")
+    
+    def _update_plots(self):
+        if not HAS_MATPLOTLIB:
+            return
+        with self.plot_output:
+            clear_output(wait=True)
+            fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+            
+            # Plot 1: Position
+            ax1 = axes[0, 0]
+            if self.best_trajectory:
+                t = self.best_trajectory['times']
+                ax1.plot(t, self.best_trajectory['leader_pos'], 'r-', lw=2, label='Leader')
+                fp = self.best_trajectory['follower_pos']
+                colors = plt.cm.Blues(np.linspace(0.3, 0.9, fp.shape[1]))
+                for i in range(min(5, fp.shape[1])):
+                    ax1.plot(t, fp[:, i], color=colors[i], alpha=0.7, lw=1)
+            ax1.set_title(f'Position (R={self.best_reward:.2f})')
+            ax1.set_xlabel('Time'); ax1.set_ylabel('Position')
+            ax1.legend(loc='upper right'); ax1.grid(True, alpha=0.3)
+            
+            # Plot 2: Velocity
+            ax2 = axes[0, 1]
+            if self.best_trajectory:
+                ax2.plot(t, self.best_trajectory['leader_vel'], 'r-', lw=2)
+                fv = self.best_trajectory['follower_vel']
+                for i in range(min(5, fv.shape[1])):
+                    ax2.plot(t, fv[:, i], color=colors[i], alpha=0.7, lw=1)
+            ax2.set_title('Velocity')
+            ax2.set_xlabel('Time'); ax2.set_ylabel('Velocity')
+            ax2.grid(True, alpha=0.3)
+            
+            # Plot 3: Reward
+            ax3 = axes[1, 0]
+            eps = list(range(1, len(self.reward_history) + 1))
+            ax3.plot(eps, self.reward_history, color='#11998e', alpha=0.3, lw=1)
+            if len(self.reward_history) > 10:
+                w = min(20, len(self.reward_history))
+                sm = np.convolve(self.reward_history, np.ones(w)/w, mode='valid')
+                ax3.plot(range(w, len(self.reward_history)+1), sm, color='#11998e', lw=2)
+            ax3.set_title('Reward'); ax3.set_xlabel('Episode')
+            ax3.grid(True, alpha=0.3)
+            
+            ax3t = ax3.twinx()
+            ax3t.plot(eps, [c*100 for c in self.comm_history], 'r--', lw=1.5)
+            ax3t.set_ylabel('Comm %', color='r'); ax3t.set_ylim(0, 100)
+            
+            # Plot 4: Error
+            ax4 = axes[1, 1]
+            ax4.plot(eps, self.tracking_error_history, color='#38ef7d', alpha=0.3, lw=1)
+            if len(self.tracking_error_history) > 10:
+                sme = np.convolve(self.tracking_error_history, np.ones(w)/w, mode='valid')
+                ax4.plot(range(w, len(self.tracking_error_history)+1), sme, color='#38ef7d', lw=2)
+            ax4.set_title('Tracking Error'); ax4.set_xlabel('Episode')
+            ax4.grid(True, alpha=0.3)
+            if max(self.tracking_error_history) / (min(self.tracking_error_history) + 1e-8) > 10:
+                ax4.set_yscale('log')
+            
+            plt.tight_layout()
+            plt.show()
+    
+    def finish(self):
+        elapsed = time.time() - self.start_time
+        if self.use_widgets:
+            self.main_progress.value = 100
+            self.main_progress.bar_style = 'success'
+            with self.log_output:
+                print("=" * 40)
+                print(f"✅ Done! Time: {self._format_time(elapsed)}, Best: {self.best_reward:.2f}")
+        else:
+            print(f"\n✅ Training complete! Best reward: {self.best_reward:.2f}")"""
+训练脚本
+"""
+from config import (
+    NUM_FOLLOWERS, NUM_PINNED, MAX_STEPS, BATCH_SIZE,
+    NUM_EPISODES, VIS_INTERVAL, SAVE_MODEL_PATH, print_config
+)
+from topology import DirectedSpanningTreeTopology
+from environment import LeaderFollowerMASEnv
+from agent import SACAgent
+from dashboard import TrainingDashboard
+from utils import collect_trajectory, plot_evaluation
+
+
+def train(num_episodes=NUM_EPISODES, vis_interval=VIS_INTERVAL, show_dashboard=True):
+    """训练主函数"""
+    print_config()
+    
+    # 初始化
+    topology = DirectedSpanningTreeTopology(NUM_FOLLOWERS, num_pinned=NUM_PINNED)
+    env = LeaderFollowerMASEnv(topology)
+    agent = SACAgent(topology)
+    
+    dashboard = None
+    if show_dashboard:
+        dashboard = TrainingDashboard(num_episodes, vis_interval)
+        dashboard.display()
+    
+    best_reward = -float('inf')
+    
+    for episode in range(1, num_episodes + 1):
+        state = env.reset()
+        episode_reward = 0
+        episode_tracking_err = 0
+        episode_comm = 0
+        
+        for step in range(MAX_STEPS):
+            if dashboard:
+                dashboard.update_step(step + 1, MAX_STEPS)
+            
+            action = agent.select_action(state, deterministic=False)
+            next_state, reward, done, info = env.step(action)
+            
+            agent.store_transition(state, action, reward, next_state, done)
+            agent.update(BATCH_SIZE)
+            
+            episode_reward += reward
+            episode_tracking_err += info['tracking_error']
+            episode_comm += info['comm_rate']
+            state = next_state
+        
+        avg_tracking_err = episode_tracking_err / MAX_STEPS
+        avg_comm = episode_comm / MAX_STEPS
+        
+        trajectory_data = None
+        if episode % vis_interval == 0 or episode == 1 or episode_reward > best_reward:
+            trajectory_data = collect_trajectory(agent, env, MAX_STEPS)
+        
+        if episode_reward > best_reward:
+            best_reward = episode_reward
+            agent.save(SAVE_MODEL_PATH)
+        
+        if dashboard:
+            dashboard.update_episode(
+                episode, episode_reward, avg_tracking_err, avg_comm,
+                agent.last_losses, trajectory_data
+            )
+        elif episode % 20 == 0:
+            print(f"Ep {episode:4d} | R:{episode_reward:7.2f} | Err:{avg_tracking_err:.4f}")
+    
+    if dashboard:
+        dashboard.finish()
+    
+    print(f"\n✅ Training complete! Best: {best_reward:.2f}")
+    return agent, topology, dashboard
+
+
+if __name__ == '__main__':
+    agent, topology, _ = train(show_dashboard=False)
+    plot_evaluation(agent, topology, num_tests=3, save_path='evaluation.png')

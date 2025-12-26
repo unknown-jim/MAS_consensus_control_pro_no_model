@@ -1,0 +1,301 @@
+"""
+训练可视化仪表盘
+"""
+import time
+import numpy as np
+
+try:
+    import matplotlib.pyplot as plt
+    HAS_MATPLOTLIB = True
+except ImportError:
+    HAS_MATPLOTLIB = False
+
+try:
+    import ipywidgets as widgets
+    from IPython.display import display, clear_output
+    HAS_WIDGETS = True
+except ImportError:
+    HAS_WIDGETS = False
+
+
+class TrainingDashboard:
+    """训练仪表盘"""
+    
+    def __init__(self, total_episodes, vis_interval=10):
+        self.total_episodes = total_episodes
+        self.vis_interval = vis_interval
+        self.start_time = None
+        
+        # 历史记录
+        self.reward_history = []
+        self.tracking_error_history = []
+        self.comm_history = []
+        self.best_reward = -float('inf')
+        self.best_trajectory = None
+        
+        self.use_widgets = HAS_WIDGETS and HAS_MATPLOTLIB
+        
+        if self.use_widgets:
+            self._create_widgets()
+    
+    def _create_widgets(self):
+        """创建 UI 组件"""
+        self.title_html = widgets.HTML(value="""
+            <div style="background: linear-gradient(90deg, #11998e 0%, #38ef7d 100%); 
+                        padding: 15px; border-radius: 10px; margin-bottom: 10px;">
+                <h2 style="color: white; margin: 0; text-align: center;">
+                    🎯 Leader-Follower MAS Consensus Control
+                </h2>
+            </div>
+        """)
+        
+        self.main_progress = widgets.FloatProgress(
+            value=0, min=0, max=100, description='Total:',
+            bar_style='info', style={'bar_color': '#11998e', 'description_width': '60px'},
+            layout=widgets.Layout(width='100%', height='30px')
+        )
+        
+        self.step_progress = widgets.FloatProgress(
+            value=0, min=0, max=100, description='Episode:',
+            bar_style='success', style={'bar_color': '#38ef7d', 'description_width': '60px'},
+            layout=widgets.Layout(width='100%', height='20px')
+        )
+        
+        self.progress_text = widgets.HTML(value="<p>Initializing...</p>")
+        self.stats_html = widgets.HTML(value="")
+        self.plot_output = widgets.Output()
+        self.log_output = widgets.Output(layout=widgets.Layout(
+            height='120px', overflow='auto', border='1px solid #ddd', padding='10px'
+        ))
+    
+    def _format_time(self, seconds):
+        """格式化时间"""
+        if seconds is None or seconds < 0:
+            return "N/A"
+        if seconds < 60:
+            return f"{seconds:.0f}s"
+        elif seconds < 3600:
+            return f"{seconds//60:.0f}m {seconds%60:.0f}s"
+        return f"{seconds//3600:.0f}h {(seconds%3600)//60:.0f}m"
+    
+    def _get_elapsed(self):
+        """获取已用时间"""
+        if self.start_time is None:
+            return 0
+        return time.time() - self.start_time
+    
+    def _estimate_remaining(self, episode, elapsed):
+        """估计剩余时间"""
+        if episode == 0 or elapsed is None or elapsed <= 0:
+            return "..."
+        return self._format_time((elapsed / episode) * (self.total_episodes - episode))
+    
+    def _generate_stats_html(self, episode, reward, tracking_err, comm, best, losses, elapsed):
+        """生成统计信息 HTML"""
+        # 根据数值选择颜色
+        r_color = "#48bb78" if reward > -5 else "#f56565" if reward < -15 else "#ed8936"
+        e_color = "#48bb78" if tracking_err < 0.5 else "#f56565" if tracking_err > 2 else "#ed8936"
+        c_color = "#48bb78" if comm < 0.3 else "#f56565" if comm > 0.6 else "#ed8936"
+        
+        return f"""
+        <div style="display: flex; flex-wrap: wrap; gap: 10px; margin: 10px 0;">
+            <div style="flex:1;min-width:100px;background:linear-gradient(135deg,#11998e,#38ef7d);padding:10px;border-radius:8px;color:white;text-align:center;">
+                <div style="font-size:11px;">📍 Episode</div>
+                <div style="font-size:18px;font-weight:bold;">{episode}/{self.total_episodes}</div>
+            </div>
+            <div style="flex:1;min-width:100px;background:{r_color};padding:10px;border-radius:8px;color:white;text-align:center;">
+                <div style="font-size:11px;">🏆 Reward</div>
+                <div style="font-size:18px;font-weight:bold;">{reward:.2f}</div>
+                <div style="font-size:9px;">Best: {best:.2f}</div>
+            </div>
+            <div style="flex:1;min-width:100px;background:{e_color};padding:10px;border-radius:8px;color:white;text-align:center;">
+                <div style="font-size:11px;">🎯 Error</div>
+                <div style="font-size:18px;font-weight:bold;">{tracking_err:.4f}</div>
+            </div>
+            <div style="flex:1;min-width:100px;background:{c_color};padding:10px;border-radius:8px;color:white;text-align:center;">
+                <div style="font-size:11px;">📡 Comm</div>
+                <div style="font-size:18px;font-weight:bold;">{comm*100:.1f}%</div>
+            </div>
+            <div style="flex:1;min-width:100px;background:#4a5568;padding:10px;border-radius:8px;color:white;text-align:center;">
+                <div style="font-size:11px;">⏱️ Time</div>
+                <div style="font-size:18px;font-weight:bold;">{self._format_time(elapsed)}</div>
+                <div style="font-size:9px;">ETA: {self._estimate_remaining(episode, elapsed)}</div>
+            </div>
+        </div>
+        <div style="background:#f7fafc;padding:6px;border-radius:6px;font-size:11px;">
+            Q1: <b>{losses.get('q1',0):.4f}</b> | Q2: <b>{losses.get('q2',0):.4f}</b> | 
+            Actor: <b>{losses.get('actor',0):.4f}</b> | α: <b>{losses.get('alpha',0.2):.4f}</b>
+        </div>
+        """
+    
+    def display(self):
+        """显示仪表盘"""
+        self.start_time = time.time()
+        if self.use_widgets:
+            dashboard = widgets.VBox([
+                self.title_html, self.main_progress, self.step_progress,
+                self.progress_text, self.stats_html,
+                widgets.HTML("<h4>📈 Training Progress</h4>"),
+                self.plot_output,
+                widgets.HTML("<h4>📝 Log</h4>"),
+                self.log_output
+            ])
+            display(dashboard)
+        else:
+            print("Dashboard requires ipywidgets in Jupyter environment")
+            print("Falling back to console output...")
+    
+    def update_step(self, step, max_steps):
+        """更新步数进度"""
+        if self.use_widgets:
+            self.step_progress.value = (step / max_steps) * 100
+    
+    def update_episode(self, episode, reward, tracking_err, comm, losses, trajectory_data=None):
+        """更新回合信息"""
+        elapsed = self._get_elapsed()
+        
+        # 记录历史
+        self.reward_history.append(reward)
+        self.tracking_error_history.append(tracking_err)
+        self.comm_history.append(comm)
+        
+        # 更新最佳记录
+        if reward > self.best_reward:
+            self.best_reward = reward
+            if trajectory_data is not None:
+                self.best_trajectory = trajectory_data
+        
+        if self.use_widgets:
+            # 更新进度条
+            self.main_progress.value = (episode / self.total_episodes) * 100
+            self.step_progress.value = 0
+            
+            # 更新文本
+            speed = episode / elapsed if elapsed > 0 else 0
+            self.progress_text.value = f"<p>🚀 <b>Ep {episode}</b> | {speed:.2f} ep/s</p>"
+            self.stats_html.value = self._generate_stats_html(
+                episode, reward, tracking_err, comm, self.best_reward, losses, elapsed
+            )
+            
+            # 更新日志
+            with self.log_output:
+                ts = time.strftime("%H:%M:%S")
+                st = "🏆" if reward >= self.best_reward - 0.1 else "✅" if reward > -10 else "⚠️"
+                print(f"[{ts}] {st} Ep {episode:4d} | R:{reward:7.2f} | Err:{tracking_err:.4f} | Comm:{comm*100:.1f}%")
+            
+            # 更新图表
+            if episode % self.vis_interval == 0 or episode == 1:
+                self._update_plots()
+        else:
+            if episode % 20 == 0:
+                print(f"Ep {episode:4d} | R:{reward:7.2f} | Err:{tracking_err:.4f} | Comm:{comm*100:.1f}%")
+    
+    def _update_plots(self):
+        """更新训练图表"""
+        if not HAS_MATPLOTLIB:
+            return
+            
+        with self.plot_output:
+            clear_output(wait=True)
+            fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+            
+            # 子图 1: 位置跟踪
+            ax1 = axes[0, 0]
+            if self.best_trajectory is not None:
+                t = self.best_trajectory['times']
+                ax1.plot(t, self.best_trajectory['leader_pos'], 'r-', lw=2, label='Leader')
+                fp = self.best_trajectory['follower_pos']
+                colors = plt.cm.Blues(np.linspace(0.3, 0.9, fp.shape[1]))
+                for i in range(min(5, fp.shape[1])):
+                    ax1.plot(t, fp[:, i], color=colors[i], alpha=0.7, lw=1)
+            ax1.set_title(f'Position Tracking (Best R={self.best_reward:.2f})')
+            ax1.set_xlabel('Time (s)')
+            ax1.set_ylabel('Position')
+            ax1.legend(loc='upper right')
+            ax1.grid(True, alpha=0.3)
+            
+            # 子图 2: 速度跟踪
+            ax2 = axes[0, 1]
+            if self.best_trajectory is not None:
+                ax2.plot(t, self.best_trajectory['leader_vel'], 'r-', lw=2, label='Leader')
+                fv = self.best_trajectory['follower_vel']
+                for i in range(min(5, fv.shape[1])):
+                    ax2.plot(t, fv[:, i], color=colors[i], alpha=0.7, lw=1)
+            ax2.set_title('Velocity Tracking')
+            ax2.set_xlabel('Time (s)')
+            ax2.set_ylabel('Velocity')
+            ax2.grid(True, alpha=0.3)
+            
+            # 子图 3: 奖励曲线
+            ax3 = axes[1, 0]
+            eps = list(range(1, len(self.reward_history) + 1))
+            ax3.plot(eps, self.reward_history, color='#11998e', alpha=0.3, lw=1)
+            if len(self.reward_history) > 10:
+                w = min(20, len(self.reward_history))
+                sm = np.convolve(self.reward_history, np.ones(w)/w, mode='valid')
+                ax3.plot(range(w, len(self.reward_history)+1), sm, color='#11998e', lw=2, label='Smoothed')
+            ax3.set_title('Episode Reward')
+            ax3.set_xlabel('Episode')
+            ax3.set_ylabel('Reward')
+            ax3.grid(True, alpha=0.3)
+            ax3.legend()
+            
+            # 添加通信率副轴
+            ax3t = ax3.twinx()
+            ax3t.plot(eps, [c*100 for c in self.comm_history], 'r--', lw=1.5, alpha=0.7, label='Comm Rate')
+            ax3t.set_ylabel('Comm Rate (%)', color='r')
+            ax3t.set_ylim(0, 100)
+            ax3t.tick_params(axis='y', labelcolor='r')
+            
+            # 子图 4: 跟踪误差
+            ax4 = axes[1, 1]
+            ax4.plot(eps, self.tracking_error_history, color='#38ef7d', alpha=0.3, lw=1)
+            if len(self.tracking_error_history) > 10:
+                w = min(20, len(self.tracking_error_history))
+                sme = np.convolve(self.tracking_error_history, np.ones(w)/w, mode='valid')
+                ax4.plot(range(w, len(self.tracking_error_history)+1), sme, color='#38ef7d', lw=2, label='Smoothed')
+            ax4.set_title('Tracking Error')
+            ax4.set_xlabel('Episode')
+            ax4.set_ylabel('Error')
+            ax4.grid(True, alpha=0.3)
+            ax4.legend()
+            
+            # 使用对数刻度（如果误差范围较大）
+            if len(self.tracking_error_history) > 0:
+                max_err = max(self.tracking_error_history)
+                min_err = min(self.tracking_error_history) + 1e-8
+                if max_err / min_err > 10:
+                    ax4.set_yscale('log')
+            
+            plt.tight_layout()
+            plt.show()
+    
+    def finish(self):
+        """训练完成"""
+        elapsed = self._get_elapsed()
+        if self.use_widgets:
+            self.main_progress.value = 100
+            self.main_progress.bar_style = 'success'
+            with self.log_output:
+                print("=" * 50)
+                print(f"✅ Training Complete!")
+                print(f"   Total Time: {self._format_time(elapsed)}")
+                print(f"   Best Reward: {self.best_reward:.2f}")
+                print(f"   Final Tracking Error: {self.tracking_error_history[-1]:.4f}")
+                print(f"   Final Comm Rate: {self.comm_history[-1]*100:.1f}%")
+                print("=" * 50)
+        else:
+            print(f"\n✅ Training complete!")
+            print(f"   Best reward: {self.best_reward:.2f}")
+            print(f"   Time: {self._format_time(elapsed)}")
+    
+    def get_summary(self):
+        """获取训练摘要"""
+        return {
+            'best_reward': self.best_reward,
+            'final_reward': self.reward_history[-1] if self.reward_history else None,
+            'final_tracking_error': self.tracking_error_history[-1] if self.tracking_error_history else None,
+            'final_comm_rate': self.comm_history[-1] if self.comm_history else None,
+            'total_episodes': len(self.reward_history),
+            'elapsed_time': self._get_elapsed()
+        }
