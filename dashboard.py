@@ -1,5 +1,5 @@
 """
-训练可视化仪表盘 - 修复版
+训练可视化仪表盘 - 动态阈值版本
 """
 import time
 import numpy as np
@@ -19,14 +19,37 @@ try:
 except ImportError:
     HAS_WIDGETS = False
 
+# 🔧 导入 MAX_STEPS 用于动态计算阈值
+from config import MAX_STEPS
+
 
 class TrainingDashboard:
-    """训练仪表盘 - 修复版"""
+    """训练仪表盘 - 动态阈值版本"""
     
-    def __init__(self, total_episodes, vis_interval=10):
+    def __init__(self, total_episodes, vis_interval=10, topology=None):
         self.total_episodes = total_episodes
         self.vis_interval = vis_interval
         self.start_time = None
+        self.max_steps = MAX_STEPS
+        
+        # 🔧 保存拓扑信息用于区分角色
+        self.topology = topology
+        self.pinned_followers = topology.pinned_followers if topology else []
+        
+        # 🔧 动态计算阈值（基于 MAX_STEPS）
+        # 每步奖励范围约 [-1.3, 0.5]（经过 soft scaling）
+        # 好的奖励：误差小，每步约 -0.17（对应 tanh(0.1*2)*1 ≈ 0.2 的惩罚 + 0.03 的改进奖励）
+        # 差的奖励：误差大，每步约 -0.67（对应 tanh(0.5*2)*1 ≈ 0.76 的惩罚）
+        self.reward_good_threshold = -0.17 * self.max_steps  # 好：> -51 (for 300 steps)
+        self.reward_poor_threshold = -0.67 * self.max_steps  # 差：< -201 (for 300 steps)
+        
+        # 跟踪误差阈值（每步平均值，与 MAX_STEPS 无关）
+        self.error_good_threshold = 0.3
+        self.error_poor_threshold = 1.0
+        
+        # 通信率阈值（比例值，与 MAX_STEPS 无关）
+        self.comm_good_threshold = 0.3
+        self.comm_poor_threshold = 0.7
         
         # 历史记录
         self.reward_history = []
@@ -39,6 +62,12 @@ class TrainingDashboard:
         
         if self.use_widgets:
             self._create_widgets()
+        
+        # 打印阈值信息
+        print(f"📊 Dashboard thresholds (based on MAX_STEPS={self.max_steps}):")
+        print(f"   Reward: Good > {self.reward_good_threshold:.1f}, Poor < {self.reward_poor_threshold:.1f}")
+        print(f"   Error:  Good < {self.error_good_threshold}, Poor > {self.error_poor_threshold}")
+        print(f"   Comm:   Good < {self.comm_good_threshold*100:.0f}%, Poor > {self.comm_poor_threshold*100:.0f}%")
     
     def _create_widgets(self):
         """创建 UI 组件"""
@@ -92,11 +121,38 @@ class TrainingDashboard:
             return "..."
         return self._format_time((elapsed / episode) * (self.total_episodes - episode))
     
+    def _get_reward_color(self, reward):
+        """根据奖励值返回颜色"""
+        if reward > self.reward_good_threshold:
+            return "#48bb78"  # 绿色
+        elif reward < self.reward_poor_threshold:
+            return "#f56565"  # 红色
+        else:
+            return "#ed8936"  # 橙色
+    
+    def _get_error_color(self, error):
+        """根据误差值返回颜色"""
+        if error < self.error_good_threshold:
+            return "#48bb78"
+        elif error > self.error_poor_threshold:
+            return "#f56565"
+        else:
+            return "#ed8936"
+    
+    def _get_comm_color(self, comm):
+        """根据通信率返回颜色"""
+        if comm < self.comm_good_threshold:
+            return "#48bb78"
+        elif comm > self.comm_poor_threshold:
+            return "#f56565"
+        else:
+            return "#ed8936"
+    
     def _generate_stats_html(self, episode, reward, tracking_err, comm, best, losses, elapsed):
-        """生成统计信息 HTML"""
-        r_color = "#48bb78" if reward > -500 else "#f56565" if reward < -1500 else "#ed8936"
-        e_color = "#48bb78" if tracking_err < 0.5 else "#f56565" if tracking_err > 2 else "#ed8936"
-        c_color = "#48bb78" if comm < 0.3 else "#f56565" if comm > 0.6 else "#ed8936"
+        """生成统计信息 HTML（使用动态阈值）"""
+        r_color = self._get_reward_color(reward)
+        e_color = self._get_error_color(tracking_err)
+        c_color = self._get_comm_color(comm)
         
         return f"""
         <div style="display: flex; flex-wrap: wrap; gap: 10px; margin: 10px 0;">
@@ -178,10 +234,17 @@ class TrainingDashboard:
                 episode, reward, tracking_err, comm, self.best_reward, losses, elapsed
             )
             
-            # 更新日志
+            # 更新日志（使用动态阈值）
             with self.log_output:
                 ts = time.strftime("%H:%M:%S")
-                st = "🏆" if reward >= self.best_reward - 0.1 else "✅" if reward > -10 else "⚠️"
+                if reward >= self.best_reward - 0.1:
+                    st = "🏆"
+                elif reward > self.reward_good_threshold:
+                    st = "✅"
+                elif reward > self.reward_poor_threshold:
+                    st = "📊"
+                else:
+                    st = "⚠️"
                 print(f"[{ts}] {st} Ep {episode:4d} | R:{reward:7.2f} | Err:{tracking_err:.4f} | Comm:{comm*100:.1f}%")
             
             # 更新图表
@@ -192,15 +255,14 @@ class TrainingDashboard:
                 print(f"Ep {episode:4d} | R:{reward:7.2f} | Err:{tracking_err:.4f} | Comm:{comm*100:.1f}%")
     
     def _update_plots(self):
-        """更新训练图表 - 修复版"""
+        """更新训练图表（2×3 布局，含通信分析）"""
         if not HAS_MATPLOTLIB:
             return
         
         with self.plot_output:
             clear_output(wait=True)
             
-            # 🔧 使用 constrained_layout 替代 tight_layout
-            fig, axes = plt.subplots(2, 2, figsize=(14, 10), constrained_layout=True)
+            fig, axes = plt.subplots(2, 3, figsize=(18, 10), constrained_layout=True)
             
             # 颜色定义
             leader_color = '#e74c3c'
@@ -217,24 +279,37 @@ class TrainingDashboard:
                 lp = self.best_trajectory['leader_pos']
                 num_followers = fp.shape[1]
                 
-                # 绘制 followers
-                colors = plt.cm.Blues(np.linspace(0.4, 0.9, num_followers))
-                for i in range(num_followers):
-                    label = 'Followers' if i == 0 else None
-                    ax1.plot(t, fp[:, i], color=colors[i], alpha=0.6, lw=1.0, label=label)
+                # 🔧 区分 Pinned 和 Normal Follower
+                pinned_indices = [i for i in range(num_followers) if (i + 1) in self.pinned_followers]
+                normal_indices = [i for i in range(num_followers) if (i + 1) not in self.pinned_followers]
                 
-                # 绘制 leader
+                # 绘制 Normal Followers（蓝色系）
+                if normal_indices:
+                    colors_normal = plt.cm.Blues(np.linspace(0.4, 0.8, len(normal_indices)))
+                    for idx, i in enumerate(normal_indices):
+                        label = 'Normal Followers' if idx == 0 else None
+                        ax1.plot(t, fp[:, i], color=colors_normal[idx], alpha=0.6, lw=1.0, label=label)
+                
+                # 绘制 Pinned Followers（绿色系，更粗）
+                if pinned_indices:
+                    colors_pinned = plt.cm.Greens(np.linspace(0.5, 0.9, len(pinned_indices)))
+                    for idx, i in enumerate(pinned_indices):
+                        label = 'Pinned Followers' if idx == 0 else None
+                        ax1.plot(t, fp[:, i], color=colors_pinned[idx], alpha=0.8, lw=1.8, 
+                                linestyle='-', label=label)
+                
+                # 领导者（红色）
                 ax1.plot(t, lp, color=leader_color, lw=2.5, label='Leader', zorder=10)
                 
-                # 绘制平均 follower
+                # 平均值
                 avg_fp = fp.mean(axis=1)
-                ax1.plot(t, avg_fp, color='#2ecc71', lw=2, linestyle='--', 
+                ax1.plot(t, avg_fp, color='#9b59b6', lw=2, linestyle='--', 
                         label='Avg Follower', alpha=0.8, zorder=9)
             
             ax1.set_title(f'Position Tracking (Best R={self.best_reward:.2f})', fontsize=12, fontweight='bold')
             ax1.set_xlabel('Time (s)', fontsize=10)
             ax1.set_ylabel('Position', fontsize=10)
-            ax1.legend(loc='upper right', fontsize=9)
+            ax1.legend(loc='upper right', fontsize=8)
             ax1.grid(True, alpha=0.3)
             
             # ========== 子图 2: 速度跟踪 ==========
@@ -245,74 +320,153 @@ class TrainingDashboard:
                 lv = self.best_trajectory['leader_vel']
                 num_followers = fv.shape[1]
                 
-                colors = plt.cm.Blues(np.linspace(0.4, 0.9, num_followers))
-                for i in range(num_followers):
-                    label = 'Followers' if i == 0 else None
-                    ax2.plot(t, fv[:, i], color=colors[i], alpha=0.6, lw=1.0, label=label)
+                # 🔧 区分 Pinned 和 Normal Follower
+                pinned_indices = [i for i in range(num_followers) if (i + 1) in self.pinned_followers]
+                normal_indices = [i for i in range(num_followers) if (i + 1) not in self.pinned_followers]
                 
+                # 绘制 Normal Followers（蓝色系）
+                if normal_indices:
+                    colors_normal = plt.cm.Blues(np.linspace(0.4, 0.8, len(normal_indices)))
+                    for idx, i in enumerate(normal_indices):
+                        label = 'Normal Followers' if idx == 0 else None
+                        ax2.plot(t, fv[:, i], color=colors_normal[idx], alpha=0.6, lw=1.0, label=label)
+                
+                # 绘制 Pinned Followers（绿色系，更粗）
+                if pinned_indices:
+                    colors_pinned = plt.cm.Greens(np.linspace(0.5, 0.9, len(pinned_indices)))
+                    for idx, i in enumerate(pinned_indices):
+                        label = 'Pinned Followers' if idx == 0 else None
+                        ax2.plot(t, fv[:, i], color=colors_pinned[idx], alpha=0.8, lw=1.8, 
+                                linestyle='-', label=label)
+                
+                # 领导者（红色）
                 ax2.plot(t, lv, color=leader_color, lw=2.5, label='Leader', zorder=10)
                 
+                # 平均值
                 avg_fv = fv.mean(axis=1)
-                ax2.plot(t, avg_fv, color='#2ecc71', lw=2, linestyle='--', 
+                ax2.plot(t, avg_fv, color='#9b59b6', lw=2, linestyle='--', 
                         label='Avg Follower', alpha=0.8, zorder=9)
             
             ax2.set_title('Velocity Tracking', fontsize=12, fontweight='bold')
             ax2.set_xlabel('Time (s)', fontsize=10)
             ax2.set_ylabel('Velocity', fontsize=10)
-            ax2.legend(loc='upper right', fontsize=9)
+            ax2.legend(loc='upper right', fontsize=8)
             ax2.grid(True, alpha=0.3)
             
-            # ========== 子图 3: 奖励曲线 ==========
-            ax3 = axes[1, 0]
+            # ========== 子图 3: 通信分析（新增）==========
+            ax3 = axes[0, 2]
+            if self.best_trajectory is not None and 'comm_rates' in self.best_trajectory:
+                t_comm = self.best_trajectory['times'][1:]  # 通信数据从 step 1 开始
+                comm_rates = self.best_trajectory['comm_rates']
+                thresholds = self.best_trajectory['thresholds']
+                num_followers = thresholds.shape[1]
+                
+                # 区分 Pinned 和 Normal
+                pinned_indices = [i for i in range(num_followers) if (i + 1) in self.pinned_followers]
+                normal_indices = [i for i in range(num_followers) if (i + 1) not in self.pinned_followers]
+                
+                # 滑动窗口平滑通信率
+                window = min(20, len(comm_rates) // 5) if len(comm_rates) > 20 else 5
+                if window >= 2:
+                    comm_smooth = np.convolve(comm_rates, np.ones(window)/window, mode='valid')
+                    t_smooth = t_comm[window-1:]
+                else:
+                    comm_smooth = comm_rates
+                    t_smooth = t_comm
+                
+                # 绘制平滑通信率
+                ax3.plot(t_smooth, comm_smooth * 100, color=comm_color, lw=2.5, 
+                        label=f'Comm Rate (smooth w={window})')
+                ax3.fill_between(t_smooth, 0, comm_smooth * 100, color=comm_color, alpha=0.2)
+                
+                # 绘制阈值（副轴）
+                ax3t = ax3.twinx()
+                
+                # Pinned followers 平均阈值
+                if pinned_indices:
+                    pinned_th = thresholds[:, pinned_indices].mean(axis=1)
+                    ax3t.plot(t_comm, pinned_th, color='#27ae60', lw=1.5, linestyle='--',
+                             label='Pinned Threshold', alpha=0.8)
+                
+                # Normal followers 平均阈值
+                if normal_indices:
+                    normal_th = thresholds[:, normal_indices].mean(axis=1)
+                    ax3t.plot(t_comm, normal_th, color='#3498db', lw=1.5, linestyle='--',
+                             label='Normal Threshold', alpha=0.8)
+                
+                # 所有 followers 平均阈值
+                avg_th = thresholds.mean(axis=1)
+                ax3t.plot(t_comm, avg_th, color='#8e44ad', lw=2, linestyle='-',
+                         label='Avg Threshold', alpha=0.9)
+                
+                ax3.set_xlabel('Time (s)', fontsize=10)
+                ax3.set_ylabel('Comm Rate (%)', color=comm_color, fontsize=10)
+                ax3.set_ylim(0, 100)
+                ax3.tick_params(axis='y', labelcolor=comm_color)
+                
+                ax3t.set_ylabel('Threshold', color='#8e44ad', fontsize=10)
+                ax3t.tick_params(axis='y', labelcolor='#8e44ad')
+                
+                # 合并图例
+                lines1, labels1 = ax3.get_legend_handles_labels()
+                lines2, labels2 = ax3t.get_legend_handles_labels()
+                ax3.legend(lines1 + lines2, labels1 + labels2, loc='upper right', fontsize=8)
+                
+                # 计算统计信息
+                avg_comm = np.mean(comm_rates) * 100
+                ax3.set_title(f'Communication Analysis (Avg: {avg_comm:.1f}%)', 
+                             fontsize=12, fontweight='bold')
+            else:
+                ax3.set_title('Communication Analysis', fontsize=12, fontweight='bold')
+                ax3.text(0.5, 0.5, 'No data yet', ha='center', va='center', 
+                        transform=ax3.transAxes, fontsize=12, color='gray')
+            
+            ax3.grid(True, alpha=0.3)
+            
+            # ========== 子图 4: 奖励曲线 ==========
+            ax4 = axes[1, 0]
             num_eps = len(self.reward_history)
             
             if num_eps > 0:
                 eps = np.arange(1, num_eps + 1)
                 
-                # 绘制原始奖励
-                ax3.plot(eps, self.reward_history, color=raw_color, alpha=0.5, lw=1, 
+                ax4.plot(eps, self.reward_history, color=raw_color, alpha=0.5, lw=1, 
                         label='Raw Reward')
                 
-                # 绘制平滑奖励
                 if num_eps >= 10:
                     w = min(20, num_eps // 2)
                     if w >= 2:
                         sm = np.convolve(self.reward_history, np.ones(w)/w, mode='valid')
                         sm_eps = np.arange(w, num_eps + 1)
-                        ax3.plot(sm_eps, sm, color=smooth_color, lw=2.5, label=f'Smoothed (w={w})')
+                        ax4.plot(sm_eps, sm, color=smooth_color, lw=2.5, label=f'Smoothed (w={w})')
                 
-                # 标记最佳
                 best_idx = np.argmax(self.reward_history)
-                ax3.scatter([best_idx + 1], [self.reward_history[best_idx]], 
+                ax4.scatter([best_idx + 1], [self.reward_history[best_idx]], 
                            color='gold', s=150, marker='*', zorder=15,
                            edgecolors='black', linewidths=0.5, label=f'Best: {self.best_reward:.2f}')
                 
-                # 🔧 修复 x 轴刻度
-                ax3.set_xlim(0, max(num_eps + 1, 10))
-                ax3.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
+                # 🔧 使用动态阈值绘制参考线
+                ax4.axhline(y=self.reward_good_threshold, color='green', linestyle='--', 
+                           alpha=0.5, label=f'Good ({self.reward_good_threshold:.0f})')
+                ax4.axhline(y=self.reward_poor_threshold, color='red', linestyle='--', 
+                           alpha=0.5, label=f'Poor ({self.reward_poor_threshold:.0f})')
+                
+                ax4.set_xlim(0, max(num_eps + 1, 10))
+                ax4.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
             
-            ax3.set_title('Episode Reward', fontsize=12, fontweight='bold')
-            ax3.set_xlabel('Episode', fontsize=10)
-            ax3.set_ylabel('Reward', fontsize=10)
-            ax3.legend(loc='best', fontsize=9)
-            ax3.grid(True, alpha=0.3)
+            ax4.set_title('Episode Reward', fontsize=12, fontweight='bold')
+            ax4.set_xlabel('Episode', fontsize=10)
+            ax4.set_ylabel('Reward', fontsize=10)
+            ax4.legend(loc='best', fontsize=8)
+            ax4.grid(True, alpha=0.3)
             
-            # 添加通信率副轴
-            if num_eps > 0:
-                ax3t = ax3.twinx()
-                ax3t.plot(eps, [c*100 for c in self.comm_history], color=comm_color, 
-                         linestyle=':', lw=1.5, alpha=0.7)
-                ax3t.set_ylabel('Comm Rate (%)', color=comm_color, fontsize=10)
-                ax3t.set_ylim(0, 100)
-                ax3t.tick_params(axis='y', labelcolor=comm_color)
-            
-            # ========== 子图 4: 跟踪误差 ==========
-            ax4 = axes[1, 1]
+            # ========== 子图 5: 跟踪误差 ==========
+            ax5 = axes[1, 1]
             
             if num_eps > 0:
                 eps = np.arange(1, num_eps + 1)
                 
-                ax4.plot(eps, self.tracking_error_history, color=error_color, alpha=0.5, lw=1, 
+                ax5.plot(eps, self.tracking_error_history, color=error_color, alpha=0.5, lw=1, 
                         label='Raw Error')
                 
                 if num_eps >= 10:
@@ -320,24 +474,70 @@ class TrainingDashboard:
                     if w >= 2:
                         sme = np.convolve(self.tracking_error_history, np.ones(w)/w, mode='valid')
                         sme_eps = np.arange(w, num_eps + 1)
-                        ax4.plot(sme_eps, sme, color='#38ef7d', lw=2.5, label=f'Smoothed (w={w})')
+                        ax5.plot(sme_eps, sme, color='#38ef7d', lw=2.5, label=f'Smoothed (w={w})')
                 
-                # 标记最小误差
                 min_idx = np.argmin(self.tracking_error_history)
                 min_err = self.tracking_error_history[min_idx]
-                ax4.scatter([min_idx + 1], [min_err], 
+                ax5.scatter([min_idx + 1], [min_err], 
                            color='lime', s=150, marker='*', zorder=15,
                            edgecolors='black', linewidths=0.5, label=f'Min: {min_err:.4f}')
                 
-                # 🔧 修复 x 轴刻度
-                ax4.set_xlim(0, max(num_eps + 1, 10))
-                ax4.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
+                # 🔧 使用动态阈值绘制参考线
+                ax5.axhline(y=self.error_good_threshold, color='green', linestyle='--', 
+                           alpha=0.5, label=f'Good ({self.error_good_threshold})')
+                ax5.axhline(y=self.error_poor_threshold, color='red', linestyle='--', 
+                           alpha=0.5, label=f'Poor ({self.error_poor_threshold})')
+                
+                ax5.set_xlim(0, max(num_eps + 1, 10))
+                ax5.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
             
-            ax4.set_title('Tracking Error', fontsize=12, fontweight='bold')
-            ax4.set_xlabel('Episode', fontsize=10)
-            ax4.set_ylabel('Error', fontsize=10)
-            ax4.legend(loc='best', fontsize=9)
-            ax4.grid(True, alpha=0.3)
+            ax5.set_title('Tracking Error', fontsize=12, fontweight='bold')
+            ax5.set_xlabel('Episode', fontsize=10)
+            ax5.set_ylabel('Error', fontsize=10)
+            ax5.legend(loc='best', fontsize=8)
+            ax5.grid(True, alpha=0.3)
+            
+            # ========== 子图 6: 通信率趋势（跨 Episode）==========
+            ax6 = axes[1, 2]
+            
+            if num_eps > 0:
+                eps = np.arange(1, num_eps + 1)
+                
+                # 原始通信率
+                ax6.plot(eps, [c*100 for c in self.comm_history], color=comm_color, 
+                        alpha=0.5, lw=1, label='Raw Comm Rate')
+                
+                # 平滑通信率
+                if num_eps >= 10:
+                    w = min(20, num_eps // 2)
+                    if w >= 2:
+                        smc = np.convolve(self.comm_history, np.ones(w)/w, mode='valid')
+                        smc_eps = np.arange(w, num_eps + 1)
+                        ax6.plot(smc_eps, smc * 100, color='#9b59b6', lw=2.5, 
+                                label=f'Smoothed (w={w})')
+                
+                # 参考线
+                ax6.axhline(y=self.comm_good_threshold * 100, color='green', linestyle='--', 
+                           alpha=0.5, label=f'Good (<{self.comm_good_threshold*100:.0f}%)')
+                ax6.axhline(y=self.comm_poor_threshold * 100, color='red', linestyle='--', 
+                           alpha=0.5, label=f'Poor (>{self.comm_poor_threshold*100:.0f}%)')
+                
+                # 最低通信率标记
+                min_comm_idx = np.argmin(self.comm_history)
+                min_comm = self.comm_history[min_comm_idx]
+                ax6.scatter([min_comm_idx + 1], [min_comm * 100], 
+                           color='cyan', s=150, marker='*', zorder=15,
+                           edgecolors='black', linewidths=0.5, label=f'Min: {min_comm*100:.1f}%')
+                
+                ax6.set_xlim(0, max(num_eps + 1, 10))
+                ax6.set_ylim(0, 100)
+                ax6.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
+            
+            ax6.set_title('Communication Rate Trend', fontsize=12, fontweight='bold')
+            ax6.set_xlabel('Episode', fontsize=10)
+            ax6.set_ylabel('Comm Rate (%)', fontsize=10)
+            ax6.legend(loc='best', fontsize=8)
+            ax6.grid(True, alpha=0.3)
             
             plt.show()
     
@@ -370,5 +570,12 @@ class TrainingDashboard:
             'final_tracking_error': self.tracking_error_history[-1] if self.tracking_error_history else None,
             'final_comm_rate': self.comm_history[-1] if self.comm_history else None,
             'total_episodes': len(self.reward_history),
-            'elapsed_time': self._get_elapsed()
+            'elapsed_time': self._get_elapsed(),
+            'max_steps': self.max_steps,
+            'thresholds': {
+                'reward_good': self.reward_good_threshold,
+                'reward_poor': self.reward_poor_threshold,
+                'error_good': self.error_good_threshold,
+                'error_poor': self.error_poor_threshold,
+            }
         }

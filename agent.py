@@ -1,5 +1,9 @@
 """
-SAC 智能体 - 优化版 (修复 PyG 兼容性)
+SAC 智能体 - CTDE 架构版本
+
+关键区别：
+- Actor：分散式，只用本地观测
+- Critic：集中式，用全局状态 + 联合动作
 """
 import torch
 import torch.optim as optim
@@ -9,14 +13,22 @@ import numpy as np
 from config import (
     DEVICE, STATE_DIM, HIDDEN_DIM, ACTION_DIM, NUM_AGENTS,
     LEARNING_RATE, ALPHA_LR, GAMMA, TAU, BATCH_SIZE,
-    INIT_ALPHA, GRADIENT_STEPS
+    INIT_ALPHA, GRADIENT_STEPS, NUM_FOLLOWERS, GLOBAL_STATE_DIM
 )
-from buffer import OptimizedReplayBuffer
+from buffer import CTDEReplayBuffer
 from networks import GaussianActor, SoftQNetwork
 
 
-class SACAgent:
-    """Soft Actor-Critic 智能体 (PyG 兼容版)"""
+class CTDESACAgent:
+    """
+    CTDE SAC 智能体
+    
+    Centralized Training:
+    - Critic 使用全局状态 + 所有智能体的联合动作
+    
+    Decentralized Execution:
+    - Actor 只使用单个智能体的本地观测
+    """
     
     def __init__(self, topology, auto_entropy=True, use_amp=True):
         self.topology = topology
@@ -25,32 +37,33 @@ class SACAgent:
         self.auto_entropy = auto_entropy
         self.use_amp = use_amp and torch.cuda.is_available()
         
-        # 网络初始化
+        # 分散式 Actor（每个智能体共享参数）
         self.actor = GaussianActor(STATE_DIM, HIDDEN_DIM).to(DEVICE)
-        self.q1 = SoftQNetwork(STATE_DIM, HIDDEN_DIM).to(DEVICE)
-        self.q2 = SoftQNetwork(STATE_DIM, HIDDEN_DIM).to(DEVICE)
-        self.q1_target = SoftQNetwork(STATE_DIM, HIDDEN_DIM).to(DEVICE)
-        self.q2_target = SoftQNetwork(STATE_DIM, HIDDEN_DIM).to(DEVICE)
+        
+        # 集中式 Critic（使用全局状态）
+        self.q1 = SoftQNetwork(GLOBAL_STATE_DIM, HIDDEN_DIM).to(DEVICE)
+        self.q2 = SoftQNetwork(GLOBAL_STATE_DIM, HIDDEN_DIM).to(DEVICE)
+        self.q1_target = SoftQNetwork(GLOBAL_STATE_DIM, HIDDEN_DIM).to(DEVICE)
+        self.q2_target = SoftQNetwork(GLOBAL_STATE_DIM, HIDDEN_DIM).to(DEVICE)
         
         self.q1_target.load_state_dict(self.q1.state_dict())
         self.q2_target.load_state_dict(self.q2.state_dict())
         
-        # 冻结目标网络
         for param in self.q1_target.parameters():
             param.requires_grad = False
         for param in self.q2_target.parameters():
             param.requires_grad = False
         
-        # 混合精度训练
         if self.use_amp:
             from torch.cuda.amp import GradScaler
             self.scaler = GradScaler()
-            print("🚀 AMP (混合精度训练) 已启用")
+            print("🚀 AMP (混合精度训练) 已启用 - CTDE 架构")
         else:
             self.scaler = None
         
-        # 熵系数
-        self.target_entropy = -float(ACTION_DIM)
+        # 温度参数（每个智能体共享）
+        # 对于多智能体联合动作空间，target_entropy 应考虑所有智能体
+        self.target_entropy = -float(ACTION_DIM * self.num_followers)
         self.log_alpha = torch.tensor(np.log(INIT_ALPHA), requires_grad=True, device=DEVICE)
         self.alpha = self.log_alpha.exp().item()
         
@@ -60,68 +73,58 @@ class SACAgent:
         self.q2_optimizer = optim.Adam(self.q2.parameters(), lr=LEARNING_RATE)
         self.alpha_optimizer = optim.Adam([self.log_alpha], lr=ALPHA_LR)
         
-        # 经验回放
-        self.buffer = OptimizedReplayBuffer(num_agents=NUM_AGENTS)
-        
-        # 预计算
-        self.role_ids = torch.zeros(self.num_agents, dtype=torch.long, device=DEVICE)
-        self.role_ids[1:] = 1
-        
-        # 缓存
-        self._edge_index_cache = {}
-        self._role_ids_cache = {}
+        # CTDE 缓冲区
+        self.buffer = CTDEReplayBuffer(num_agents=NUM_AGENTS)
         
         self.last_losses = {'q1': 0, 'q2': 0, 'actor': 0, 'alpha': INIT_ALPHA}
         self.update_count = 0
-    
-    def _get_batch_graph_data(self, batch_size):
-        """获取批量图数据 (缓存)"""
-        if batch_size not in self._edge_index_cache:
-            num_nodes = self.num_agents
-            edge_indices = [self.topology.edge_index + i * num_nodes for i in range(batch_size)]
-            self._edge_index_cache[batch_size] = torch.cat(edge_indices, dim=1)
-            self._role_ids_cache[batch_size] = self.role_ids.repeat(batch_size)
-        return self._edge_index_cache[batch_size], self._role_ids_cache[batch_size]
+        
+        print(f"📊 CTDE Agent initialized:")
+        print(f"   Actor input: Local state ({STATE_DIM})")
+        print(f"   Critic input: Global state ({GLOBAL_STATE_DIM}) + Joint action ({NUM_FOLLOWERS * ACTION_DIM})")
     
     @torch.no_grad()
-    def select_action(self, state, deterministic=False):
-        """选择动作"""
-        is_batched = state.dim() == 3
+    def select_action(self, local_states, deterministic=False):
+        """
+        分散式动作选择（只用本地观测）
+        
+        Args:
+            local_states: (batch, num_agents, state_dim) 或 (num_agents, state_dim)
+        """
+        is_batched = local_states.dim() == 3
         
         if is_batched:
-            batch_size = state.shape[0]
-            flat_state = state.view(-1, STATE_DIM)
-            batch_edge_index, batch_role_ids = self._get_batch_graph_data(batch_size)
+            batch_size = local_states.shape[0]
+            # 只处理跟随者
+            follower_states = local_states[:, 1:, :]
+            flat_states = follower_states.reshape(-1, STATE_DIM)
             
             if self.use_amp:
                 with torch.cuda.amp.autocast():
-                    action, _, _ = self.actor(
-                        flat_state, batch_edge_index, batch_role_ids, deterministic=deterministic
-                    )
+                    action, _, _ = self.actor(flat_states, deterministic=deterministic)
             else:
-                action, _, _ = self.actor(
-                    flat_state, batch_edge_index, batch_role_ids, deterministic=deterministic
-                )
+                action, _, _ = self.actor(flat_states, deterministic=deterministic)
+            
             action = action.view(batch_size, self.num_followers, ACTION_DIM)
         else:
+            follower_states = local_states[1:, :]
+            
             if self.use_amp:
                 with torch.cuda.amp.autocast():
-                    action, _, _ = self.actor(
-                        state, self.topology.edge_index, self.role_ids, deterministic=deterministic
-                    )
+                    action, _, _ = self.actor(follower_states, deterministic=deterministic)
             else:
-                action, _, _ = self.actor(
-                    state, self.topology.edge_index, self.role_ids, deterministic=deterministic
-                )
+                action, _, _ = self.actor(follower_states, deterministic=deterministic)
         
         return action.float()
     
-    def store_transitions_batch(self, states, actions, rewards, next_states, dones):
-        """批量存储"""
-        self.buffer.push_batch(states, actions, rewards, next_states, dones)
+    def store_transitions_batch(self, local_states, global_states, actions, rewards, 
+                                next_local_states, next_global_states, dones):
+        """批量存储（包含全局状态）"""
+        self.buffer.push_batch(local_states, global_states, actions, rewards, 
+                               next_local_states, next_global_states, dones)
     
     def update(self, batch_size=BATCH_SIZE, gradient_steps=GRADIENT_STEPS):
-        """更新网络"""
+        """更新网络（CTDE 方式）"""
         if not self.buffer.is_ready(batch_size):
             return {}
         
@@ -132,51 +135,51 @@ class SACAgent:
         for _ in range(gradient_steps):
             self.update_count += 1
             
-            states, actions, rewards, next_states, dones = self.buffer.sample(batch_size)
+            # 采样
+            (local_states, global_states, actions, rewards, 
+             next_local_states, next_global_states, dones) = self.buffer.sample(batch_size)
             
-            flat_states = states.view(-1, STATE_DIM)
-            flat_next_states = next_states.view(-1, STATE_DIM)
-            flat_actions = actions.view(-1, ACTION_DIM)
+            # 准备数据
+            follower_states = local_states[:, 1:, :].reshape(-1, STATE_DIM)
+            follower_next_states = next_local_states[:, 1:, :].reshape(-1, STATE_DIM)
+            joint_actions = actions.view(batch_size, -1)  # (batch, num_followers * action_dim)
             
-            batch_edge_index, batch_role_ids = self._get_batch_graph_data(batch_size)
-            
-            # ========== Critic 更新 ==========
+            # ========== Critic 更新（使用全局状态）==========
             with torch.no_grad():
+                # 使用 Actor 生成下一步动作
                 if self.use_amp:
                     with torch.cuda.amp.autocast():
-                        next_actions, next_log_probs, _ = self.actor(
-                            flat_next_states, batch_edge_index, batch_role_ids
-                        )
-                        q1_next = self.q1_target(flat_next_states, batch_edge_index, batch_role_ids, next_actions)
-                        q2_next = self.q2_target(flat_next_states, batch_edge_index, batch_role_ids, next_actions)
+                        next_actions, next_log_probs, _ = self.actor(follower_next_states)
                 else:
-                    next_actions, next_log_probs, _ = self.actor(
-                        flat_next_states, batch_edge_index, batch_role_ids
-                    )
-                    q1_next = self.q1_target(flat_next_states, batch_edge_index, batch_role_ids, next_actions)
-                    q2_next = self.q2_target(flat_next_states, batch_edge_index, batch_role_ids, next_actions)
+                    next_actions, next_log_probs, _ = self.actor(follower_next_states)
                 
+                # 重塑为联合动作
+                next_joint_actions = next_actions.view(batch_size, -1)
+
+                # 🔧 多智能体熵项：应对联合策略的 log-prob 做“求和”而不是均值
+                # next_log_probs: (batch*num_followers, 1) -> (batch, num_followers, 1) -> (batch, 1)
+                next_log_probs_joint = next_log_probs.view(batch_size, self.num_followers, 1).sum(dim=1)
+                
+                # 使用全局状态计算 Q 值
+                q1_next = self.q1_target(next_global_states, next_joint_actions)
+                q2_next = self.q2_target(next_global_states, next_joint_actions)
                 q_next = torch.min(q1_next, q2_next)
-                q_next = q_next.view(batch_size, self.num_followers).mean(dim=1, keepdim=True)
-                next_log_probs = next_log_probs.view(batch_size, self.num_followers).mean(dim=1, keepdim=True)
                 
-                target_q = rewards.unsqueeze(1) + GAMMA * (1 - dones.unsqueeze(1)) * (q_next - self.alpha * next_log_probs)
+                target_q = rewards.unsqueeze(1) + GAMMA * (1 - dones.unsqueeze(1)) * (q_next - self.alpha * next_log_probs_joint)
                 target_q = target_q.float()
             
             # Q1 更新
             self.q1_optimizer.zero_grad(set_to_none=True)
             if self.use_amp:
                 with torch.cuda.amp.autocast():
-                    q1_curr = self.q1(flat_states, batch_edge_index, batch_role_ids, flat_actions)
-                    q1_curr = q1_curr.view(batch_size, self.num_followers).mean(dim=1, keepdim=True)
+                    q1_curr = self.q1(global_states, joint_actions)
                     q1_loss = F.mse_loss(q1_curr.float(), target_q)
                 self.scaler.scale(q1_loss).backward()
                 self.scaler.unscale_(self.q1_optimizer)
                 torch.nn.utils.clip_grad_norm_(self.q1.parameters(), 1.0)
                 self.scaler.step(self.q1_optimizer)
             else:
-                q1_curr = self.q1(flat_states, batch_edge_index, batch_role_ids, flat_actions)
-                q1_curr = q1_curr.view(batch_size, self.num_followers).mean(dim=1, keepdim=True)
+                q1_curr = self.q1(global_states, joint_actions)
                 q1_loss = F.mse_loss(q1_curr, target_q)
                 q1_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.q1.parameters(), 1.0)
@@ -186,16 +189,14 @@ class SACAgent:
             self.q2_optimizer.zero_grad(set_to_none=True)
             if self.use_amp:
                 with torch.cuda.amp.autocast():
-                    q2_curr = self.q2(flat_states, batch_edge_index, batch_role_ids, flat_actions)
-                    q2_curr = q2_curr.view(batch_size, self.num_followers).mean(dim=1, keepdim=True)
+                    q2_curr = self.q2(global_states, joint_actions)
                     q2_loss = F.mse_loss(q2_curr.float(), target_q)
                 self.scaler.scale(q2_loss).backward()
                 self.scaler.unscale_(self.q2_optimizer)
                 torch.nn.utils.clip_grad_norm_(self.q2.parameters(), 1.0)
                 self.scaler.step(self.q2_optimizer)
             else:
-                q2_curr = self.q2(flat_states, batch_edge_index, batch_role_ids, flat_actions)
-                q2_curr = q2_curr.view(batch_size, self.num_followers).mean(dim=1, keepdim=True)
+                q2_curr = self.q2(global_states, joint_actions)
                 q2_loss = F.mse_loss(q2_curr, target_q)
                 q2_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.q2.parameters(), 1.0)
@@ -205,21 +206,33 @@ class SACAgent:
             self.actor_optimizer.zero_grad(set_to_none=True)
             if self.use_amp:
                 with torch.cuda.amp.autocast():
-                    new_actions, log_probs, _ = self.actor(flat_states, batch_edge_index, batch_role_ids)
-                    q1_new = self.q1(flat_states, batch_edge_index, batch_role_ids, new_actions)
-                    q2_new = self.q2(flat_states, batch_edge_index, batch_role_ids, new_actions)
+                    new_actions, log_probs, _ = self.actor(follower_states)
+                    new_joint_actions = new_actions.view(batch_size, -1)
+                    
+                    # 使用全局状态评估动作
+                    q1_new = self.q1(global_states, new_joint_actions)
+                    q2_new = self.q2(global_states, new_joint_actions)
                     q_new = torch.min(q1_new, q2_new)
-                    actor_loss = (self.alpha * log_probs - q_new).mean()
+                    
+                    # 🔧 联合策略熵项：对跟随者维度求和（与 target_entropy 定义一致）
+                    log_probs_joint = log_probs.view(batch_size, self.num_followers, 1).sum(dim=1)
+                    actor_loss = (self.alpha * log_probs_joint - q_new).mean()
+                
                 self.scaler.scale(actor_loss).backward()
                 self.scaler.unscale_(self.actor_optimizer)
                 torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
                 self.scaler.step(self.actor_optimizer)
             else:
-                new_actions, log_probs, _ = self.actor(flat_states, batch_edge_index, batch_role_ids)
-                q1_new = self.q1(flat_states, batch_edge_index, batch_role_ids, new_actions)
-                q2_new = self.q2(flat_states, batch_edge_index, batch_role_ids, new_actions)
+                new_actions, log_probs, _ = self.actor(follower_states)
+                new_joint_actions = new_actions.view(batch_size, -1)
+                
+                q1_new = self.q1(global_states, new_joint_actions)
+                q2_new = self.q2(global_states, new_joint_actions)
                 q_new = torch.min(q1_new, q2_new)
-                actor_loss = (self.alpha * log_probs - q_new).mean()
+                
+                log_probs_joint = log_probs.view(batch_size, self.num_followers, 1).sum(dim=1)
+                actor_loss = (self.alpha * log_probs_joint - q_new).mean()
+                
                 actor_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
                 self.actor_optimizer.step()
@@ -227,18 +240,23 @@ class SACAgent:
             # ========== Alpha 更新 ==========
             if self.auto_entropy:
                 self.alpha_optimizer.zero_grad(set_to_none=True)
-                alpha_loss = -(self.log_alpha * (log_probs.detach() + self.target_entropy)).mean()
+
+                # 🔧 alpha 更新也应基于“联合动作”的 log-prob（对跟随者求和后再对 batch 求均值）
+                log_probs_joint_detached = log_probs.view(batch_size, self.num_followers, 1).sum(dim=1).detach()
+                mean_log_prob = log_probs_joint_detached.mean()
+
+                alpha_loss = -(self.log_alpha * (mean_log_prob + self.target_entropy))
                 alpha_loss.backward()
                 self.alpha_optimizer.step()
                 self.alpha = self.log_alpha.exp().item()
             
+            # ========== AMP Scaler 更新（在所有 step 之后）==========
+            if self.use_amp:
+                self.scaler.update()
+            
             # ========== 软更新 ==========
             self._soft_update(self.q1, self.q1_target)
             self._soft_update(self.q2, self.q2_target)
-            
-            # 更新 scaler
-            if self.use_amp:
-                self.scaler.update()
             
             total_q1_loss += q1_loss.item()
             total_q2_loss += q2_loss.item()
@@ -268,7 +286,7 @@ class SACAgent:
             'log_alpha': self.log_alpha,
             'update_count': self.update_count,
         }, path)
-        print(f"✅ Model saved to {path}")
+        print(f"✅ CTDE Model saved to {path}")
     
     def load(self, path):
         checkpoint = torch.load(path, map_location=DEVICE, weights_only=False)
@@ -280,4 +298,8 @@ class SACAgent:
         if 'log_alpha' in checkpoint:
             self.log_alpha = checkpoint['log_alpha']
             self.alpha = self.log_alpha.exp().item()
-        print(f"✅ Model loaded from {path}")
+        print(f"✅ CTDE Model loaded from {path}")
+
+
+# 保留旧名称以兼容
+SACAgent = CTDESACAgent

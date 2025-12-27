@@ -1,5 +1,5 @@
 """
-工具函数
+工具函数 - CTDE 版本
 """
 import torch
 import numpy as np
@@ -15,7 +15,7 @@ from config import DEVICE, MAX_STEPS
 
 @torch.no_grad()
 def collect_trajectory(agent, env, max_steps=MAX_STEPS):
-    """收集轨迹用于可视化"""
+    """收集轨迹用于可视化（CTDE 版本，含通信数据）"""
     state = env.reset()
     
     times = [0]
@@ -24,28 +24,45 @@ def collect_trajectory(agent, env, max_steps=MAX_STEPS):
     follower_pos = [env.positions[1:].cpu().numpy()]
     follower_vel = [env.velocities[1:].cpu().numpy()]
     
+    # 🔧 通信数据
+    comm_rates = []  # 每步的通信率
+    thresholds = []  # 每步的阈值
+    triggered = []   # 每步每个智能体是否触发通信
+    
     for step in range(max_steps):
+        # 🔧 state 需要是 (num_agents, state_dim) 格式
+        if state.dim() == 1:
+            state = state.unsqueeze(0)
+        
         action = agent.select_action(state, deterministic=True)
-        state, _, _, _ = env.step(action)
+        state, _, _, info = env.step(action)
         
         times.append(env.t)
         leader_pos.append(env.positions[0].item())
         leader_vel.append(env.velocities[0].item())
         follower_pos.append(env.positions[1:].cpu().numpy())
         follower_vel.append(env.velocities[1:].cpu().numpy())
+        
+        # 🔧 记录通信数据
+        comm_rates.append(info['comm_rate'])
+        # 阈值从 action 中提取 (action shape: num_followers, 2)
+        thresholds.append(action[:, 1].cpu().numpy())
     
     return {
         'times': np.array(times),
         'leader_pos': np.array(leader_pos),
         'leader_vel': np.array(leader_vel),
         'follower_pos': np.array(follower_pos),
-        'follower_vel': np.array(follower_vel)
+        'follower_vel': np.array(follower_vel),
+        # 🔧 通信数据
+        'comm_rates': np.array(comm_rates),
+        'thresholds': np.array(thresholds),  # (steps, num_followers)
     }
 
 
 @torch.no_grad()
 def evaluate_agent(agent, env, num_episodes=5):
-    """评估智能体性能"""
+    """评估智能体性能（CTDE 版本）"""
     results = {
         'rewards': [],
         'tracking_errors': [],
@@ -84,9 +101,9 @@ def plot_evaluation(agent, topology, num_tests=3, save_path=None):
         print("matplotlib not available")
         return
     
-    from environment import LeaderFollowerMASEnv
+    from environment import ModelFreeEnv
     
-    env = LeaderFollowerMASEnv(topology)
+    env = ModelFreeEnv(topology)
     
     fig, axes = plt.subplots(num_tests, 2, figsize=(14, 4 * num_tests))
     if num_tests == 1:
@@ -133,7 +150,7 @@ def plot_evaluation(agent, topology, num_tests=3, save_path=None):
     
     plt.show()
     
-    print("\n📊 Evaluation Results:")
+    print("\n📊 CTDE Evaluation Results:")
     print("-" * 40)
     for i, r in enumerate(results):
         print(f"Test {i+1}: Final Err = {r['final_error']:.4f}, Avg Err = {r['avg_error']:.4f}")
