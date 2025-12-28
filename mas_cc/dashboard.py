@@ -554,7 +554,10 @@ class TrainingDashboard:
             ax6.legend(loc="best", fontsize=8)
             ax6.grid(True, alpha=0.3)
 
-            plt.show()
+            # 在 ipywidgets.Output 中用 display(fig) 渲染，避免 inline backend 的“自动渲染 + plt.show()”重复输出
+            display(fig)
+            # 关闭 figure，防止 notebook 在 cell 结束时再次自动渲染/累计打开的 figure
+            plt.close(fig)
 
     def save_training_progress(self, save_path: str | None = None, dpi: int = 150):
         if self._last_progress_fig is None:

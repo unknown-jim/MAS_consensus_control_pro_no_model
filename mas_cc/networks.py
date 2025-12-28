@@ -16,7 +16,12 @@ from .config import (
     ACTION_DIM,
     DROPOUT,
     GLOBAL_STATE_DIM,
+    GLOBAL_STATE_INCLUDE_BROADCAST,
+    GLOBAL_STATE_INCLUDE_LEADER_PARAMS,
+    GLOBAL_STATE_INCLUDE_TIME,
+    GLOBAL_STATE_INCLUDE_TRAJ_TYPE,
     HIDDEN_DIM,
+    LEADER_TRAJECTORY_TYPES,
     LOCAL_OBS_DIM,
     LOG_STD_MAX,
     LOG_STD_MIN,
@@ -24,6 +29,7 @@ from .config import (
     NEIGHBOR_FEAT_DIM,
     NEIGHBOR_OBS_DIM,
     NEIGHBOR_ROLE_DIM,
+    NUM_AGENTS,
     NUM_ATTENTION_HEADS,
     NUM_FOLLOWERS,
     NUM_TRANSFORMER_LAYERS,
@@ -350,20 +356,103 @@ class DecentralizedActor(nn.Module):
 
 
 # ============================================================
-# Critic / Value
+# Critic / Value（Set-Invariant Encoder，适配规模扩展）
 # ============================================================
 
 
+def _split_global_state(global_state: torch.Tensor):
+    """把 flat `global_state` 拆成：agent 级特征序列 + 全局上下文。
+
+    该拆分必须与 `environment.py::get_global_state()` 的拼接顺序严格一致。
+
+    Returns:
+        agent_feats: (B, NUM_AGENTS, agent_feat_dim)
+        global_ctx: (B, ctx_dim)；可能为 0 维
+    """
+
+    if global_state.dim() != 2:
+        raise ValueError(f"Expected global_state dim=2, got shape={tuple(global_state.shape)}")
+
+    B = int(global_state.shape[0])
+    N = int(NUM_AGENTS)
+
+    offset = 0
+    pos = global_state[:, offset:offset + N]
+    offset += N
+    vel = global_state[:, offset:offset + N]
+    offset += N
+
+    components = [pos, vel]
+
+    if bool(GLOBAL_STATE_INCLUDE_BROADCAST):
+        b_pos = global_state[:, offset:offset + N]
+        offset += N
+        b_vel = global_state[:, offset:offset + N]
+        offset += N
+        components.extend([b_pos, b_vel])
+
+    agent_feats = torch.stack(components, dim=-1)  # (B, N, 2/4)
+
+    # 剩余部分作为全局上下文（leader params / traj onehot / time）
+    global_ctx = global_state[:, offset:]
+    if global_ctx.numel() == 0:
+        global_ctx = global_state.new_zeros((B, 0))
+
+    return agent_feats, global_ctx
+
+
+class DeepSetsEncoder(nn.Module):
+    """DeepSets 风格集合编码器：对可变数量实体做置换不变的 pooling。"""
+
+    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int | None = None, dropout: float = 0.0):
+        super().__init__()
+        out_dim = int(out_dim) if out_dim is not None else int(hidden_dim)
+
+        self.phi = nn.Sequential(
+            nn.Linear(int(in_dim), hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Dropout(float(dropout)),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),
+        )
+
+        self.rho = nn.Sequential(
+            nn.Linear(hidden_dim, out_dim),
+            nn.GELU(),
+            nn.LayerNorm(out_dim),
+        )
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None):
+        """Args:
+        x: (B, M, D)
+        mask: (B, M)；True 表示该实体无效（会被排除）
+        """
+        h = self.phi(x)
+
+        if mask is not None:
+            valid = (~mask).to(dtype=h.dtype).unsqueeze(-1)
+            h = h * valid
+            denom = valid.sum(dim=1).clamp(min=1.0)
+            pooled = h.sum(dim=1) / denom
+        else:
+            pooled = h.mean(dim=1)
+
+        return self.rho(pooled)
+
+
 class CentralizedCritic(nn.Module):
-    """集中式 Q 网络（用于 CTDE-SAC）。
+    """集中式 Q 网络（用于 CTDE-SAC / 可扩展到 DDPG）。
 
-    输入为 `(global_state, joint_action)`，输出为每个并行样本的 Q 值。
+    与旧实现相比：
+    - 不再直接对 `(global_state, joint_action)` 做大向量拼接 MLP
+    - 而是：
+        1) 将 `global_state` 拆成 agent 级特征序列，DeepSets pooling 得到固定维度表示
+        2) 将 `joint_action` 拆成 follower 动作序列，DeepSets pooling 得到固定维度表示
+        3) 拼接（state_set, action_set, global_ctx）后输出 Q
 
-    Args:
-        global_state_dim: 全局状态维度。
-        num_followers: follower 数量。
-        action_dim: 单个 follower 动作维度。
-        hidden_dim: 隐藏层维度。
+    这样输入维度对 `NUM_AGENTS/NUM_FOLLOWERS` 不敏感，适合规模扩展。
     """
 
     def __init__(
@@ -378,26 +467,37 @@ class CentralizedCritic(nn.Module):
         self.global_state_dim = int(global_state_dim)
         self.num_followers = int(num_followers)
         self.action_dim = int(action_dim)
-        self.joint_action_dim = self.num_followers * self.action_dim
 
-        self.state_encoder = nn.Sequential(
-            nn.Linear(self.global_state_dim, hidden_dim),
-            nn.GELU(),
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.LayerNorm(hidden_dim),
-        )
+        # agent 特征维度与 get_global_state() 保持一致：pos/vel (+ broadcast pos/vel)
+        self.agent_feat_dim = 2 + (2 if bool(GLOBAL_STATE_INCLUDE_BROADCAST) else 0)
 
-        self.action_encoder = nn.Sequential(
-            nn.Linear(self.joint_action_dim, hidden_dim),
-            nn.GELU(),
-            nn.LayerNorm(hidden_dim),
+        # 全局上下文维度：leader params / traj type / time
+        ctx_dim = 0
+        if bool(GLOBAL_STATE_INCLUDE_LEADER_PARAMS):
+            ctx_dim += 3
+        if bool(GLOBAL_STATE_INCLUDE_TRAJ_TYPE):
+            ctx_dim += len(LEADER_TRAJECTORY_TYPES)
+        if bool(GLOBAL_STATE_INCLUDE_TIME):
+            ctx_dim += 1
+        self.ctx_dim = int(ctx_dim)
+
+        self.state_set_encoder = DeepSetsEncoder(self.agent_feat_dim, hidden_dim, out_dim=hidden_dim, dropout=DROPOUT)
+        self.action_set_encoder = DeepSetsEncoder(self.action_dim, hidden_dim, out_dim=hidden_dim, dropout=DROPOUT)
+
+        self.ctx_encoder = (
+            nn.Sequential(
+                nn.Linear(self.ctx_dim, hidden_dim),
+                nn.GELU(),
+                nn.LayerNorm(hidden_dim),
+            )
+            if self.ctx_dim > 0
+            else nn.Identity()
         )
 
         self.q_net = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.Linear(hidden_dim * (3 if self.ctx_dim > 0 else 2), hidden_dim),
             nn.GELU(),
+            nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.GELU(),
             nn.Linear(hidden_dim // 2, 1),
@@ -413,40 +513,101 @@ class CentralizedCritic(nn.Module):
                     nn.init.zeros_(m.bias)
 
     def forward(self, global_state: torch.Tensor, joint_action: torch.Tensor):
-        """前向计算。
+        # 兼容 `@torch.inference_mode()` 产生的 inference tensor（避免反向保存时报错）
+        if global_state.is_inference():
+            global_state = global_state.clone()
+        if joint_action.is_inference():
+            joint_action = joint_action.clone()
 
-        Args:
-            global_state: shape=(B, global_state_dim)
-            joint_action: shape=(B, num_followers * action_dim)
+        if global_state.shape[1] != int(self.global_state_dim):
+            raise ValueError(f"Expected global_state_dim={self.global_state_dim}, got {global_state.shape[1]}")
 
-        Returns:
-            Q 值：shape=(B, 1)
-        """
-        state_feat = self.state_encoder(global_state)
-        action_feat = self.action_encoder(joint_action)
-        combined = torch.cat([state_feat, action_feat], dim=-1)
-        return self.q_net(combined)
+        if joint_action.dim() != 2:
+            raise ValueError(f"Expected joint_action dim=2, got shape={tuple(joint_action.shape)}")
+        expected_joint = int(self.num_followers * self.action_dim)
+        if joint_action.shape[1] != expected_joint:
+            raise ValueError(f"Expected joint_action_dim={expected_joint}, got {joint_action.shape[1]}")
+
+        agent_feats, global_ctx = _split_global_state(global_state)
+        z_s = self.state_set_encoder(agent_feats)
+
+        act_seq = joint_action.view(-1, self.num_followers, self.action_dim)
+        z_a = self.action_set_encoder(act_seq)
+
+        if self.ctx_dim > 0:
+            z_c = self.ctx_encoder(global_ctx)
+            z = torch.cat([z_s, z_a, z_c], dim=-1)
+        else:
+            z = torch.cat([z_s, z_a], dim=-1)
+
+        return self.q_net(z)
 
 
 class CentralizedValue(nn.Module):
     """集中式 Value 网络（CTDE-MAPPO 用）。
 
-    Args:
-        global_state_dim: 全局状态维度。
-        hidden_dim: 隐藏层维度。
+    同样使用集合编码器把可变规模的 agent 状态压成固定维度表示。
     """
 
     def __init__(self, global_state_dim: int = GLOBAL_STATE_DIM, hidden_dim: int = HIDDEN_DIM):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(int(global_state_dim), hidden_dim),
-            nn.GELU(),
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, 1),
+
+        self.global_state_dim = int(global_state_dim)
+        self.agent_feat_dim = 2 + (2 if bool(GLOBAL_STATE_INCLUDE_BROADCAST) else 0)
+
+        ctx_dim = 0
+        if bool(GLOBAL_STATE_INCLUDE_LEADER_PARAMS):
+            ctx_dim += 3
+        if bool(GLOBAL_STATE_INCLUDE_TRAJ_TYPE):
+            ctx_dim += len(LEADER_TRAJECTORY_TYPES)
+        if bool(GLOBAL_STATE_INCLUDE_TIME):
+            ctx_dim += 1
+        self.ctx_dim = int(ctx_dim)
+
+        self.state_set_encoder = DeepSetsEncoder(self.agent_feat_dim, hidden_dim, out_dim=hidden_dim, dropout=DROPOUT)
+
+        self.ctx_encoder = (
+            nn.Sequential(
+                nn.Linear(self.ctx_dim, hidden_dim),
+                nn.GELU(),
+                nn.LayerNorm(hidden_dim),
+            )
+            if self.ctx_dim > 0
+            else nn.Identity()
         )
 
+        self.v_net = nn.Sequential(
+            nn.Linear(hidden_dim * (2 if self.ctx_dim > 0 else 1), hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, gain=1.0)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
     def forward(self, global_state: torch.Tensor):
-        return self.net(global_state)
+        if global_state.is_inference():
+            global_state = global_state.clone()
+
+        if global_state.shape[1] != int(self.global_state_dim):
+            raise ValueError(f"Expected global_state_dim={self.global_state_dim}, got {global_state.shape[1]}")
+
+        agent_feats, global_ctx = _split_global_state(global_state)
+        z_s = self.state_set_encoder(agent_feats)
+
+        if self.ctx_dim > 0:
+            z_c = self.ctx_encoder(global_ctx)
+            z = torch.cat([z_s, z_c], dim=-1)
+        else:
+            z = z_s
+
+        return self.v_net(z)

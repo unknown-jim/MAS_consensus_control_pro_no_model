@@ -42,6 +42,90 @@ from .config import (
 from .networks import CentralizedCritic, CentralizedValue, DecentralizedActor
 
 
+class ActorOnlyPolicy:
+    """只加载共享 Actor 的评估策略（支持任意 follower 数）。
+
+    设计目标：
+    - **评估/部署**场景不需要 centralized critic/value，也不需要 replay/rollout buffer。
+    - 允许你在训练结束后，把 `num_followers` 设得很大（重新创建 topology/env），
+      仍然能用同一个共享 actor 做闭环仿真。
+
+    约束：
+    - `STATE_DIM`/`ACTION_DIM`/`MAX_NEIGHBORS` 等网络输入输出维度必须与训练时一致。
+    - `local_states` 约定 index=0 为 leader，follower 为 1..N。
+    """
+
+    def __init__(self, actor: DecentralizedActor, use_amp: bool = False):
+        self.actor = actor.to(DEVICE)
+        self.actor.eval()
+        self.use_amp = bool(use_amp and DEVICE.type == "cuda")
+        self._autocast = None
+        if self.use_amp:
+            from torch.amp import autocast
+
+            self._autocast = lambda: autocast("cuda")
+
+    @staticmethod
+    def _extract_actor_state_dict(checkpoint) -> dict:
+        # 兼容两种保存形式：
+        # 1) {'actor': actor_state_dict, ...}
+        # 2) 直接保存 actor_state_dict
+        if isinstance(checkpoint, dict) and ("actor" in checkpoint) and isinstance(checkpoint["actor"], dict):
+            return checkpoint["actor"]
+        if isinstance(checkpoint, dict) and any(k.startswith("local_encoder") or k.startswith("neighbor_encoder") for k in checkpoint.keys()):
+            return checkpoint
+        raise ValueError("Unrecognized checkpoint format: cannot find actor state_dict")
+
+    @classmethod
+    def from_checkpoint(cls, path: str, hidden_dim: int = HIDDEN_DIM, strict: bool = True, use_amp: bool = False):
+        ckpt = torch.load(path, map_location=DEVICE)
+        actor = DecentralizedActor(hidden_dim=hidden_dim).to(DEVICE)
+        actor_sd = cls._extract_actor_state_dict(ckpt)
+        actor.load_state_dict(actor_sd, strict=bool(strict))
+        return cls(actor=actor, use_amp=use_amp)
+
+    @torch.inference_mode()
+    def select_action(self, local_states: torch.Tensor, deterministic: bool = True):
+        """根据本地状态选择动作（面向 follower）。
+
+        Args:
+            local_states:
+                - 单环境：shape=(num_agents, STATE_DIM)
+                - 并行环境：shape=(E, num_agents, STATE_DIM)
+            deterministic: 评估默认 True。
+
+        Returns:
+            follower 动作张量：
+                - 单环境：shape=(num_followers, ACTION_DIM)
+                - 并行环境：shape=(E, num_followers, ACTION_DIM)
+        """
+        is_batched = local_states.dim() == 3
+
+        if is_batched:
+            E = int(local_states.shape[0])
+            num_followers = int(local_states.shape[1]) - 1
+            follower_states = local_states[:, 1:, :]
+            flat_states = follower_states.reshape(-1, STATE_DIM)
+
+            if self.use_amp:
+                with self._autocast():
+                    action, _ = self.actor(flat_states, deterministic=bool(deterministic))
+            else:
+                action, _ = self.actor(flat_states, deterministic=bool(deterministic))
+
+            action = action.view(E, num_followers, ACTION_DIM)
+            return action.float()
+
+        num_followers = int(local_states.shape[0]) - 1
+        follower_states = local_states[1:, :]
+        if self.use_amp:
+            with self._autocast():
+                action, _ = self.actor(follower_states, deterministic=bool(deterministic))
+        else:
+            action, _ = self.actor(follower_states, deterministic=bool(deterministic))
+        return action.float()
+
+
 class CTDESACAgent:
     """CTDE-SAC 智能体（集中训练、分散执行）。
 

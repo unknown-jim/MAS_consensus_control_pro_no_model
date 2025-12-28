@@ -75,7 +75,7 @@ LIGHTWEIGHT_MODE = True
 
 # ==================== 算法选择 ====================
 # 可选："MASAC"（CTDE-SAC） / "MAPPO"（CTDE-MAPPO）
-ALGO = "MASAC"
+ALGO = "MAPPO"
 
 # ==================== 输出目录（按算法隔离）====================
 _ALGO_TAG = str(ALGO).lower().strip() if str(ALGO).strip() else "unknown"
@@ -86,8 +86,8 @@ MODELS_DIR = os.path.join(RUN_DIR, "models")
 FIGS_DIR = os.path.join(RUN_DIR, "figs")
 
 # ==================== 网络拓扑 ====================
-NUM_FOLLOWERS = 14
-NUM_PINNED = 3
+NUM_FOLLOWERS = 20
+NUM_PINNED = 5
 NUM_AGENTS = NUM_FOLLOWERS + 1
 
 # ==================== 无模型状态空间 ====================
@@ -102,7 +102,17 @@ NEIGHBOR_LEADER_DIM = 4
 NEIGHBOR_OBS_DIM = NEIGHBOR_STATE_DIM + NEIGHBOR_LEADER_DIM  # 6
 NEIGHBOR_ROLE_DIM = 0
 
-MAX_NEIGHBORS = 6
+# Actor 观测里的 Top-K 邻居槽位数（固定维度，不随智能体数量增长）
+#
+# 可通过环境变量覆盖（在导入本模块前设置）：
+# - MAX_NEIGHBORS=12 python train.py
+# - TOP_K=12 python train.py  （兼容别名）
+_MAX_NEIGHBORS_DEFAULT = 4
+_max_neighbors_env = os.getenv("MAX_NEIGHBORS", "").strip() or os.getenv("TOP_K", "").strip()
+MAX_NEIGHBORS = int(_max_neighbors_env) if _max_neighbors_env else int(_MAX_NEIGHBORS_DEFAULT)
+if MAX_NEIGHBORS <= 0:
+    raise ValueError(f"MAX_NEIGHBORS must be positive, got {MAX_NEIGHBORS}")
+
 NEIGHBOR_FEAT_DIM = NEIGHBOR_OBS_DIM + NEIGHBOR_ROLE_DIM  # 6
 
 STATE_DIM = LOCAL_OBS_DIM + SELF_ROLE_DIM + MAX_NEIGHBORS * NEIGHBOR_FEAT_DIM

@@ -146,11 +146,23 @@ class BatchedModelFreeEnv:
         self._prev_error_valid = torch.zeros(self.num_envs, dtype=torch.bool, device=DEVICE)
 
         self._state_buffer = torch.zeros(self.num_envs, self.num_agents, STATE_DIM, device=DEVICE)
-        self._global_state_buffer = torch.zeros(self.num_envs, GLOBAL_STATE_DIM, device=DEVICE)
+
+        # 评估场景支持任意 `num_agents`：全局状态维度与 buffer 按 topology 动态分配
+        self.global_state_dim = int(self._compute_global_state_dim(self.num_agents))
+        self._global_state_buffer = torch.zeros(self.num_envs, self.global_state_dim, device=DEVICE)
 
         self.reset()
 
     def _precompute_neighbor_indices(self, verbose: bool = True):
+        """预计算每个智能体的候选入邻居索引。
+
+        注意：
+        - `MAX_NEIGHBORS` 现在语义为 **Actor 输入的 Top-K 槽位数**（固定维度，不随智能体数量增长）。
+        - 这里会保留“全量候选邻居”（入邻居）用于：
+            1) leader gossip 吸收更新（看见所有可接收的邻居广播）
+            2) 构造观测时按 `leader_age` 选择 Top-K
+        """
+
         self._neighbor_indices_list = []
         self._neighbor_counts = torch.zeros(self.num_agents, dtype=torch.long, device=DEVICE)
 
@@ -158,28 +170,31 @@ class BatchedModelFreeEnv:
             can_receive_mask = self.topology.adj_matrix[i, :] > 0
             indices = torch.where(can_receive_mask)[0]
 
-            if len(indices) > MAX_NEIGHBORS:
-                indices = indices[:MAX_NEIGHBORS]
-
             self._neighbor_indices_list.append(indices)
             self._neighbor_counts[i] = len(indices)
 
-        self._padded_neighbor_indices = torch.zeros(self.num_agents, MAX_NEIGHBORS, dtype=torch.long, device=DEVICE)
-        self._neighbor_valid_mask = torch.zeros(self.num_agents, MAX_NEIGHBORS, dtype=torch.bool, device=DEVICE)
+        # 候选邻居槽位数（用于内部 gather/max）；至少要 >= MAX_NEIGHBORS，避免 topk/view 出错
+        max_candidates = int(self._neighbor_counts.max().item())
+        max_candidates = max(int(MAX_NEIGHBORS), max_candidates)
+
+        self._padded_neighbor_indices = torch.zeros(self.num_agents, max_candidates, dtype=torch.long, device=DEVICE)
+        self._neighbor_valid_mask = torch.zeros(self.num_agents, max_candidates, dtype=torch.bool, device=DEVICE)
 
         for i, indices in enumerate(self._neighbor_indices_list):
-            num_neighbors = len(indices)
+            num_neighbors = int(len(indices))
             if num_neighbors > 0:
                 self._padded_neighbor_indices[i, :num_neighbors] = indices
                 self._neighbor_valid_mask[i, :num_neighbors] = True
 
         self._max_actual_neighbors = int(self._neighbor_counts.max().item())
+        self._max_candidate_neighbors = int(max_candidates)
 
         self._precompute_role_info()
 
         if verbose:
             print("📊 Precomputed neighbor indices:")
-            print(f"   Max neighbors per agent: {self._max_actual_neighbors}")
+            print(f"   Top-K slots (actor): {int(MAX_NEIGHBORS)}")
+            print(f"   Candidate neighbors (max in-degree): {self._max_actual_neighbors}")
             print(f"   Neighbor counts: {self._neighbor_counts.tolist()}")
             print("   Role encoding: Leader=0, Pinned=1, Normal=2")
 
@@ -283,11 +298,30 @@ class BatchedModelFreeEnv:
         self.positions[env_ids, 1:] = leader_pos.unsqueeze(1) + pos_offset
         self.velocities[env_ids, 1:] = leader_vel.unsqueeze(1) + vel_offset
 
+    @staticmethod
+    def _compute_global_state_dim(num_agents: int) -> int:
+        """根据 `get_global_state()` 的拼接顺序动态计算全局状态维度。
+
+        目的：让评估时可以把 `num_agents` 设置得很大，而不会因为 `GLOBAL_STATE_DIM`
+        是训练时固定常量导致 buffer 越界。
+        """
+        n = int(num_agents)
+        dim = 2 * n
+        if bool(GLOBAL_STATE_INCLUDE_BROADCAST):
+            dim += 2 * n
+        if bool(GLOBAL_STATE_INCLUDE_LEADER_PARAMS):
+            dim += 3
+        if bool(GLOBAL_STATE_INCLUDE_TRAJ_TYPE):
+            dim += len(LEADER_TRAJECTORY_TYPES)
+        if bool(GLOBAL_STATE_INCLUDE_TIME):
+            dim += 1
+        return int(dim)
+
     def get_global_state(self):
         """构造 CTDE 的全局状态。
 
         Returns:
-            全局状态张量，shape=(E, GLOBAL_STATE_DIM)。内容包含：
+            全局状态张量，shape=(E, self.global_state_dim)。内容包含：
             - 所有 agent 的 (pos, vel)（归一化）
             - （可选）最近一次广播的 (pos, vel)
             - （可选）leader 动力学参数（幅值/角频率/相位）
@@ -453,23 +487,45 @@ class BatchedModelFreeEnv:
         )
         b_age_norm = torch.clamp(b_age / denom_steps, 0.0, 1.0)
 
+        # 候选邻居集合（全量入邻居），以及有效 mask
         padded_idx = self._padded_neighbor_indices
         valid_mask = self._neighbor_valid_mask
 
-        idx = padded_idx.unsqueeze(0).expand(self.num_envs, -1, -1)
-        valid = valid_mask.unsqueeze(0).expand(self.num_envs, -1, -1)
+        idx = padded_idx.unsqueeze(0).expand(self.num_envs, -1, -1)   # (E, A, Kcand)
+        valid = valid_mask.unsqueeze(0).expand(self.num_envs, -1, -1) # (E, A, Kcand)
 
-        idx_flat = idx.reshape(self.num_envs, -1)
+        candidate_k = int(padded_idx.shape[1])
+        idx_flat = idx.reshape(self.num_envs, -1)  # (E, A*kcand)
 
-        neighbor_pos = broadcast_pos_norm.gather(1, idx_flat).view(self.num_envs, self.num_agents, MAX_NEIGHBORS)
-        neighbor_vel = broadcast_vel_norm.gather(1, idx_flat).view(self.num_envs, self.num_agents, MAX_NEIGHBORS)
+        # 先抽取“候选邻居”的特征（不直接写入观测；后面按 age 选 Top-K）
+        cand_pos = broadcast_pos_norm.gather(1, idx_flat).view(self.num_envs, self.num_agents, candidate_k)
+        cand_vel = broadcast_vel_norm.gather(1, idx_flat).view(self.num_envs, self.num_agents, candidate_k)
 
-        neighbor_leader_pos = b_leader_pos_norm.gather(1, idx_flat).view(self.num_envs, self.num_agents, MAX_NEIGHBORS)
-        neighbor_leader_vel = b_leader_vel_norm.gather(1, idx_flat).view(self.num_envs, self.num_agents, MAX_NEIGHBORS)
-        neighbor_leader_seq = b_seq_norm.gather(1, idx_flat).view(self.num_envs, self.num_agents, MAX_NEIGHBORS)
-        neighbor_leader_age = b_age_norm.gather(1, idx_flat).view(self.num_envs, self.num_agents, MAX_NEIGHBORS)
+        cand_leader_pos = b_leader_pos_norm.gather(1, idx_flat).view(self.num_envs, self.num_agents, candidate_k)
+        cand_leader_vel = b_leader_vel_norm.gather(1, idx_flat).view(self.num_envs, self.num_agents, candidate_k)
+        cand_leader_seq = b_seq_norm.gather(1, idx_flat).view(self.num_envs, self.num_agents, candidate_k)
+        cand_leader_age = b_age_norm.gather(1, idx_flat).view(self.num_envs, self.num_agents, candidate_k)
 
-        valid_f = valid.to(dtype=neighbor_pos.dtype)
+        # 按 “leader_age 越小越新鲜” 选 Top-K（K = MAX_NEIGHBORS），无效槽位置为极大避免被选中
+        age_for_sort = cand_leader_age.clone()
+        age_for_sort = torch.where(valid, age_for_sort, torch.full_like(age_for_sort, 1e9))
+
+        # torch.topk 支持 largest=False 取最小的 K 个
+        _, topk_idx = torch.topk(age_for_sort, k=int(MAX_NEIGHBORS), dim=2, largest=False)
+
+        # 把 Top-K 特征按新鲜度顺序 gather 出来
+        neighbor_pos = cand_pos.gather(2, topk_idx)
+        neighbor_vel = cand_vel.gather(2, topk_idx)
+
+        neighbor_leader_pos = cand_leader_pos.gather(2, topk_idx)
+        neighbor_leader_vel = cand_leader_vel.gather(2, topk_idx)
+        neighbor_leader_seq = cand_leader_seq.gather(2, topk_idx)
+        neighbor_leader_age = cand_leader_age.gather(2, topk_idx)
+
+        # 把对应的有效位也 gather 过来，确保“没有足够邻居”时其余槽位为 0
+        selected_valid = valid.gather(2, topk_idx)
+        valid_f = selected_valid.to(dtype=neighbor_pos.dtype)
+
         neighbor_pos = neighbor_pos * valid_f
         neighbor_vel = neighbor_vel * valid_f
         neighbor_leader_pos = neighbor_leader_pos * valid_f
@@ -477,7 +533,9 @@ class BatchedModelFreeEnv:
         neighbor_leader_seq = neighbor_leader_seq * valid_f
         neighbor_leader_age = neighbor_leader_age * valid_f
 
-        neighbor_feat = self._state_buffer[:, :, neighbor_start:].view(self.num_envs, self.num_agents, MAX_NEIGHBORS, NEIGHBOR_FEAT_DIM)
+        neighbor_feat = self._state_buffer[:, :, neighbor_start:].view(
+            self.num_envs, self.num_agents, int(MAX_NEIGHBORS), int(NEIGHBOR_FEAT_DIM)
+        )
         neighbor_feat[:, :, :, 0] = neighbor_pos
         neighbor_feat[:, :, :, 1] = neighbor_vel
         neighbor_feat[:, :, :, 2] = neighbor_leader_pos
@@ -562,16 +620,18 @@ class BatchedModelFreeEnv:
 
         idx = padded_idx.unsqueeze(0).expand(self.num_envs, -1, -1)
         valid = valid_mask.unsqueeze(0).expand(self.num_envs, -1, -1)
+
+        candidate_k = int(padded_idx.shape[1])
         idx_flat = idx.reshape(self.num_envs, -1)
 
-        n_seq = self.last_broadcast_leader_seq.gather(1, idx_flat).view(self.num_envs, self.num_agents, MAX_NEIGHBORS)
+        n_seq = self.last_broadcast_leader_seq.gather(1, idx_flat).view(self.num_envs, self.num_agents, candidate_k)
         n_seq = torch.where(valid, n_seq, torch.full_like(n_seq, -1))
         seq_max, argmax = n_seq.max(dim=2)
 
         update_mask = (seq_max >= 0) & (seq_max > self.leader_est_seq)
 
-        n_pos = self.last_broadcast_leader_pos.gather(1, idx_flat).view(self.num_envs, self.num_agents, MAX_NEIGHBORS)
-        n_vel = self.last_broadcast_leader_vel.gather(1, idx_flat).view(self.num_envs, self.num_agents, MAX_NEIGHBORS)
+        n_pos = self.last_broadcast_leader_pos.gather(1, idx_flat).view(self.num_envs, self.num_agents, candidate_k)
+        n_vel = self.last_broadcast_leader_vel.gather(1, idx_flat).view(self.num_envs, self.num_agents, candidate_k)
 
         best_pos = n_pos.gather(2, argmax.unsqueeze(-1)).squeeze(-1)
         best_vel = n_vel.gather(2, argmax.unsqueeze(-1)).squeeze(-1)
