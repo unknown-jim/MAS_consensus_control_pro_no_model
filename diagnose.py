@@ -48,46 +48,12 @@ def diagnose():
     t_large = time.time() - start
     print(f"   Large matrix (2000x2000, 100x): {t_large:.3f}s")
     
-    # 4. 测试 torch_geometric
-    print("\n4️⃣ torch_geometric Test:")
-    try:
-        from torch_geometric.nn import GATConv
-        import torch.nn.functional as F
-        
-        # 创建简单图
-        num_nodes = 100
-        x = torch.randn(num_nodes, 64, device='cuda')
-        edge_index = torch.randint(0, num_nodes, (2, 500), device='cuda')
-        
-        gat = GATConv(64, 64, heads=4).to('cuda')
-        
-        # 预热
-        for _ in range(10):
-            out = gat(x, edge_index)
-        torch.cuda.synchronize()
-        
-        # 测试
-        start = time.time()
-        for _ in range(100):
-            out = gat(x, edge_index)
-        torch.cuda.synchronize()
-        t_gat = time.time() - start
-        print(f"   GATConv (100 nodes, 100x): {t_gat:.3f}s")
-        
-        if t_gat > 5.0:
-            print("   ⚠️ GATConv seems slow!")
-        else:
-            print("   ✅ GATConv performance OK")
-            
-    except ImportError:
-        print("   torch_geometric not installed")
-    
-    # 5. 内存状态
-    print(f"\n5️⃣ GPU Memory:")
+    # 4. 内存状态
+    print(f"\n4️⃣ GPU Memory:")
     print(f"   Allocated: {torch.cuda.memory_allocated(0) / 1024**3:.2f} GB")
     print(f"   Cached: {torch.cuda.memory_reserved(0) / 1024**3:.2f} GB")
     
-    # 6. 建议
+    # 5. 建议
     print("\n" + "=" * 60)
     print("💡 Recommendations:")
     

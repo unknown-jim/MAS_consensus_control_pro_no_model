@@ -4,7 +4,7 @@
 import torch
 import time
 
-from config import (
+from mas_cc.config import (
     NUM_FOLLOWERS, NUM_PINNED, MAX_STEPS, BATCH_SIZE,
     NUM_EPISODES, VIS_INTERVAL, SAVE_MODEL_PATH,
     print_config, set_seed, SEED,
@@ -14,17 +14,10 @@ from config import (
 
     ALGO, PPO_ROLLOUT_STEPS,
 )
-from topology import CommunicationTopology
-from environment import BatchedModelFreeEnv, ModelFreeEnv
-from agent import CTDESACAgent, CTDEMAPPOAgent
-from utils import collect_trajectory, plot_evaluation
-
-try:
-    from dashboard import TrainingDashboard
-    HAS_DASHBOARD = True
-except ImportError:
-    HAS_DASHBOARD = False
-    print("⚠️ Dashboard not available, using console logging")
+from mas_cc.topology import CommunicationTopology
+from mas_cc.environment import BatchedModelFreeEnv, ModelFreeEnv
+from mas_cc.agent import CTDESACAgent, CTDEMAPPOAgent
+from mas_cc.utils import collect_trajectory, plot_evaluation
 
 
 torch.backends.cudnn.benchmark = True
@@ -32,14 +25,13 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 # PyTorch 2.x：提升 matmul 精度/性能（对 Transformer/MLP 常有收益）
-if hasattr(torch, "set_float32_matmul_precision"):
-    torch.set_float32_matmul_precision("high")
+torch.set_float32_matmul_precision("high")
 
 
 def train(
     num_episodes=NUM_EPISODES,
     vis_interval=VIS_INTERVAL,
-    show_dashboard=True,
+    show_dashboard: bool = False,
     seed=SEED,
     profile_timing: bool = False,
 ):
@@ -76,7 +68,10 @@ def train(
         agent = CTDESACAgent(topology, use_amp=USE_AMP)
     
     dashboard = None
-    if show_dashboard and HAS_DASHBOARD:
+    if show_dashboard:
+        # 仅在需要可视化时导入（依赖 Jupyter + ipywidgets）
+        from mas_cc.dashboard import TrainingDashboard
+
         dashboard = TrainingDashboard(num_episodes, vis_interval, topology=topology)
         dashboard.display()
     
@@ -215,5 +210,5 @@ def train(
 if __name__ == '__main__':
     agent, topology, _ = train(show_dashboard=False)
     # 统一从 config 读取评估保存路径（自动落到 results/.../figs/）
-    from config import EVAL_NUM_TESTS, EVAL_SAVE_PATH
+    from mas_cc.config import EVAL_NUM_TESTS, EVAL_SAVE_PATH
     plot_evaluation(agent, topology, num_tests=EVAL_NUM_TESTS, save_path=EVAL_SAVE_PATH)

@@ -3,10 +3,10 @@ import time
 
 import torch
 
-import config as C
-from agent import CTDESACAgent
-from environment import BatchedModelFreeEnv
-from topology import CommunicationTopology
+from mas_cc import config as C
+from mas_cc.agent import CTDESACAgent
+from mas_cc.environment import BatchedModelFreeEnv
+from mas_cc.topology import CommunicationTopology
 
 
 def main():

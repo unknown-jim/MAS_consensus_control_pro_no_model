@@ -1,8 +1,9 @@
 """测试修复后的环境 - 更新判断标准"""
 import torch
-from topology import DirectedSpanningTreeTopology
-from environment import LeaderFollowerMASEnv, BatchedLeaderFollowerEnv
-from config import NUM_FOLLOWERS, MAX_STEPS, DEVICE, THRESHOLD_MIN, THRESHOLD_MAX, TH_SCALE
+
+from mas_cc.config import NUM_FOLLOWERS, NUM_PINNED, MAX_STEPS, DEVICE, THRESHOLD_MIN, THRESHOLD_MAX, TH_SCALE
+from mas_cc.environment import ModelFreeEnv
+from mas_cc.topology import CommunicationTopology
 
 def _raw_threshold_from_env_threshold(threshold_env: float) -> float:
     """把“环境实际阈值”反算为 Actor 动作第 2 维的 raw 值（用于 test_env 施加固定阈值）。"""
@@ -14,8 +15,8 @@ def _raw_threshold_from_env_threshold(threshold_env: float) -> float:
 
 def test_zero_control():
     """测试零调整控制下系统是否稳定"""
-    topology = DirectedSpanningTreeTopology(NUM_FOLLOWERS)
-    env = LeaderFollowerMASEnv(topology)
+    topology = CommunicationTopology(NUM_FOLLOWERS, num_pinned=NUM_PINNED)
+    env = ModelFreeEnv(topology)
     
     state = env.reset()
     errors = []
@@ -45,7 +46,7 @@ def test_zero_control():
 
 def test_optimal_threshold():
     """寻找最优阈值"""
-    topology = DirectedSpanningTreeTopology(NUM_FOLLOWERS)
+    topology = CommunicationTopology(NUM_FOLLOWERS, num_pinned=NUM_PINNED)
     
     print("\n寻找最优阈值:")
     print("-" * 60)
@@ -55,7 +56,7 @@ def test_optimal_threshold():
     
     # threshold_env：环境实际阈值（应位于 [THRESHOLD_MIN, THRESHOLD_MAX]）
     for threshold in [0.10, 0.12, 0.15, 0.18, 0.20, 0.25, 0.35, 0.50]:
-        env = LeaderFollowerMASEnv(topology)
+        env = ModelFreeEnv(topology)
         state = env.reset()
         
         total_comm = 0
@@ -89,8 +90,8 @@ def test_optimal_threshold():
 
 def test_trajectory_tracking():
     """测试轨迹跟踪效果"""
-    topology = DirectedSpanningTreeTopology(NUM_FOLLOWERS)
-    env = LeaderFollowerMASEnv(topology)
+    topology = CommunicationTopology(NUM_FOLLOWERS, num_pinned=NUM_PINNED)
+    env = ModelFreeEnv(topology)
     
     state = env.reset()
     
