@@ -5,6 +5,7 @@ SAC 智能体 - CTDE 架构版本
 - Actor：分散式，只用本地观测
 - Critic：集中式，用全局状态 + 联合动作
 """
+import os
 import torch
 import torch.optim as optim
 import torch.nn.functional as F
@@ -332,6 +333,11 @@ class CTDESACAgent:
             target_param.data.lerp_(param.data, tau)
     
     def save(self, path):
+        # 确保父目录存在（将模型统一保存到 results/.../models/ 等目录时需要）
+        parent = os.path.dirname(str(path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
         torch.save({
             'actor': self.actor.state_dict(),
             'q1': self.q1.state_dict(),
@@ -636,6 +642,10 @@ class CTDEMAPPOAgent:
         return self.last_losses
 
     def save(self, path):
+        parent = os.path.dirname(str(path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
         torch.save({
             'actor': self.actor.state_dict(),
             'value': self.value_net.state_dict(),

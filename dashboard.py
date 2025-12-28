@@ -33,6 +33,8 @@ from config import (
     DASH_COMM_GOOD_THRESHOLD, DASH_COMM_POOR_THRESHOLD,
     # 🔧 标题/实验信息也应跟随 config，避免 notebook/训练输出混淆
     ALGO, NUM_AGENTS, NUM_FOLLOWERS, LIGHTWEIGHT_MODE,
+    # 输出目录
+    FIGS_DIR,
 )
 
 
@@ -655,11 +657,18 @@ class TrainingDashboard:
         mode = "light" if LIGHTWEIGHT_MODE else "full"
 
         if save_path is None:
-            save_path = f"training_progress_{algo}_{NUM_FOLLOWERS}f_{mode}_{ts}.png"
+            # 默认保存到 results/.../figs/ 下
+            save_path = os.path.join(FIGS_DIR, f"training_progress_{algo}_{NUM_FOLLOWERS}f_{mode}_{ts}.png")
         else:
             root, ext = os.path.splitext(save_path)
             ext = ext if ext else ".png"
             save_path = f"{root}_{ts}{ext}"
+
+        # 确保目录存在
+        try:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        except Exception:
+            pass
 
         try:
             self._last_progress_fig.savefig(save_path, dpi=dpi, bbox_inches='tight')

@@ -1,6 +1,18 @@
 """
 配置文件 - CTDE 架构版本（随机初始化）
+
+输出目录约定（统一管理训练产物）：
+- 根目录：OUTPUT_ROOT（默认 results/）
+- 按算法/日期分层：results/<algo>/YYYYMMDD/HHMMSS/
+- 模型：.../models/
+- 图片：.../figs/
+
+可通过环境变量覆盖：
+- RUN_DIR：直接指定本次运行输出目录（最高优先级）
+- OUTPUT_ROOT：指定根目录（默认 results）
 """
+import os
+from datetime import datetime
 import torch
 import random
 import numpy as np
@@ -46,12 +58,49 @@ DEVICE = _select_device()
 SEED = 42
 TOPOLOGY_SEED = 42
 
+# ==================== 输出目录（训练/评估产物统一落盘）====================
+OUTPUT_ROOT = os.getenv('OUTPUT_ROOT', 'results')
+
+# 默认按“日期/时间”分层，避免同一天多次运行互相覆盖
+_RUN_DATE = datetime.now().strftime('%Y%m%d')
+_RUN_TIME = datetime.now().strftime('%H%M%S')
+
+# 允许通过环境变量强制指定本次运行目录（优先级最高）
+# 若未设置 RUN_DIR，则稍后会基于 ALGO 生成默认路径：results/<algo>/YYYYMMDD/HHMMSS/
+RUN_DIR = os.getenv('RUN_DIR', '').strip()
+MODELS_DIR = ''
+FIGS_DIR = ''
+
+
+def ensure_dir(path: str) -> str:
+    """确保目录存在；返回原 path 方便链式使用。"""
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def ensure_parent_dir(file_path: str) -> str:
+    """确保文件父目录存在；返回原 file_path。"""
+    parent = os.path.dirname(file_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    return file_path
+
 # ==================== 模式选择 ====================
 LIGHTWEIGHT_MODE = True
 
 # ==================== 算法选择 ====================
 # 可选："MASAC"（当前 CTDE-SAC 实现） / "MAPPO"（新增 CTDE-MAPPO 实现）
 ALGO = "MASAC"
+
+# ==================== 输出目录（按算法隔离）====================
+# 默认：results/<algo>/YYYYMMDD/HHMMSS/
+# 注：若设置了环境变量 RUN_DIR，则完全按 RUN_DIR 保存（不再额外拼接 algo/date/time）。
+_ALGO_TAG = str(ALGO).lower().strip() if str(ALGO).strip() else 'unknown'
+_RUN_DIR_DEFAULT = os.path.join(OUTPUT_ROOT, _ALGO_TAG, _RUN_DATE, _RUN_TIME)
+if not RUN_DIR:
+    RUN_DIR = _RUN_DIR_DEFAULT
+MODELS_DIR = os.path.join(RUN_DIR, 'models')
+FIGS_DIR = os.path.join(RUN_DIR, 'figs')
 
 # ==================== 网络拓扑 ====================
 # 总智能体数 = 1 Leader + NUM_FOLLOWERS Followers
@@ -273,19 +322,25 @@ POLICY_DELAY = 2                 # 每 2 个 critic 更新，做 1 次 actor+alp
 TARGET_UPDATE_INTERVAL = 2       # 每 2 个 critic 更新做一次 target soft-update
 
 _SAVE_TAG = 'mappo' if str(ALGO).upper().strip() == 'MAPPO' else 'masac'
-SAVE_MODEL_PATH = (
-    f'best_model_ctde_14f_{_SAVE_TAG}_light.pt'
-    if LIGHTWEIGHT_MODE
-    else f'best_model_ctde_14f_{_SAVE_TAG}.pt'
+
+# 确保输出目录存在（训练/评估开始即创建，便于外部监控/同步）
+ensure_dir(MODELS_DIR)
+ensure_dir(FIGS_DIR)
+
+SAVE_MODEL_PATH = ensure_parent_dir(
+    os.path.join(
+        MODELS_DIR,
+        (f'best_model_ctde_14f_{_SAVE_TAG}_light.pt' if LIGHTWEIGHT_MODE else f'best_model_ctde_14f_{_SAVE_TAG}.pt'),
+    )
 )
 
 # ==================== Notebook / Evaluation（建议统一从 config 读取，避免 hardcode）====================
 EVAL_NUM_TESTS = 3
-EVAL_SAVE_PATH = f'final_evaluation_ctde_{_SAVE_TAG}.png'
+EVAL_SAVE_PATH = ensure_parent_dir(os.path.join(FIGS_DIR, f'final_evaluation_ctde_{_SAVE_TAG}.png'))
 
 # 泛化测试：单环境不使用 done（环境内部 dones 恒为 False），这里用步数控制时长
 GENERALIZATION_TEST_STEPS = MAX_STEPS * 2
-GENERALIZATION_SAVE_PATH = f'generalization_test_ctde_{_SAVE_TAG}.png'
+GENERALIZATION_SAVE_PATH = ensure_parent_dir(os.path.join(FIGS_DIR, f'generalization_test_ctde_{_SAVE_TAG}.png'))
 
 # 泛化 OOD（Out-of-distribution）测试：用于查看是否能外推到训练范围外
 GENERALIZATION_INCLUDE_OOD = True
@@ -364,6 +419,12 @@ def print_config():
     print(f"     Base Comm Penalty: {COMM_PENALTY}")
     print(f"     Comm Weight Decay: {COMM_WEIGHT_DECAY}")
     print(f"     Threshold Range: [{THRESHOLD_MIN}, {THRESHOLD_MAX}]")
+    print(f"  💾 Output Paths:")
+    print(f"     RUN_DIR: {RUN_DIR}")
+    print(f"     MODELS_DIR: {MODELS_DIR}")
+    print(f"     FIGS_DIR: {FIGS_DIR}")
+    print(f"     SAVE_MODEL_PATH: {SAVE_MODEL_PATH}")
+    print(f"     EVAL_SAVE_PATH: {EVAL_SAVE_PATH}")
     print(f"  🎯 Reward Settings (Soft Comm Reduction):")
     print(f"     Tracking Penalty: -{TRACKING_PENALTY_MAX}*log1p(err_norm*{TRACKING_PENALTY_SCALE})")
     print(f"       where err_norm = mean(|pos_f-leader|)/{POS_LIMIT} + 0.5*mean(|vel_f-leader|)/{VEL_LIMIT}")

@@ -214,4 +214,6 @@ def train(
 
 if __name__ == '__main__':
     agent, topology, _ = train(show_dashboard=False)
-    plot_evaluation(agent, topology, num_tests=3, save_path='evaluation_ctde.png')
+    # 统一从 config 读取评估保存路径（自动落到 results/.../figs/）
+    from config import EVAL_NUM_TESTS, EVAL_SAVE_PATH
+    plot_evaluation(agent, topology, num_tests=EVAL_NUM_TESTS, save_path=EVAL_SAVE_PATH)
