@@ -1,4 +1,12 @@
-"""测试修复后的环境 - 更新判断标准"""
+"""环境快速自检脚本。
+
+用于在开始训练前做最小 sanity check：
+- 零控制/固定阈值下是否稳定
+- 粗略搜索一个可用的阈值范围
+- 轨迹跟踪相关性（leader 与 follower 平均位置）
+
+注：本脚本里的阈值使用“环境实际阈值”（与 `positions` 同量纲），会转换成策略动作的 raw 值。
+"""
 import torch
 
 from mas_cc.config import NUM_FOLLOWERS, NUM_PINNED, MAX_STEPS, DEVICE, THRESHOLD_MIN, THRESHOLD_MAX, TH_SCALE
@@ -6,15 +14,28 @@ from mas_cc.environment import ModelFreeEnv
 from mas_cc.topology import CommunicationTopology
 
 def _raw_threshold_from_env_threshold(threshold_env: float) -> float:
-    """把“环境实际阈值”反算为 Actor 动作第 2 维的 raw 值（用于 test_env 施加固定阈值）。"""
-    # env: threshold_env = THRESHOLD_MIN + (THRESHOLD_MAX-THRESHOLD_MIN) * clamp(raw/TH_SCALE, 0, 1)
+    """把“环境实际阈值”反算为策略动作的 raw 阈值。
+
+    环境内部的映射关系为：
+        threshold_env = THRESHOLD_MIN + (THRESHOLD_MAX - THRESHOLD_MIN) * clamp(raw/TH_SCALE, 0, 1)
+
+    Args:
+        threshold_env: 环境实际阈值（位于 [THRESHOLD_MIN, THRESHOLD_MAX]）。
+
+    Returns:
+        raw 阈值（对应 actor 动作第 2 维的 raw 值）。
+    """
     x = (threshold_env - THRESHOLD_MIN) / (THRESHOLD_MAX - THRESHOLD_MIN + 1e-12)
     x = float(min(1.0, max(0.0, x)))
     return x * TH_SCALE
 
 
 def test_zero_control():
-    """测试零调整控制下系统是否稳定"""
+    """测试零调整控制（仅固定阈值）下系统是否稳定。
+
+    Returns:
+        若满足稳定判据返回 True，否则 False。
+    """
     topology = CommunicationTopology(NUM_FOLLOWERS, num_pinned=NUM_PINNED)
     env = ModelFreeEnv(topology)
     
@@ -45,7 +66,11 @@ def test_zero_control():
     return stable
 
 def test_optimal_threshold():
-    """寻找最优阈值"""
+    """粗略搜索一个可用的环境阈值。
+
+    Returns:
+        最优阈值（环境实际阈值，非 raw action）。
+    """
     topology = CommunicationTopology(NUM_FOLLOWERS, num_pinned=NUM_PINNED)
     
     print("\n寻找最优阈值:")
@@ -89,7 +114,10 @@ def test_optimal_threshold():
     return best_threshold
 
 def test_trajectory_tracking():
-    """测试轨迹跟踪效果"""
+    """测试轨迹跟踪效果。
+
+    采用 leader 位置与 follower 平均位置的相关系数作为粗指标。
+    """
     topology = CommunicationTopology(NUM_FOLLOWERS, num_pinned=NUM_PINNED)
     env = ModelFreeEnv(topology)
     

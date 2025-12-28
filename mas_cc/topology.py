@@ -1,4 +1,10 @@
-"""通信拓扑（仅用于模拟物理通信范围，不作为神经网络输入）。"""
+"""通信拓扑（仅用于环境模拟，不作为神经网络输入）。
+
+该模块维护一个有向邻接矩阵 `adj_matrix`，用于表示“广播可达性”。
+约定：`adj_matrix[receiver, sender] = 1` 表示 `receiver` 可以接收 `sender` 的广播。
+
+注意：拓扑只影响环境中的通信/估计过程，不会直接作为网络输入特征。
+"""
 
 from __future__ import annotations
 
@@ -12,9 +18,20 @@ from .config import DEVICE, NUM_PINNED, TOPOLOGY_SEED, NUM_PINNED_RANGE, EXTRA_E
 
 
 class CommunicationTopology:
-    """通信拓扑类 - 支持动态随机化。
+    """通信拓扑（可随机化）。
 
-    约定：`adj_matrix[i, j] = 1` 表示智能体 i 可以接收智能体 j 的广播。
+    拓扑会生成以下核心属性：
+    - `adj_matrix`: 形状为 `(num_agents, num_agents)` 的邻接矩阵（receiver, sender）。
+    - `pinned_followers`: 直接与 leader 相连的 follower 列表。
+
+    Args:
+        num_followers: follower 数量（不含 leader）。
+        num_pinned: pinned follower 数量（会被截断到 `[0, num_followers]`）。
+        seed: 随机种子（影响 pinned 选择与随机边）。
+
+    Attributes:
+        num_agents: 智能体总数（`num_followers + 1`）。
+        leader_id: leader 的节点 id（固定为 0）。
     """
 
     def __init__(self, num_followers: int, num_pinned: int = NUM_PINNED, seed: int = TOPOLOGY_SEED):
@@ -65,6 +82,13 @@ class CommunicationTopology:
         self._compute_stats()
 
     def randomize(self):
+        """随机化拓扑结构。
+
+        会在 `NUM_PINNED_RANGE` 内随机采样 pinned 数量，并重建邻接矩阵。
+
+        Returns:
+            新的 pinned follower 列表（按升序）。
+        """
         num_pinned = int(np.random.randint(self.pinned_range[0], self.pinned_range[1] + 1))
         self._build_topology(num_pinned=num_pinned)
         return self.pinned_followers
@@ -75,16 +99,50 @@ class CommunicationTopology:
         self.num_edges = int(self.adj_matrix.sum().item())
 
     def get_receivers(self, sender_id: int):
+        """获取某个 sender 的接收者列表。
+
+        Args:
+            sender_id: 发送者 id。
+
+        Returns:
+            能接收该 sender 广播的节点 id 列表。
+        """
         return torch.where(self.adj_matrix[:, int(sender_id)] > 0)[0].tolist()
 
     def can_receive(self, receiver_id: int, sender_id: int):
+        """判断 receiver 是否能接收 sender 的广播。
+
+        Args:
+            receiver_id: 接收者 id。
+            sender_id: 发送者 id。
+
+        Returns:
+            若可接收返回 True，否则 False。
+        """
         return self.adj_matrix[int(receiver_id), int(sender_id)] > 0
 
     def get_neighbors(self, node_id: int):
+        """获取某个节点的“可接收邻居”（入邻居）列表。
+
+        这里的“邻居”指 `node_id` 可以接收其广播的节点集合。
+
+        Args:
+            node_id: 节点 id。
+
+        Returns:
+            邻居节点 id 列表。
+        """
         return torch.where(self.adj_matrix[int(node_id), :] > 0)[0].tolist()
 
     def visualize(self, save_path: str | None = None):
-        """可视化拓扑结构（需要 matplotlib + networkx）。"""
+        """可视化拓扑结构。
+
+        Args:
+            save_path: 若提供则保存图片到该路径，否则仅展示。
+
+        Raises:
+            ImportError: 当缺少 `matplotlib` 或 `networkx` 时会在导入阶段报错。
+        """
 
         G = nx.DiGraph()
         G.add_nodes_from(range(self.num_agents))

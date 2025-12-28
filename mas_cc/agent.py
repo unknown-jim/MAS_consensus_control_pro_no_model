@@ -43,7 +43,22 @@ from .networks import CentralizedCritic, CentralizedValue, DecentralizedActor
 
 
 class CTDESACAgent:
-    """CTDE SAC 智能体。"""
+    """CTDE-SAC 智能体（集中训练、分散执行）。
+
+    - Actor：对每个 follower 使用本地 flat state 生成动作。
+    - Critic：集中式 Q 网络，输入为 global state + joint action。
+
+    Args:
+        topology: `CommunicationTopology` 实例（提供 follower 数量等信息）。
+        auto_entropy: 是否启用 entropy 系数自动调节（SAC 的 temperature）。
+        use_amp: 是否启用 AMP 混合精度（仅 CUDA 环境有效）。
+
+    Attributes:
+        actor: `DecentralizedActor`，用于执行/策略更新。
+        q1/q2: `CentralizedCritic`，双 Q 网络。
+        buffer: `CTDEReplayBuffer`。
+        value_net: 为了评估工具统一保留（SAC 不使用，恒为 None）。
+    """
 
     def __init__(self, topology, auto_entropy: bool = True, use_amp: bool = True):
         self.topology = topology
@@ -100,6 +115,20 @@ class CTDESACAgent:
 
     @torch.inference_mode()
     def select_action(self, local_states: torch.Tensor, deterministic: bool = False):
+        """根据本地状态选择动作（面向 follower）。
+
+        Args:
+            local_states: 本地状态。
+                - 单环境：shape=(num_agents, STATE_DIM)
+                - 并行环境：shape=(E, num_agents, STATE_DIM)
+                其中 index=0 为 leader，follower 为 1..N。
+            deterministic: 是否使用确定性动作（评估/可视化常用 True）。
+
+        Returns:
+            follower 动作张量：
+            - 单环境：shape=(num_followers, ACTION_DIM)
+            - 并行环境：shape=(E, num_followers, ACTION_DIM)
+        """
         is_batched = local_states.dim() == 3
 
         if is_batched:
@@ -134,9 +163,29 @@ class CTDESACAgent:
         next_global_states: torch.Tensor,
         dones: torch.Tensor,
     ):
+        """向 replay buffer 追加一批 transition。
+
+        Args:
+            local_states: shape=(E, num_agents, STATE_DIM)。
+            global_states: shape=(E, GLOBAL_STATE_DIM)。
+            actions: shape=(E, num_followers, ACTION_DIM)。
+            rewards: shape=(E,)。
+            next_local_states: shape=(E, num_agents, STATE_DIM)。
+            next_global_states: shape=(E, GLOBAL_STATE_DIM)。
+            dones: shape=(E,)；True 表示该并行环境在该步终止（含时间截断）。
+        """
         self.buffer.push_batch(local_states, global_states, actions, rewards, next_local_states, next_global_states, dones)
 
     def update(self, batch_size: int = BATCH_SIZE, gradient_steps: int = GRADIENT_STEPS):
+        """执行一次或多次 SAC 更新。
+
+        Args:
+            batch_size: 每次从 replay buffer 采样的 batch 大小。
+            gradient_steps: 连续更新的次数（每次都会重新采样）。
+
+        Returns:
+            最近一次更新的损失字典（用于日志/仪表盘）。若 buffer 数据不足返回空字典。
+        """
         if not self.buffer.is_ready(batch_size):
             return {}
 
@@ -305,6 +354,11 @@ class CTDESACAgent:
             target_param.data.lerp_(param.data, tau)
 
     def save(self, path: str):
+        """保存模型参数到文件。
+
+        Args:
+            path: 保存路径。
+        """
         parent = os.path.dirname(str(path))
         if parent:
             os.makedirs(parent, exist_ok=True)
@@ -324,6 +378,11 @@ class CTDESACAgent:
         print(f"✅ CTDE Model saved to {path}")
 
     def load(self, path: str):
+        """从文件加载模型参数。
+
+        Args:
+            path: checkpoint 路径。
+        """
         checkpoint = torch.load(path, map_location=DEVICE)
         self.actor.load_state_dict(checkpoint["actor"])
         self.q1.load_state_dict(checkpoint["q1"])
@@ -379,7 +438,19 @@ class _PPOBuffer:
 
 
 class CTDEMAPPOAgent:
-    """CTDE-MAPPO：centralized value + decentralized shared policy（factorized followers）。"""
+    """CTDE-MAPPO 智能体。
+
+    - Policy：对每个 follower 使用本地状态（factorized policy，参数共享）。
+    - Value：集中式 V 网络，输入 global state。
+
+    Args:
+        topology: `CommunicationTopology` 实例。
+        use_amp: 是否启用 AMP（当前实现默认关闭）。
+
+    Notes:
+        MAPPO 是 on-policy 算法，需要先通过 `store_rollout_step()` 收集 rollout，
+        再调用 `update()` 进行多轮 PPO 优化。
+    """
 
     def __init__(self, topology, use_amp: bool = False):
         self.topology = topology
@@ -411,6 +482,18 @@ class CTDEMAPPOAgent:
 
     @torch.inference_mode()
     def act(self, local_states: torch.Tensor, global_states: torch.Tensor | None = None, deterministic: bool = False):
+        """采样动作并（可选）返回 value 估计。
+
+        Args:
+            local_states: shape=(E, num_agents, STATE_DIM)。
+            global_states: shape=(E, GLOBAL_STATE_DIM)；若为 None 则不计算 value。
+            deterministic: 是否使用确定性动作。
+
+        Returns:
+            actions: shape=(E, num_followers, ACTION_DIM)
+            logp_joint: shape=(E, 1)
+            values: shape=(E, 1)；当 global_states 为 None 时填充 NaN。
+        """
         assert local_states.dim() == 3, "MAPPO 训练需要 batched local_states"
         E = int(local_states.shape[0])
 
@@ -565,6 +648,11 @@ class CTDEMAPPOAgent:
         return self.last_losses
 
     def save(self, path: str):
+        """保存模型参数到文件。
+
+        Args:
+            path: 保存路径。
+        """
         parent = os.path.dirname(str(path))
         if parent:
             os.makedirs(parent, exist_ok=True)
@@ -573,6 +661,11 @@ class CTDEMAPPOAgent:
         print(f"✅ CTDE MAPPO Model saved to {path}")
 
     def load(self, path: str):
+        """从文件加载模型参数。
+
+        Args:
+            path: checkpoint 路径。
+        """
         checkpoint = torch.load(path, map_location=DEVICE)
         self.actor.load_state_dict(checkpoint["actor"])
         self.value_net.load_state_dict(checkpoint["value"])

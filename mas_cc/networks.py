@@ -35,7 +35,20 @@ from .config import (
 
 
 def _parse_flat_state(state: torch.Tensor):
-    """把 (batch, STATE_DIM) 的 flat state 拆成结构化输入。"""
+    """把 flat state 拆成结构化输入。
+
+    Args:
+        state: shape=(B, STATE_DIM) 的 flat 状态。
+
+    Returns:
+        local_obs: shape=(B, LOCAL_OBS_DIM)
+        self_role: shape=(B, SELF_ROLE_DIM)
+        neighbor_data: shape=(B, MAX_NEIGHBORS, NEIGHBOR_FEAT_DIM)
+        neighbor_mask: shape=(B, MAX_NEIGHBORS)；True 表示该邻居槽位为空（需要 mask）。
+
+    Raises:
+        ValueError: 当输入维度不匹配时抛出。
+    """
 
     if state.dim() != 2:
         raise ValueError(f"Expected state dim=2, got shape={tuple(state.shape)}")
@@ -67,7 +80,15 @@ def _logit(p: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 
 
 class LightweightAttention(nn.Module):
-    """轻量级注意力模块"""
+    """轻量级自注意力模块。
+
+    用于对邻居序列特征做编码；支持传入 mask 把空邻居槽位从 attention 中屏蔽掉。
+
+    Args:
+        dim: 输入/输出特征维度。
+        num_heads: multi-head 数量。
+        dropout: dropout 概率。
+    """
 
     def __init__(self, dim: int, num_heads: int = 2, dropout: float = 0.05):
         super().__init__()
@@ -290,7 +311,15 @@ class DecentralizedActor(nn.Module):
         return action, log_prob
 
     def evaluate_actions(self, state: torch.Tensor, action: torch.Tensor):
-        """给定 action（post-squash）计算 log_prob。"""
+        """给定动作计算 log_prob（用于 PPO/MAPPO）。
+
+        Args:
+            state: shape=(B, STATE_DIM)。
+            action: shape=(B, ACTION_DIM)，为 post-squash 空间动作（与环境交互的动作）。
+
+        Returns:
+            log_prob: shape=(B, 1)
+        """
 
         v_mean, v_log_std, th_mean, th_log_std = self.compute_action_params(state)
         v_std = torch.exp(v_log_std)
@@ -326,7 +355,16 @@ class DecentralizedActor(nn.Module):
 
 
 class CentralizedCritic(nn.Module):
-    """集中式 Critic（用于 CTDE-SAC）。"""
+    """集中式 Q 网络（用于 CTDE-SAC）。
+
+    输入为 `(global_state, joint_action)`，输出为每个并行样本的 Q 值。
+
+    Args:
+        global_state_dim: 全局状态维度。
+        num_followers: follower 数量。
+        action_dim: 单个 follower 动作维度。
+        hidden_dim: 隐藏层维度。
+    """
 
     def __init__(
         self,
@@ -375,6 +413,15 @@ class CentralizedCritic(nn.Module):
                     nn.init.zeros_(m.bias)
 
     def forward(self, global_state: torch.Tensor, joint_action: torch.Tensor):
+        """前向计算。
+
+        Args:
+            global_state: shape=(B, global_state_dim)
+            joint_action: shape=(B, num_followers * action_dim)
+
+        Returns:
+            Q 值：shape=(B, 1)
+        """
         state_feat = self.state_encoder(global_state)
         action_feat = self.action_encoder(joint_action)
         combined = torch.cat([state_feat, action_feat], dim=-1)
@@ -382,7 +429,12 @@ class CentralizedCritic(nn.Module):
 
 
 class CentralizedValue(nn.Module):
-    """集中式 Value 网络（CTDE-MAPPO 用）。"""
+    """集中式 Value 网络（CTDE-MAPPO 用）。
+
+    Args:
+        global_state_dim: 全局状态维度。
+        hidden_dim: 隐藏层维度。
+    """
 
     def __init__(self, global_state_dim: int = GLOBAL_STATE_DIM, hidden_dim: int = HIDDEN_DIM):
         super().__init__()

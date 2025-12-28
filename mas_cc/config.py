@@ -43,11 +43,27 @@ FIGS_DIR = ""
 
 
 def ensure_dir(path: str) -> str:
+    """确保目录存在。
+
+    Args:
+        path: 目录路径。
+
+    Returns:
+        原样返回 `path`，便于在配置中链式使用。
+    """
     os.makedirs(path, exist_ok=True)
     return path
 
 
 def ensure_parent_dir(file_path: str) -> str:
+    """确保文件的父目录存在。
+
+    Args:
+        file_path: 文件路径。
+
+    Returns:
+        原样返回 `file_path`。
+    """
     parent = os.path.dirname(file_path)
     if parent:
         os.makedirs(parent, exist_ok=True)
@@ -260,6 +276,14 @@ GENERALIZATION_OOD_OMEGA = LEADER_OMEGA_RANGE[1] * 1.25
 
 
 def set_seed(seed: int = SEED) -> None:
+    """设置随机种子。
+
+    Args:
+        seed: 随机种子。
+
+    Notes:
+        若当前设备为 CUDA，会额外设置 `torch.cuda.manual_seed(_all)`。
+    """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -269,6 +293,7 @@ def set_seed(seed: int = SEED) -> None:
 
 
 def print_config() -> None:
+    """打印当前关键配置（用于实验可复现与排查）。"""
     mode_str = "Lightweight" if LIGHTWEIGHT_MODE else "Full"
     print("=" * 70)
     print(f"🔧 Configuration - CTDE Architecture ({mode_str} Mode) - Large Scale")

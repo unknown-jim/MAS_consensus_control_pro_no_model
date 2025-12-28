@@ -29,7 +29,20 @@ from .config import (
 
 
 class CTDEReplayBuffer:
-    """CTDE 架构的经验回放缓冲区"""
+    """CTDE 架构的经验回放缓冲区。
+
+    主要面向 off-policy（SAC）训练，存储一批并行环境产生的 transition。
+
+    Args:
+        capacity: buffer 最大容量。
+        num_agents: 智能体总数（含 leader）。
+        state_dim: 本地状态维度（flat）。
+        action_dim: follower 动作维度。
+        global_state_dim: CTDE 全局状态维度。
+        storage_device: buffer 存放设备（通常为 CPU）。
+        storage_dtype: buffer 存放 dtype（CUDA 训练时通常用 float16）。
+        pin_memory: 是否使用 pinned memory（仅 CPU 存储且 CUDA 训练时有效）。
+    """
 
     def __init__(
         self,
@@ -99,6 +112,17 @@ class CTDEReplayBuffer:
         next_global_states: torch.Tensor,
         dones: torch.Tensor,
     ):
+        """追加一批 transition。
+
+        Args:
+            local_states: shape=(B, num_agents, state_dim)。
+            global_states: shape=(B, global_state_dim)。
+            actions: shape=(B, num_followers, action_dim)。
+            rewards: shape=(B,)。
+            next_local_states: shape=(B, num_agents, state_dim)。
+            next_global_states: shape=(B, global_state_dim)。
+            dones: shape=(B,)；终止标记（含时间截断）。
+        """
         batch_size = int(local_states.shape[0])
 
         local_states_s = self._to_storage(local_states)
@@ -147,6 +171,18 @@ class CTDEReplayBuffer:
         self.size = min(self.size + batch_size, self.capacity)
 
     def sample(self, batch_size: int):
+        """从 buffer 采样一个 batch。
+
+        Args:
+            batch_size: batch 大小。
+
+        Returns:
+            (local_states, global_states, actions, rewards, next_local_states, next_global_states, dones)，
+            均已搬运到计算设备 `DEVICE` 且转换为 float32（dones 仍为 float32/0-1）。
+
+        Raises:
+            RuntimeError: 当 buffer 为空时抛出。
+        """
         if self.size <= 0:
             raise RuntimeError("Replay buffer is empty")
 

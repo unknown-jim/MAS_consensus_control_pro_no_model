@@ -40,7 +40,21 @@ from .config import (
 
 
 class TrainingDashboard:
-    """训练仪表盘 - 动态阈值版本"""
+    """训练仪表盘（Notebook 交互式可视化）。
+
+    该类面向 Jupyter 场景，使用 `ipywidgets` 与 `matplotlib` 实时展示：
+    - reward / tracking error / comm rate 的训练曲线
+    - 每隔 `vis_interval` 采样的轨迹可视化
+
+    Args:
+        total_episodes: 训练总 episode 数（用于进度条/预计剩余时间）。
+        vis_interval: 可视化更新间隔。
+        topology: 可选的 `CommunicationTopology`；用于标识 pinned followers。
+
+    Notes:
+        该模块为可视化用途，依赖 `ipywidgets`、`IPython`、`matplotlib`。训练脚本默认不启用仪表盘，
+        只有显式传入 `show_dashboard=True` 才会导入/使用。
+    """
 
     def __init__(self, total_episodes: int, vis_interval: int = 10, topology=None):
         self.total_episodes = int(total_episodes)

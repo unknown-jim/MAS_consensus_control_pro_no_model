@@ -58,7 +58,18 @@ from .config import (
 
 
 class BatchedModelFreeEnv:
-    """无模型批量环境（CTDE 版本）。"""
+    """无模型并行环境（CTDE 版本）。
+
+    环境内部维护 `num_envs` 个并行 episode，用向量化方式推进动力学与通信触发逻辑。
+
+    Args:
+        topology: `CommunicationTopology` 实例。
+        num_envs: 并行环境数量（E）。
+
+    Notes:
+        - `reset()` 返回本地状态（给 actor 用）。
+        - `get_global_state()` 返回全局状态（给 centralized critic/value 用）。
+    """
 
     def __init__(self, topology, num_envs: int = 64):
         self.topology = topology
@@ -273,6 +284,16 @@ class BatchedModelFreeEnv:
         self.velocities[env_ids, 1:] = leader_vel.unsqueeze(1) + vel_offset
 
     def get_global_state(self):
+        """构造 CTDE 的全局状态。
+
+        Returns:
+            全局状态张量，shape=(E, GLOBAL_STATE_DIM)。内容包含：
+            - 所有 agent 的 (pos, vel)（归一化）
+            - （可选）最近一次广播的 (pos, vel)
+            - （可选）leader 动力学参数（幅值/角频率/相位）
+            - （可选）轨迹类型 one-hot
+            - （可选）时间归一化
+        """
         offset = 0
 
         self._global_state_buffer[:, offset:offset + self.num_agents] = self.positions / self.pos_limit
@@ -309,6 +330,14 @@ class BatchedModelFreeEnv:
         return self._global_state_buffer.clone()
 
     def reset(self, env_ids=None):
+        """重置环境并返回本地状态。
+
+        Args:
+            env_ids: 需要重置的环境 id（Tensor 或 list）。若为 None 则重置全部环境。
+
+        Returns:
+            本地状态张量，shape=(E, num_agents, STATE_DIM)。
+        """
         if env_ids is None:
             env_ids = torch.arange(self.num_envs, device=DEVICE)
 
@@ -467,6 +496,19 @@ class BatchedModelFreeEnv:
         return torch.clamp(reward, self.reward_min, self.reward_max)
 
     def step(self, action: torch.Tensor):
+        """推进一步环境动力学与通信触发。
+
+        Args:
+            action: follower 动作，shape=(E, num_followers, ACTION_DIM)。
+                - action[..., 0]：速度增量（delta_v）
+                - action[..., 1]：阈值 raw 值（内部会映射到 [THRESHOLD_MIN, THRESHOLD_MAX]）
+
+        Returns:
+            states: 下一步本地状态，shape=(E, num_agents, STATE_DIM)
+            rewards: shape=(E,)
+            dones: shape=(E,)（当前实现不提前终止，主要由训练端做时间截断）
+            infos: 诊断信息字典（tracking_error/comm_rate 等）
+        """
         self.t += DT
 
         leader_pos, leader_vel = self._leader_state_batch(self.t)
@@ -588,7 +630,12 @@ class BatchedModelFreeEnv:
 
 
 class ModelFreeEnv:
-    """单环境版本"""
+    """单环境包装器。
+
+    该类将 `BatchedModelFreeEnv(num_envs=1)` 封装为更直观的单环境接口：
+    - `reset()` -> shape=(num_agents, STATE_DIM)
+    - `step()` -> reward/done 返回标量
+    """
 
     def __init__(self, topology):
         self.batched_env = BatchedModelFreeEnv(topology, num_envs=1)

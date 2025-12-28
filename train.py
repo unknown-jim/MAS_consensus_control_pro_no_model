@@ -1,5 +1,10 @@
-"""
-训练脚本 - CTDE 架构版本
+"""CTDE 训练入口。
+
+本脚本提供一个可直接运行的训练入口：集中训练、分散执行（CTDE）。
+- Actor：仅使用本地观测（每个 follower 独立决策）
+- Critic/Value：使用全局状态（以及 SAC 的联合动作）
+
+注意：`show_dashboard=True` 时会在运行期导入 `mas_cc.dashboard`，需要在 Jupyter 环境下使用。
 """
 import torch
 import time
@@ -35,7 +40,21 @@ def train(
     seed=SEED,
     profile_timing: bool = False,
 ):
-    """CTDE 训练"""
+    """运行 CTDE 训练。
+
+    Args:
+        num_episodes: 训练 episode 数。
+        vis_interval: 可视化/轨迹采样的间隔（每隔多少个 episode 采样一次）。
+        show_dashboard: 是否启用 Jupyter 仪表盘；启用会额外依赖 `ipywidgets` 等。
+        seed: 随机种子。
+        profile_timing: 是否统计粗粒度耗时（step/update 的累计均值）。
+
+    Returns:
+        (agent, topology, dashboard)：
+        - agent: 训练得到的智能体实例（`CTDESACAgent` 或 `CTDEMAPPOAgent`）。
+        - topology: 本次训练使用的 `CommunicationTopology` 实例。
+        - dashboard: 若启用仪表盘返回 `TrainingDashboard`，否则为 `None`。
+    """
     set_seed(seed)
     print_config()
     
@@ -89,19 +108,20 @@ def train(
     for episode in range(1, num_episodes + 1):
         
         local_states = batched_env.reset()
-        global_states = batched_env.get_global_state()  # 🔧 获取全局状态
-        
+        # CTDE：critic/value 的输入（与 actor 的本地输入区分开）
+        global_states = batched_env.get_global_state()
+
         episode_rewards = torch.zeros(NUM_PARALLEL_ENVS, device=DEVICE)
         episode_tracking_err = torch.zeros(NUM_PARALLEL_ENVS, device=DEVICE)
         episode_comm = torch.zeros(NUM_PARALLEL_ENVS, device=DEVICE)
-        
+
         for step in range(MAX_STEPS):
             global_step += NUM_PARALLEL_ENVS
-            
+
             if dashboard and step % 10 == 0:
                 dashboard.update_step(step, MAX_STEPS)
-            
-            # 🔧 Actor 只用本地状态
+
+            # 执行阶段：actor 只使用本地状态；训练阶段：MAPPO 还会用 global_state 估计 value
             if is_mappo:
                 actions, logp_joint, values = agent.act(local_states, global_states, deterministic=False)
             else:
@@ -110,12 +130,11 @@ def train(
             if profile_timing:
                 t0 = time.perf_counter()
             next_local_states, rewards, dones, infos = batched_env.step(actions)
-            next_global_states = batched_env.get_global_state()  # 🔧 获取下一步全局状态
+            next_global_states = batched_env.get_global_state()
             if profile_timing:
                 step_time_s += (time.perf_counter() - t0)
-            
-            # 🔧 存储时包含全局状态
-            # 时间截断：最后一步视为终止，避免跨 episode 的 bootstrapping 偏差
+
+            # 处理时间截断：最后一步视为终止，避免跨 episode 的 bootstrapping 偏差
             time_limit_done = torch.zeros_like(dones)
             if step == MAX_STEPS - 1:
                 time_limit_done[:] = True

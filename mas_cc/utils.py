@@ -1,4 +1,12 @@
-"""工具函数 - CTDE 版本。"""
+"""评估与可视化工具（CTDE 版本）。
+
+该模块主要提供：
+- 轨迹采样（用于绘图/诊断）
+- 多次评估汇总
+- 评估绘图（position/velocity 曲线）
+
+约定：评估阶段默认使用 deterministic 动作。
+"""
 
 from __future__ import annotations
 
@@ -13,7 +21,14 @@ from .environment import ModelFreeEnv
 
 
 def _set_eval_for_inference(agent):
-    """评估/可视化时临时关闭 Dropout 等随机性（不影响训练）。"""
+    """在评估/可视化阶段临时切换到 eval 模式。
+
+    Args:
+        agent: 智能体实例，需至少包含 `actor`；若包含 `value_net` 也会一并处理。
+
+    Returns:
+        一个无参函数，调用后会把模块的 train/eval 状态恢复到进入本函数之前的状态。
+    """
 
     modules = [(agent.actor, bool(agent.actor.training))]
     if agent.value_net is not None:
@@ -31,7 +46,21 @@ def _set_eval_for_inference(agent):
 
 @torch.no_grad()
 def collect_trajectory(agent, env, max_steps: int = MAX_STEPS):
-    """收集轨迹用于可视化（含通信数据）。"""
+    """采样一条轨迹用于可视化（包含通信率与阈值）。
+
+    Args:
+        agent: 智能体实例（需实现 `select_action(state, deterministic=True)`）。
+        env: 环境实例（通常为 `ModelFreeEnv`）。
+        max_steps: 采样步数。
+
+    Returns:
+        轨迹字典，包含：
+        - `times`: shape=(T+1,)
+        - `leader_pos/leader_vel`: shape=(T+1,)
+        - `follower_pos/follower_vel`: shape=(T+1, num_followers)
+        - `comm_rates`: shape=(T,)
+        - `thresholds`: shape=(T, num_followers)（环境实际阈值）
+    """
 
     restore = _set_eval_for_inference(agent)
     state = env.reset()
@@ -81,7 +110,16 @@ def collect_trajectory(agent, env, max_steps: int = MAX_STEPS):
 
 @torch.no_grad()
 def evaluate_agent(agent, env, num_episodes: int = 5):
-    """评估智能体性能。"""
+    """多次运行环境并汇总评估指标。
+
+    Args:
+        agent: 智能体实例。
+        env: 环境实例。
+        num_episodes: 评估 episode 数。
+
+    Returns:
+        指标字典：`mean_reward/std_reward/mean_tracking_error/mean_comm_rate`。
+    """
 
     restore = _set_eval_for_inference(agent)
     results = {"rewards": [], "tracking_errors": [], "comm_rates": []}
@@ -116,7 +154,18 @@ def evaluate_agent(agent, env, num_episodes: int = 5):
 
 
 def plot_evaluation(agent, topology, num_tests: int = 3, save_path: str | None = None, max_plot_followers: int | None = 5):
-    """绘制评估结果。"""
+    """绘制评估结果（位置/速度曲线）。
+
+    Args:
+        agent: 智能体实例。
+        topology: `CommunicationTopology` 实例。
+        num_tests: 测试次数（每次重新 reset 环境并采样一条轨迹）。
+        save_path: 若提供则保存图片到该路径。
+        max_plot_followers: 最多展示多少个 follower 曲线；为 None 或 <=0 则全部展示。
+
+    Returns:
+        每次测试的误差统计列表（final/avg）。
+    """
 
     env = ModelFreeEnv(topology)
 
