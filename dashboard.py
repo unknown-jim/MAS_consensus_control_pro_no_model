@@ -2,6 +2,8 @@
 训练可视化仪表盘 - 动态阈值版本
 """
 import time
+import os
+from datetime import datetime
 import numpy as np
 
 try:
@@ -19,8 +21,19 @@ try:
 except ImportError:
     HAS_WIDGETS = False
 
-# 🔧 导入 MAX_STEPS 用于动态计算阈值
-from config import MAX_STEPS
+# 🔧 Dashboard 的颜色阈值/参考线应跟随 config，避免改了奖励/阈值范围后显示误导
+from config import (
+    MAX_STEPS,
+    POS_LIMIT, VEL_LIMIT,
+    TRACKING_PENALTY_MAX, TRACKING_PENALTY_SCALE,
+    COMM_PENALTY, COMM_WEIGHT_DECAY,
+    THRESHOLD_MIN, THRESHOLD_MAX,
+    REWARD_MIN, REWARD_MAX, USE_SOFT_REWARD_SCALING,
+    DASH_ERROR_GOOD_FRAC, DASH_ERROR_POOR_FRAC,
+    DASH_COMM_GOOD_THRESHOLD, DASH_COMM_POOR_THRESHOLD,
+    # 🔧 标题/实验信息也应跟随 config，避免 notebook/训练输出混淆
+    ALGO, NUM_AGENTS, NUM_FOLLOWERS, LIGHTWEIGHT_MODE,
+)
 
 
 class TrainingDashboard:
@@ -36,20 +49,43 @@ class TrainingDashboard:
         self.topology = topology
         self.pinned_followers = topology.pinned_followers if topology else []
         
-        # 🔧 动态计算阈值（基于 MAX_STEPS）
-        # 每步奖励范围约 [-1.3, 0.5]（经过 soft scaling）
-        # 好的奖励：误差小，每步约 -0.17（对应 tanh(0.1*2)*1 ≈ 0.2 的惩罚 + 0.03 的改进奖励）
-        # 差的奖励：误差大，每步约 -0.67（对应 tanh(0.5*2)*1 ≈ 0.76 的惩罚）
-        self.reward_good_threshold = -0.17 * self.max_steps  # 好：> -51 (for 300 steps)
-        self.reward_poor_threshold = -0.67 * self.max_steps  # 差：< -201 (for 300 steps)
-        
+        # 🔧 动态计算 Dashboard 阈值（跟随 config + 当前奖励形式）
+        # 说明：训练里记录的 reward 是“每步经缩放后的 reward 求和”，这里用一个简化的
+        # “典型 good/poor 场景”近似来生成参考线，避免硬编码导致显示误导。
+        def _scale_reward_np(r: float) -> float:
+            if USE_SOFT_REWARD_SCALING:
+                mid = (REWARD_MAX + REWARD_MIN) / 2.0
+                scale = (REWARD_MAX - REWARD_MIN) / 2.0
+                normalized = (r - mid) / (scale + 1e-8)
+                return float(mid + scale * np.tanh(normalized))
+            return float(np.clip(r, REWARD_MIN, REWARD_MAX))
+
         # 跟踪误差阈值（每步平均值，与 MAX_STEPS 无关）
-        self.error_good_threshold = 0.3
-        self.error_poor_threshold = 1.0
-        
+        # 假设 pos/vel 平均误差分别约占上限的某个比例（来自 config 的 dashboard 参数）
+        self.error_good_threshold = DASH_ERROR_GOOD_FRAC * POS_LIMIT + 0.5 * DASH_ERROR_GOOD_FRAC * VEL_LIMIT
+        self.error_poor_threshold = DASH_ERROR_POOR_FRAC * POS_LIMIT + 0.5 * DASH_ERROR_POOR_FRAC * VEL_LIMIT
+
         # 通信率阈值（比例值，与 MAX_STEPS 无关）
-        self.comm_good_threshold = 0.3
-        self.comm_poor_threshold = 0.7
+        self.comm_good_threshold = DASH_COMM_GOOD_THRESHOLD
+        self.comm_poor_threshold = DASH_COMM_POOR_THRESHOLD
+
+        # reward 阈值：用“tracking penalty + comm penalty”的典型值估算（改 reward 形式也能自适应）
+        tracking_norm_good = (DASH_ERROR_GOOD_FRAC + 0.5 * DASH_ERROR_GOOD_FRAC)
+        tracking_norm_poor = (DASH_ERROR_POOR_FRAC + 0.5 * DASH_ERROR_POOR_FRAC)
+
+        tp_good = -TRACKING_PENALTY_MAX * np.log1p(tracking_norm_good * TRACKING_PENALTY_SCALE)
+        tp_poor = -TRACKING_PENALTY_MAX * np.log1p(tracking_norm_poor * TRACKING_PENALTY_SCALE)
+
+        cw_good = np.exp(-self.error_good_threshold * COMM_WEIGHT_DECAY)
+        cw_poor = np.exp(-self.error_poor_threshold * COMM_WEIGHT_DECAY)
+        cp_good = -self.comm_good_threshold * COMM_PENALTY * cw_good
+        cp_poor = -self.comm_poor_threshold * COMM_PENALTY * cw_poor
+
+        per_step_good = _scale_reward_np(tp_good + cp_good)
+        per_step_poor = _scale_reward_np(tp_poor + cp_poor)
+
+        self.reward_good_threshold = per_step_good * self.max_steps
+        self.reward_poor_threshold = per_step_poor * self.max_steps
         
         # 历史记录
         self.reward_history = []
@@ -57,6 +93,9 @@ class TrainingDashboard:
         self.comm_history = []
         self.best_reward = -float('inf')
         self.best_trajectory = None
+
+        # 最近一次绘制的训练进度图（用于训练结束后保存最终图像）
+        self._last_progress_fig = None
         
         self.use_widgets = HAS_WIDGETS and HAS_MATPLOTLIB
         
@@ -71,11 +110,18 @@ class TrainingDashboard:
     
     def _create_widgets(self):
         """创建 UI 组件"""
-        self.title_html = widgets.HTML(value="""
-            <div style="background: linear-gradient(90deg, #11998e 0%, #38ef7d 100%); 
-                        padding: 15px; border-radius: 10px; margin-bottom: 10px;">
-                <h2 style="color: white; margin: 0; text-align: center;">
-                    🎯 Leader-Follower MAS Consensus Control
+        algo = str(ALGO).upper().strip()
+        mode = "Light" if LIGHTWEIGHT_MODE else "Full"
+        title = (
+            f"🎯 CTDE Leader-Follower MAS Event-Triggered Consensus "
+            f"({algo} | {NUM_AGENTS} agents = 1 leader + {NUM_FOLLOWERS} followers | {mode})"
+        )
+
+        self.title_html = widgets.HTML(value=f"""
+            <div style=\"background: linear-gradient(90deg, #11998e 0%, #38ef7d 100%); 
+                        padding: 15px; border-radius: 10px; margin-bottom: 10px;\">
+                <h2 style=\"color: white; margin: 0; text-align: center;\">
+                    {title}
                 </h2>
             </div>
         """)
@@ -154,6 +200,25 @@ class TrainingDashboard:
         e_color = self._get_error_color(tracking_err)
         c_color = self._get_comm_color(comm)
         
+        # 不同算法的 loss 展示兼容
+        if ('q1' in losses) or ('alpha' in losses):
+            loss_line = (
+                f"Q1: <b>{losses.get('q1',0):.4f}</b> | Q2: <b>{losses.get('q2',0):.4f}</b> | "
+                f"Actor: <b>{losses.get('actor',0):.4f}</b> | α: <b>{losses.get('alpha',0.2):.4f}</b> | "
+                f"H(joint): <b>{losses.get('entropy_joint', float('nan')):.2f}</b> | "
+                f"Qμ: <b>{losses.get('q1_mean', float('nan')):.2f}</b> / tgtQμ: <b>{losses.get('target_q_mean', float('nan')):.2f}</b>"
+            )
+        elif ('policy' in losses) or ('value' in losses):
+            loss_line = (
+                f"Policy: <b>{losses.get('policy', float('nan')):.4f}</b> | "
+                f"Value: <b>{losses.get('value', float('nan')):.4f}</b> | "
+                f"H(joint): <b>{losses.get('entropy_joint', float('nan')):.2f}</b> | "
+                f"KL: <b>{losses.get('kl', float('nan')):.4f}</b> | "
+                f"ClipFrac: <b>{losses.get('clipfrac', float('nan')):.2f}</b>"
+            )
+        else:
+            loss_line = "(no loss stats)"
+
         return f"""
         <div style="display: flex; flex-wrap: wrap; gap: 10px; margin: 10px 0;">
             <div style="flex:1;min-width:100px;background:linear-gradient(135deg,#11998e,#38ef7d);padding:10px;border-radius:8px;color:white;text-align:center;">
@@ -180,8 +245,7 @@ class TrainingDashboard:
             </div>
         </div>
         <div style="background:#f7fafc;padding:6px;border-radius:6px;font-size:11px;">
-            Q1: <b>{losses.get('q1',0):.4f}</b> | Q2: <b>{losses.get('q2',0):.4f}</b> | 
-            Actor: <b>{losses.get('actor',0):.4f}</b> | α: <b>{losses.get('alpha',0.2):.4f}</b>
+            {loss_line}
         </div>
         """
     
@@ -245,7 +309,23 @@ class TrainingDashboard:
                     st = "📊"
                 else:
                     st = "⚠️"
-                print(f"[{ts}] {st} Ep {episode:4d} | R:{reward:7.2f} | Err:{tracking_err:.4f} | Comm:{comm*100:.1f}%")
+                entropy = losses.get('entropy_joint', float('nan'))
+
+                if ('q1' in losses) or ('alpha' in losses):
+                    alpha = losses.get('alpha', float('nan'))
+                    tail = f"α:{alpha:.3f} | H:{entropy:.2f}"
+                elif ('policy' in losses) or ('value' in losses):
+                    pol = losses.get('policy', float('nan'))
+                    val = losses.get('value', float('nan'))
+                    kl = losses.get('kl', float('nan'))
+                    tail = f"π:{pol:.3f} | V:{val:.3f} | KL:{kl:.3f} | H:{entropy:.2f}"
+                else:
+                    tail = f"H:{entropy:.2f}"
+
+                print(
+                    f"[{ts}] {st} Ep {episode:4d} | R:{reward:7.2f} | Err:{tracking_err:.4f} | "
+                    f"Comm:{comm*100:.1f}% | {tail}"
+                )
             
             # 更新图表
             if episode % self.vis_interval == 0 or episode == 1:
@@ -263,6 +343,14 @@ class TrainingDashboard:
             clear_output(wait=True)
             
             fig, axes = plt.subplots(2, 3, figsize=(18, 10), constrained_layout=True)
+
+            # 保存引用：训练结束时可直接保存最终 Training Progress 图
+            if self._last_progress_fig is not None:
+                try:
+                    plt.close(self._last_progress_fig)
+                except Exception:
+                    pass
+            self._last_progress_fig = fig
             
             # 颜色定义
             leader_color = '#e74c3c'
@@ -406,6 +494,8 @@ class TrainingDashboard:
                 
                 ax3t.set_ylabel('Threshold', color='#8e44ad', fontsize=10)
                 ax3t.tick_params(axis='y', labelcolor='#8e44ad')
+                # 🔧 阈值范围跟随 config，避免 y 轴尺度误导
+                ax3t.set_ylim(THRESHOLD_MIN, THRESHOLD_MAX)
                 
                 # 合并图例
                 lines1, labels1 = ax3.get_legend_handles_labels()
@@ -540,13 +630,64 @@ class TrainingDashboard:
             ax6.grid(True, alpha=0.3)
             
             plt.show()
-    
+
+    def save_training_progress(self, save_path: str | None = None, dpi: int = 150):
+        """保存最终 Training Progress 图片，并在文件名中追加时间戳。
+
+        - 若未提供 save_path：默认保存到当前工作目录，文件名包含 ALGO/规模/Light-Full/时间戳。
+        - 若提供了 save_path：会在扩展名前追加时间戳，避免覆盖。
+        """
+        if not HAS_MATPLOTLIB:
+            print("matplotlib not available, skip saving Training Progress")
+            return None
+
+        # 确保有一张最新图
+        if self._last_progress_fig is None:
+            if self.use_widgets and self.reward_history:
+                self._update_plots()
+
+        if self._last_progress_fig is None:
+            print("No Training Progress figure available to save")
+            return None
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        algo = str(ALGO).lower().strip()
+        mode = "light" if LIGHTWEIGHT_MODE else "full"
+
+        if save_path is None:
+            save_path = f"training_progress_{algo}_{NUM_FOLLOWERS}f_{mode}_{ts}.png"
+        else:
+            root, ext = os.path.splitext(save_path)
+            ext = ext if ext else ".png"
+            save_path = f"{root}_{ts}{ext}"
+
+        try:
+            self._last_progress_fig.savefig(save_path, dpi=dpi, bbox_inches='tight')
+        except Exception as e:
+            print(f"Failed to save Training Progress to {save_path}: {e}")
+            return None
+
+        msg = f"📁 Training Progress saved to {save_path}"
+        if self.use_widgets:
+            with self.log_output:
+                print(msg)
+        else:
+            print(msg)
+
+        return save_path
+
     def finish(self):
         """训练完成"""
         elapsed = self._get_elapsed()
         if self.use_widgets:
             self.main_progress.value = 100
             self.main_progress.bar_style = 'success'
+
+            # 训练结束时刷新一次图，确保保存的是最终状态
+            if self.reward_history:
+                self._update_plots()
+                self.save_training_progress()
+
             with self.log_output:
                 print("=" * 50)
                 print(f"✅ Training Complete!")
@@ -558,6 +699,11 @@ class TrainingDashboard:
                     print(f"   Final Comm Rate: {self.comm_history[-1]*100:.1f}%")
                 print("=" * 50)
         else:
+            # 无 widgets 时也尝试保存（如果 matplotlib 可用且历史非空）
+            if self.reward_history and HAS_MATPLOTLIB:
+                # 这里不依赖 plot_output，直接复用最近一次图（若有）
+                self.save_training_progress()
+
             print(f"\n✅ Training complete!")
             print(f"   Best reward: {self.best_reward:.2f}")
             print(f"   Time: {self._format_time(elapsed)}")

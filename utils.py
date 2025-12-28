@@ -10,7 +10,7 @@ try:
 except ImportError:
     HAS_MATPLOTLIB = False
 
-from config import DEVICE, MAX_STEPS
+from config import DEVICE, MAX_STEPS, THRESHOLD_MIN, THRESHOLD_MAX, TH_SCALE
 
 
 @torch.no_grad()
@@ -45,8 +45,13 @@ def collect_trajectory(agent, env, max_steps=MAX_STEPS):
         
         # 🔧 记录通信数据
         comm_rates.append(info['comm_rate'])
-        # 阈值从 action 中提取 (action shape: num_followers, 2)
-        thresholds.append(action[:, 1].cpu().numpy())
+
+        # 阈值：Dashboard/可视化应展示“环境实际使用的阈值”，而不是 Actor 的归一化输出
+        # Actor 输出 th_raw ∈ [0, TH_SCALE]（TH_SCALE 通常为 1），环境映射到 [THRESHOLD_MIN, THRESHOLD_MAX]
+        th_raw = action[:, 1]
+        th_norm = (th_raw / TH_SCALE).clamp(0.0, 1.0)
+        th_env = THRESHOLD_MIN + (THRESHOLD_MAX - THRESHOLD_MIN) * th_norm
+        thresholds.append(th_env.cpu().numpy())
     
     return {
         'times': np.array(times),

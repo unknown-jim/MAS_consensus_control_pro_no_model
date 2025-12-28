@@ -2,7 +2,15 @@
 import torch
 from topology import DirectedSpanningTreeTopology
 from environment import LeaderFollowerMASEnv, BatchedLeaderFollowerEnv
-from config import NUM_FOLLOWERS, MAX_STEPS, DEVICE
+from config import NUM_FOLLOWERS, MAX_STEPS, DEVICE, THRESHOLD_MIN, THRESHOLD_MAX, TH_SCALE
+
+def _raw_threshold_from_env_threshold(threshold_env: float) -> float:
+    """把“环境实际阈值”反算为 Actor 动作第 2 维的 raw 值（用于 test_env 施加固定阈值）。"""
+    # env: threshold_env = THRESHOLD_MIN + (THRESHOLD_MAX-THRESHOLD_MIN) * clamp(raw/TH_SCALE, 0, 1)
+    x = (threshold_env - THRESHOLD_MIN) / (THRESHOLD_MAX - THRESHOLD_MIN + 1e-12)
+    x = float(min(1.0, max(0.0, x)))
+    return x * TH_SCALE
+
 
 def test_zero_control():
     """测试零调整控制下系统是否稳定"""
@@ -14,7 +22,8 @@ def test_zero_control():
     
     for step in range(MAX_STEPS):
         action = torch.zeros(env.num_followers, 2, device=DEVICE)
-        action[:, 1] = 0.15  # 中等阈值
+        # 这里的 0.15 指“环境实际阈值”（单位同 positions），需要反算成 raw action
+        action[:, 1] = _raw_threshold_from_env_threshold(0.15)
         state, reward, done, info = env.step(action)
         errors.append(info['tracking_error'])
     
@@ -44,7 +53,8 @@ def test_optimal_threshold():
     best_threshold = None
     best_score = float('inf')
     
-    for threshold in [0.05, 0.08, 0.10, 0.12, 0.15, 0.18, 0.20, 0.25]:
+    # threshold_env：环境实际阈值（应位于 [THRESHOLD_MIN, THRESHOLD_MAX]）
+    for threshold in [0.10, 0.12, 0.15, 0.18, 0.20, 0.25, 0.35, 0.50]:
         env = LeaderFollowerMASEnv(topology)
         state = env.reset()
         
@@ -53,7 +63,7 @@ def test_optimal_threshold():
         
         for step in range(MAX_STEPS):
             action = torch.zeros(env.num_followers, 2, device=DEVICE)
-            action[:, 1] = threshold
+            action[:, 1] = _raw_threshold_from_env_threshold(threshold)
             state, reward, done, info = env.step(action)
             total_comm += info['comm_rate']
             errors.append(info['tracking_error'])
@@ -71,7 +81,7 @@ def test_optimal_threshold():
             best_threshold = threshold
             marker = " ← Best"
         
-        print(f"阈值={threshold:.2f} | 平均误差={avg_err:.4f} | 最终误差={final_err:.4f} | "
+        print(f"阈值(env)={threshold:.2f} | 平均误差={avg_err:.4f} | 最终误差={final_err:.4f} | "
               f"通信率={avg_comm*100:.1f}% | Score={score:.4f}{marker}")
     
     print(f"\n最优阈值: {best_threshold:.2f}")
@@ -89,7 +99,7 @@ def test_trajectory_tracking():
     
     for step in range(MAX_STEPS):
         action = torch.zeros(env.num_followers, 2, device=DEVICE)
-        action[:, 1] = 0.15
+        action[:, 1] = _raw_threshold_from_env_threshold(0.15)
         state, reward, done, info = env.step(action)
         
         leader_pos.append(env.positions[0].item())

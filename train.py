@@ -6,15 +6,17 @@ import time
 
 from config import (
     NUM_FOLLOWERS, NUM_PINNED, MAX_STEPS, BATCH_SIZE,
-    NUM_EPISODES, VIS_INTERVAL, SAVE_MODEL_PATH, 
+    NUM_EPISODES, VIS_INTERVAL, SAVE_MODEL_PATH,
     print_config, set_seed, SEED,
     NUM_PARALLEL_ENVS, UPDATE_FREQUENCY, GRADIENT_STEPS,
     USE_AMP, DEVICE, COMM_PENALTY, THRESHOLD_MIN, THRESHOLD_MAX,
-    WARMUP_STEPS
+    WARMUP_STEPS,
+
+    ALGO, PPO_ROLLOUT_STEPS,
 )
 from topology import CommunicationTopology
 from environment import BatchedModelFreeEnv, ModelFreeEnv
-from agent import CTDESACAgent
+from agent import CTDESACAgent, CTDEMAPPOAgent
 from utils import collect_trajectory, plot_evaluation
 
 try:
@@ -29,15 +31,25 @@ torch.backends.cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
+# PyTorch 2.x：提升 matmul 精度/性能（对 Transformer/MLP 常有收益）
+if hasattr(torch, "set_float32_matmul_precision"):
+    torch.set_float32_matmul_precision("high")
 
-def train(num_episodes=NUM_EPISODES, vis_interval=VIS_INTERVAL, 
-          show_dashboard=True, seed=SEED):
+
+def train(
+    num_episodes=NUM_EPISODES,
+    vis_interval=VIS_INTERVAL,
+    show_dashboard=True,
+    seed=SEED,
+    profile_timing: bool = False,
+):
     """CTDE 训练"""
     set_seed(seed)
     print_config()
     
     print("\n" + "="*60)
     print("🚀 CTDE Training (Centralized Training Decentralized Execution)")
+    print(f"   • Algorithm: {ALGO}")
     print("   • Actor: Decentralized (local observation only)")
     print("   • Critic: Centralized (global state + joint action)")
     print("   • Execution: Each agent uses only local information")
@@ -53,7 +65,15 @@ def train(num_episodes=NUM_EPISODES, vis_interval=VIS_INTERVAL,
     batched_env = BatchedModelFreeEnv(topology, num_envs=NUM_PARALLEL_ENVS)
     eval_env = ModelFreeEnv(topology)
     
-    agent = CTDESACAgent(topology, use_amp=USE_AMP)
+    algo = str(ALGO).upper().strip()
+    is_mappo = (algo == 'MAPPO')
+
+    if is_mappo:
+        agent = CTDEMAPPOAgent(topology, use_amp=False)
+        print(f"   • MAPPO Rollout Steps: {PPO_ROLLOUT_STEPS}")
+    else:
+        # 默认 MASAC（CTDE-SAC）
+        agent = CTDESACAgent(topology, use_amp=USE_AMP)
     
     dashboard = None
     if show_dashboard and HAS_DASHBOARD:
@@ -65,7 +85,12 @@ def train(num_episodes=NUM_EPISODES, vis_interval=VIS_INTERVAL,
     
     start_time = time.time()
     log_interval = 10
-    
+
+    # 低成本 profiling（默认关闭）
+    step_time_s = 0.0
+    update_time_s = 0.0
+    update_calls = 0
+
     for episode in range(1, num_episodes + 1):
         
         local_states = batched_env.reset()
@@ -82,9 +107,17 @@ def train(num_episodes=NUM_EPISODES, vis_interval=VIS_INTERVAL,
                 dashboard.update_step(step, MAX_STEPS)
             
             # 🔧 Actor 只用本地状态
-            actions = agent.select_action(local_states, deterministic=False)
+            if is_mappo:
+                actions, logp_joint, values = agent.act(local_states, global_states, deterministic=False)
+            else:
+                actions = agent.select_action(local_states, deterministic=False)
+
+            if profile_timing:
+                t0 = time.perf_counter()
             next_local_states, rewards, dones, infos = batched_env.step(actions)
             next_global_states = batched_env.get_global_state()  # 🔧 获取下一步全局状态
+            if profile_timing:
+                step_time_s += (time.perf_counter() - t0)
             
             # 🔧 存储时包含全局状态
             # 时间截断：最后一步视为终止，避免跨 episode 的 bootstrapping 偏差
@@ -93,13 +126,35 @@ def train(num_episodes=NUM_EPISODES, vis_interval=VIS_INTERVAL,
                 time_limit_done[:] = True
             store_dones = dones | time_limit_done
 
-            agent.store_transitions_batch(
-                local_states, global_states, actions, rewards,
-                next_local_states, next_global_states, store_dones
-            )
-            
-            if step % UPDATE_FREQUENCY == 0 and step > 0 and global_step > WARMUP_STEPS:
-                agent.update(BATCH_SIZE, GRADIENT_STEPS)
+            if is_mappo:
+                # MAPPO：on-policy rollout
+                agent.store_rollout_step(
+                    local_states, global_states, actions, logp_joint, values,
+                    rewards, store_dones
+                )
+
+                do_update = agent.buffer.is_full() or (step == MAX_STEPS - 1)
+                if do_update:
+                    if profile_timing:
+                        t1 = time.perf_counter()
+                    agent.update(next_global_states=next_global_states, next_dones=store_dones)
+                    if profile_timing:
+                        update_time_s += (time.perf_counter() - t1)
+                        update_calls += 1
+            else:
+                # MASAC（CTDE-SAC）：off-policy replay
+                agent.store_transitions_batch(
+                    local_states, global_states, actions, rewards,
+                    next_local_states, next_global_states, store_dones
+                )
+
+                if step % UPDATE_FREQUENCY == 0 and step > 0 and global_step > WARMUP_STEPS:
+                    if profile_timing:
+                        t1 = time.perf_counter()
+                    agent.update(BATCH_SIZE, GRADIENT_STEPS)
+                    if profile_timing:
+                        update_time_s += (time.perf_counter() - t1)
+                        update_calls += 1
             
             episode_rewards += rewards
             episode_tracking_err += infos['tracking_error']
@@ -129,8 +184,18 @@ def train(num_episodes=NUM_EPISODES, vis_interval=VIS_INTERVAL,
         elif episode % log_interval == 0:
             elapsed = time.time() - start_time
             speed = episode / elapsed
+
+            if profile_timing:
+                # 以“每 episode”展示一个大致占比（跨 episode 累计的均值）
+                avg_step_ms = (step_time_s / max(1, episode)) * 1000
+                avg_update_ms = (update_time_s / max(1, episode)) * 1000
+                upd_per_ep = update_calls / max(1, episode)
+                timing_str = f" | step:{avg_step_ms:.0f}ms/ep | upd:{avg_update_ms:.0f}ms/ep ({upd_per_ep:.2f}/ep)"
+            else:
+                timing_str = ""
+
             print(f"Ep {episode:4d} | R:{avg_reward:7.2f} | Err:{avg_tracking_err:.4f} | "
-                  f"Comm:{avg_comm*100:.1f}% | {speed:.2f} ep/s")
+                  f"Comm:{avg_comm*100:.1f}% | {speed:.2f} ep/s{timing_str}")
     
     if dashboard:
         dashboard.finish()
