@@ -1,6 +1,8 @@
 *.pth
 *.pyc
 *.txt
+*.png
+*.pt
 __pycache__/
 .ipynb_checkpoints/
 .Trash-0/

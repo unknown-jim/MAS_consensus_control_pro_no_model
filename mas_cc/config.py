@@ -375,7 +375,7 @@ def print_config() -> None:
     print(f"     EVAL_SAVE_PATH: {EVAL_SAVE_PATH}")
     print(f"  🎯 Reward Settings (Soft Comm Reduction):")
     print(f"     Tracking Penalty: -{TRACKING_PENALTY_MAX}*log1p(err_norm*{TRACKING_PENALTY_SCALE})")
-    print(f"       where err_norm = mean(|pos_f-leader|)/{POS_LIMIT} + 0.5*mean(|vel_f-leader|)/{VEL_LIMIT}")
+    print(f"       where err_norm = mean(|pos_f-leader|)/{POS_LIMIT} + 0.01*mean(|vel_f-leader|)/{VEL_LIMIT}")
     print(f"     Comm Penalty: {COMM_PENALTY}")
     print(f"     Comm Weight Decay: {COMM_WEIGHT_DECAY}")
     print(f"     Improvement: scale={IMPROVEMENT_SCALE}, clip=±{IMPROVEMENT_CLIP}")

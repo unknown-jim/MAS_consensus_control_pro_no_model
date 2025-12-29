@@ -71,14 +71,14 @@ class TrainingDashboard:
                 return float(mid + scale * np.tanh(normalized))
             return float(np.clip(r, REWARD_MIN, REWARD_MAX))
 
-        self.error_good_threshold = DASH_ERROR_GOOD_FRAC * POS_LIMIT + 0.5 * DASH_ERROR_GOOD_FRAC * VEL_LIMIT
-        self.error_poor_threshold = DASH_ERROR_POOR_FRAC * POS_LIMIT + 0.5 * DASH_ERROR_POOR_FRAC * VEL_LIMIT
+        self.error_good_threshold = DASH_ERROR_GOOD_FRAC * POS_LIMIT + 0.01 * DASH_ERROR_GOOD_FRAC * VEL_LIMIT
+        self.error_poor_threshold = DASH_ERROR_POOR_FRAC * POS_LIMIT + 0.01 * DASH_ERROR_POOR_FRAC * VEL_LIMIT
 
         self.comm_good_threshold = float(DASH_COMM_GOOD_THRESHOLD)
         self.comm_poor_threshold = float(DASH_COMM_POOR_THRESHOLD)
 
-        tracking_norm_good = DASH_ERROR_GOOD_FRAC + 0.5 * DASH_ERROR_GOOD_FRAC
-        tracking_norm_poor = DASH_ERROR_POOR_FRAC + 0.5 * DASH_ERROR_POOR_FRAC
+        tracking_norm_good = DASH_ERROR_GOOD_FRAC + 0.01 * DASH_ERROR_GOOD_FRAC
+        tracking_norm_poor = DASH_ERROR_POOR_FRAC + 0.01 * DASH_ERROR_POOR_FRAC
 
         tp_good = -TRACKING_PENALTY_MAX * np.log1p(tracking_norm_good * TRACKING_PENALTY_SCALE)
         tp_poor = -TRACKING_PENALTY_MAX * np.log1p(tracking_norm_poor * TRACKING_PENALTY_SCALE)

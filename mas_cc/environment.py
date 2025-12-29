@@ -631,7 +631,7 @@ class BatchedModelFreeEnv:
         # 计算信息更新前的 leader 估计误差（用于奖励）
         old_est_error = (
             torch.abs(self.leader_est_pos[:, 1:] - self.positions[:, 0:1]).mean(dim=1)
-            + 0.5 * torch.abs(self.leader_est_vel[:, 1:] - self.velocities[:, 0:1]).mean(dim=1)
+            + 0.01 * torch.abs(self.leader_est_vel[:, 1:] - self.velocities[:, 0:1]).mean(dim=1)
         )
 
         self.leader_est_pos = torch.where(update_mask, best_pos, self.leader_est_pos)
@@ -641,7 +641,7 @@ class BatchedModelFreeEnv:
         # 计算信息更新后的 leader 估计误差
         new_est_error = (
             torch.abs(self.leader_est_pos[:, 1:] - self.positions[:, 0:1]).mean(dim=1)
-            + 0.5 * torch.abs(self.leader_est_vel[:, 1:] - self.velocities[:, 0:1]).mean(dim=1)
+            + 0.01 * torch.abs(self.leader_est_vel[:, 1:] - self.velocities[:, 0:1]).mean(dim=1)
         )
 
         # 信息增益奖励：通信使得 leader 估计更准确
@@ -650,11 +650,11 @@ class BatchedModelFreeEnv:
 
         pos_error = torch.abs(self.positions[:, 1:] - self.positions[:, 0:1])
         vel_error = torch.abs(self.velocities[:, 1:] - self.velocities[:, 0:1])
-        tracking_error = pos_error.mean(dim=1) + 0.5 * vel_error.mean(dim=1)
+        tracking_error = pos_error.mean(dim=1) + 0.01 * vel_error.mean(dim=1)
 
         pos_error_norm = pos_error.mean(dim=1) / self.pos_limit
         vel_error_norm = vel_error.mean(dim=1) / self.vel_limit
-        tracking_error_norm = pos_error_norm + 0.5 * vel_error_norm
+        tracking_error_norm = pos_error_norm + 0.01 * vel_error_norm
         tracking_penalty = -self.tracking_penalty_max * torch.log1p(tracking_error_norm * self.tracking_penalty_scale)
 
         improvement_bonus = torch.zeros_like(tracking_error)
