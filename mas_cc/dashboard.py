@@ -319,17 +319,18 @@ class TrainingDashboard:
             self._update_plots()
 
     def _update_plots(self):
+        # 先关闭旧 figure（如果存在）
+        if self._last_progress_fig is not None:
+            try:
+                plt.close(self._last_progress_fig)
+            except Exception:
+                pass
+            self._last_progress_fig = None
+
         with self.plot_output:
             clear_output(wait=True)
 
             fig, axes = plt.subplots(2, 3, figsize=(18, 10), constrained_layout=True)
-
-            if self._last_progress_fig is not None:
-                try:
-                    plt.close(self._last_progress_fig)
-                except Exception:
-                    pass
-            self._last_progress_fig = fig
 
             leader_color = "#e74c3c"
             raw_color = "#95a5a6"
@@ -555,10 +556,12 @@ class TrainingDashboard:
             ax6.legend(loc="best", fontsize=8)
             ax6.grid(True, alpha=0.3)
 
-            # 在 ipywidgets.Output 中用 display(fig) 渲染，避免 inline backend 的“自动渲染 + plt.show()”重复输出
+            # 保存 figure 引用（用于后续 save_training_progress）
+            self._last_progress_fig = fig
+
+            # 在 ipywidgets.Output 中用 display(fig) 渲染
             display(fig)
-            # 关闭 figure，防止 notebook 在 cell 结束时再次自动渲染/累计打开的 figure
-            plt.close(fig)
+            # 注意：不要在这里 close(fig)，否则 _last_progress_fig 会失效
 
     def save_training_progress(self, save_path: str | None = None, dpi: int = 150):
         if self._last_progress_fig is None:
@@ -582,6 +585,13 @@ class TrainingDashboard:
 
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         self._last_progress_fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
+
+        # 保存后关闭 figure，释放内存
+        try:
+            plt.close(self._last_progress_fig)
+        except Exception:
+            pass
+        self._last_progress_fig = None
 
         msg = f"📁 Training Progress saved to {save_path}"
         with self.log_output:

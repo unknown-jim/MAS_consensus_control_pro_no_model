@@ -95,6 +95,7 @@ def train(
         dashboard.display()
     
     best_reward = -float('inf')
+    best_model_state = None  # 记录最优模型状态（内存中）
     global_step = 0
     
     start_time = time.time()
@@ -187,7 +188,17 @@ def train(
         
         if avg_reward > best_reward:
             best_reward = avg_reward
-            agent.save(SAVE_MODEL_PATH)
+            # 记录最优模型状态（内存中），训练结束后再落盘
+            best_model_state = {
+                'actor': {k: v.clone() for k, v in agent.actor.state_dict().items()},
+            }
+            if is_mappo:
+                best_model_state['value'] = {k: v.clone() for k, v in agent.value_net.state_dict().items()}
+            else:
+                best_model_state['q1'] = {k: v.clone() for k, v in agent.q1.state_dict().items()}
+                best_model_state['q2'] = {k: v.clone() for k, v in agent.q2.state_dict().items()}
+                best_model_state['q1_target'] = {k: v.clone() for k, v in agent.q1_target.state_dict().items()}
+                best_model_state['q2_target'] = {k: v.clone() for k, v in agent.q2_target.state_dict().items()}
             trajectory_data = collect_trajectory(agent, eval_env, MAX_STEPS)
         
         if dashboard:
@@ -213,6 +224,28 @@ def train(
     
     if dashboard:
         dashboard.finish()
+    
+    # 训练完成后，保存最优模型到磁盘
+    if best_model_state is not None:
+        import os
+        parent = os.path.dirname(SAVE_MODEL_PATH)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        
+        if is_mappo:
+            torch.save({
+                'actor': best_model_state['actor'],
+                'value': best_model_state['value'],
+            }, SAVE_MODEL_PATH)
+        else:
+            torch.save({
+                'actor': best_model_state['actor'],
+                'q1': best_model_state['q1'],
+                'q2': best_model_state['q2'],
+                'q1_target': best_model_state['q1_target'],
+                'q2_target': best_model_state['q2_target'],
+            }, SAVE_MODEL_PATH)
+        print(f"✅ Best model saved to {SAVE_MODEL_PATH}")
     
     elapsed = time.time() - start_time
     print(f"\n{'='*60}")
