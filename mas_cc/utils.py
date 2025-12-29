@@ -16,7 +16,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from .config import DEVICE, MAX_STEPS, THRESHOLD_MAX, THRESHOLD_MIN, TH_SCALE
+from .config import DEVICE, MAX_STEPS
 from .environment import ModelFreeEnv
 
 
@@ -59,7 +59,7 @@ def collect_trajectory(agent, env, max_steps: int = MAX_STEPS):
         - `leader_pos/leader_vel`: shape=(T+1,)
         - `follower_pos/follower_vel`: shape=(T+1, num_followers)
         - `comm_rates`: shape=(T,)
-        - `thresholds`: shape=(T, num_followers)（环境实际阈值）
+        - `comm_probs`: shape=(T, num_followers)（智能体输出的通信概率）
     """
 
     restore = _set_eval_for_inference(agent)
@@ -72,7 +72,7 @@ def collect_trajectory(agent, env, max_steps: int = MAX_STEPS):
     follower_vel = [env.velocities[1:].cpu().numpy()]
 
     comm_rates = []
-    thresholds = []
+    comm_probs = []
 
     for _ in range(int(max_steps)):
         if state.dim() == 1:
@@ -89,10 +89,9 @@ def collect_trajectory(agent, env, max_steps: int = MAX_STEPS):
 
         comm_rates.append(info["comm_rate"])
 
-        th_raw = action[:, 1]
-        th_norm = (th_raw / TH_SCALE).clamp(0.0, 1.0)
-        th_env = THRESHOLD_MIN + (THRESHOLD_MAX - THRESHOLD_MIN) * th_norm
-        thresholds.append(th_env.cpu().numpy())
+        # 通信概率直接从 action 获取
+        comm_prob = action[:, 1].clamp(0.0, 1.0)
+        comm_probs.append(comm_prob.cpu().numpy())
 
     out = {
         "times": np.array(times),
@@ -101,7 +100,7 @@ def collect_trajectory(agent, env, max_steps: int = MAX_STEPS):
         "follower_pos": np.array(follower_pos),
         "follower_vel": np.array(follower_vel),
         "comm_rates": np.array(comm_rates),
-        "thresholds": np.array(thresholds),
+        "comm_probs": np.array(comm_probs),
     }
 
     restore()

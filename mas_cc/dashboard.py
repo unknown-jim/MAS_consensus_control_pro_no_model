@@ -30,8 +30,6 @@ from .config import (
     POS_LIMIT,
     REWARD_MAX,
     REWARD_MIN,
-    THRESHOLD_MAX,
-    THRESHOLD_MIN,
     TRACKING_PENALTY_MAX,
     TRACKING_PENALTY_SCALE,
     USE_SOFT_REWARD_SCALING,
@@ -412,11 +410,7 @@ class TrainingDashboard:
             if self.best_trajectory is not None and "comm_rates" in self.best_trajectory:
                 t_comm = self.best_trajectory["times"][1:]
                 comm_rates = self.best_trajectory["comm_rates"]
-                thresholds = self.best_trajectory["thresholds"]
-                num_followers = thresholds.shape[1]
-
-                pinned_indices = [i for i in range(num_followers) if (i + 1) in self.pinned_followers]
-                normal_indices = [i for i in range(num_followers) if (i + 1) not in self.pinned_followers]
+                comm_probs = self.best_trajectory.get("comm_probs", None)
 
                 window = min(20, len(comm_rates) // 5) if len(comm_rates) > 20 else 5
                 if window >= 2:
@@ -429,31 +423,38 @@ class TrainingDashboard:
                 ax3.plot(t_smooth, comm_smooth * 100, color=comm_color, lw=2.5, label=f"Comm Rate (smooth w={window})")
                 ax3.fill_between(t_smooth, 0, comm_smooth * 100, color=comm_color, alpha=0.2)
 
-                ax3t = ax3.twinx()
+                # 如果有通信概率数据，在副轴显示
+                if comm_probs is not None and len(comm_probs) > 0:
+                    ax3t = ax3.twinx()
+                    num_followers = comm_probs.shape[1]
+                    pinned_indices = [i for i in range(num_followers) if (i + 1) in self.pinned_followers]
+                    normal_indices = [i for i in range(num_followers) if (i + 1) not in self.pinned_followers]
 
-                if pinned_indices:
-                    pinned_th = thresholds[:, pinned_indices].mean(axis=1)
-                    ax3t.plot(t_comm, pinned_th, color="#27ae60", lw=1.5, linestyle="--", label="Pinned Threshold", alpha=0.8)
+                    if pinned_indices:
+                        pinned_prob = comm_probs[:, pinned_indices].mean(axis=1)
+                        ax3t.plot(t_comm, pinned_prob, color="#27ae60", lw=1.5, linestyle="--", label="Pinned Prob", alpha=0.8)
 
-                if normal_indices:
-                    normal_th = thresholds[:, normal_indices].mean(axis=1)
-                    ax3t.plot(t_comm, normal_th, color="#3498db", lw=1.5, linestyle="--", label="Normal Threshold", alpha=0.8)
+                    if normal_indices:
+                        normal_prob = comm_probs[:, normal_indices].mean(axis=1)
+                        ax3t.plot(t_comm, normal_prob, color="#3498db", lw=1.5, linestyle="--", label="Normal Prob", alpha=0.8)
 
-                avg_th = thresholds.mean(axis=1)
-                ax3t.plot(t_comm, avg_th, color="#8e44ad", lw=2, linestyle="-", label="Avg Threshold", alpha=0.9)
+                    avg_prob = comm_probs.mean(axis=1)
+                    ax3t.plot(t_comm, avg_prob, color="#8e44ad", lw=2, linestyle="-", label="Avg Prob", alpha=0.9)
+
+                    ax3t.set_ylabel("Comm Prob", color="#8e44ad", fontsize=10)
+                    ax3t.tick_params(axis="y", labelcolor="#8e44ad")
+                    ax3t.set_ylim(0, 1)
+
+                    lines1, labels1 = ax3.get_legend_handles_labels()
+                    lines2, labels2 = ax3t.get_legend_handles_labels()
+                    ax3.legend(lines1 + lines2, labels1 + labels2, loc="upper right", fontsize=8)
+                else:
+                    ax3.legend(loc="upper right", fontsize=8)
 
                 ax3.set_xlabel("Time (s)", fontsize=10)
                 ax3.set_ylabel("Comm Rate (%)", color=comm_color, fontsize=10)
                 ax3.set_ylim(0, 100)
                 ax3.tick_params(axis="y", labelcolor=comm_color)
-
-                ax3t.set_ylabel("Threshold", color="#8e44ad", fontsize=10)
-                ax3t.tick_params(axis="y", labelcolor="#8e44ad")
-                ax3t.set_ylim(THRESHOLD_MIN, THRESHOLD_MAX)
-
-                lines1, labels1 = ax3.get_legend_handles_labels()
-                lines2, labels2 = ax3t.get_legend_handles_labels()
-                ax3.legend(lines1 + lines2, labels1 + labels2, loc="upper right", fontsize=8)
 
                 avg_comm = np.mean(comm_rates) * 100
                 ax3.set_title(f"Communication Analysis (Avg: {avg_comm:.1f}%)", fontsize=12, fontweight="bold")
@@ -554,7 +555,10 @@ class TrainingDashboard:
             ax6.legend(loc="best", fontsize=8)
             ax6.grid(True, alpha=0.3)
 
-            plt.show()
+            # 在 ipywidgets.Output 中用 display(fig) 渲染，避免 inline backend 的“自动渲染 + plt.show()”重复输出
+            display(fig)
+            # 关闭 figure，防止 notebook 在 cell 结束时再次自动渲染/累计打开的 figure
+            plt.close(fig)
 
     def save_training_progress(self, save_path: str | None = None, dpi: int = 150):
         if self._last_progress_fig is None:
