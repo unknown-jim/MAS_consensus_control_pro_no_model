@@ -75,7 +75,7 @@ LIGHTWEIGHT_MODE = True
 
 # ==================== 算法选择 ====================
 # 可选："MASAC"（CTDE-SAC） / "MAPPO"（CTDE-MAPPO）
-ALGO = "MAPPO"
+ALGO = "MASAC"
 
 # ==================== 输出目录（按算法隔离）====================
 _ALGO_TAG = str(ALGO).lower().strip() if str(ALGO).strip() else "unknown"
@@ -177,7 +177,7 @@ COMM_RANGE = 5.0
 # 事件触发阈值范围：当 |pos - last_broadcast_pos| > threshold 时触发通信
 # 注意：每步最大位置变化 = VEL_LIMIT × DT = 0.5
 # 阈值应该 < 0.5 才能有效触发通信
-COMM_PENALTY = 0.05
+COMM_PENALTY = 0.1  # 适中的通信惩罚（0.3太强导致熵崩溃）
 THRESHOLD_MIN = 0.02  # 最小阈值（高通信率）
 THRESHOLD_MAX = 0.3   # 最大阈值（低通信率），必须 < VEL_LIMIT * DT
 
@@ -232,16 +232,16 @@ CRITIC_LR = 3e-4
 ALPHA_LR = 3e-4
 
 # ==================== PPO/MAPPO 参数 ====================
-PPO_LR = 3e-4
-PPO_CLIP_EPS = 0.2
+PPO_LR = 1e-4  # 降低学习率（原 3e-4），提高稳定性
+PPO_CLIP_EPS = 0.15  # 减小裁剪范围（原 0.2），限制策略更新幅度
 PPO_EPOCHS = 4
 PPO_ROLLOUT_STEPS = 128
 PPO_MINIBATCH_SIZE = 1024
 PPO_GAE_LAMBDA = 0.95
 PPO_VALUE_COEF = 0.5
-PPO_ENTROPY_COEF = 0.01
-PPO_MAX_GRAD_NORM = 1.0
-PPO_TARGET_KL = 0.02
+PPO_ENTROPY_COEF = 0.05  # 大幅增加熵系数，防止 Beta 分布熵崩溃
+PPO_MAX_GRAD_NORM = 0.5  # 减小梯度裁剪（原 1.0），提高稳定性
+PPO_TARGET_KL = 0.015  # 减小目标 KL（原 0.02），更保守的更新
 
 GAMMA = 0.99
 TAU = 0.005

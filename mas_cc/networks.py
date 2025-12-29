@@ -253,7 +253,7 @@ class DecentralizedActor(nn.Module):
 
         self.v_scale = float(V_SCALE)
         self._eps = 1e-6
-        self._beta_min = 1.0  # Beta 分布参数下界，避免极端分布
+        self._beta_min = 1.0  # Beta 分布参数下界，保持 >= 1 避免 U 形分布和熵崩溃
 
         self.register_buffer("_log_v_scale", torch.log(torch.tensor(self.v_scale)), persistent=False)
 
@@ -267,15 +267,13 @@ class DecentralizedActor(nn.Module):
                     nn.init.zeros_(m.bias)
 
         # 特殊初始化：Beta 分布通信概率头
-        # 目标：初始通信概率 ≈ 0.85，让智能体一开始就能获得好的跟踪效果
-        # Beta(alpha, beta) 的均值 = alpha / (alpha + beta)
-        # softplus(2.5) + 1.0 ≈ 3.7, softplus(-1.5) + 1.0 ≈ 1.2 → mean ≈ 0.76
-        # softplus(3.0) + 1.0 ≈ 4.0, softplus(-2.0) + 1.0 ≈ 1.1 → mean ≈ 0.78
-        # 更激进：alpha_bias=3.5, beta_bias=-2.5 → alpha≈4.5, beta≈1.1 → mean≈0.80
+        # 目标：初始通信概率 ≈ 0.80，让智能体一开始就能获得好的跟踪效果
+        # 然后通过通信惩罚学会降低通信
+        # softplus(2.0) + 0.5 ≈ 2.6, softplus(-1.0) + 0.5 ≈ 0.8 → mean ≈ 0.76
         nn.init.zeros_(self.comm_alpha.weight)
-        nn.init.constant_(self.comm_alpha.bias, 4.0)  # softplus(4.0)+1.0 ≈ 5.0
+        nn.init.constant_(self.comm_alpha.bias, 2.0)  # softplus(2.0)+0.5 ≈ 2.6
         nn.init.zeros_(self.comm_beta.weight)
-        nn.init.constant_(self.comm_beta.bias, -3.0)  # softplus(-3.0)+1.0 ≈ 1.05
+        nn.init.constant_(self.comm_beta.bias, -1.0)  # softplus(-1.0)+0.5 ≈ 0.8
 
     def compute_action_params(self, state: torch.Tensor):
         local_obs, self_role, neighbor_data, neighbor_mask = _parse_flat_state(state)
