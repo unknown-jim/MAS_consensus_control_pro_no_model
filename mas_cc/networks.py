@@ -35,7 +35,6 @@ from .config import (
     NUM_TRANSFORMER_LAYERS,
     SELF_ROLE_DIM,
     STATE_DIM,
-    TH_SCALE,
     V_SCALE,
 )
 
