@@ -26,6 +26,7 @@ from .config import (
     GLOBAL_STATE_INCLUDE_TRAJ_TYPE,
     IMPROVEMENT_CLIP,
     IMPROVEMENT_SCALE,
+    INFO_GAIN_SCALE,
     LEADER_AMPLITUDE,
     LEADER_AMPLITUDE_RANGE,
     LEADER_OMEGA,
@@ -112,6 +113,7 @@ class BatchedModelFreeEnv:
         self.comm_weight_decay = float(COMM_WEIGHT_DECAY)
         self.improvement_scale = float(IMPROVEMENT_SCALE)
         self.improvement_clip = float(IMPROVEMENT_CLIP)
+        self.info_gain_scale = float(INFO_GAIN_SCALE)
 
         self.v_scale = float(V_SCALE)
 
@@ -626,9 +628,25 @@ class BatchedModelFreeEnv:
         best_pos = n_pos.gather(2, argmax.unsqueeze(-1)).squeeze(-1)
         best_vel = n_vel.gather(2, argmax.unsqueeze(-1)).squeeze(-1)
 
+        # 计算信息更新前的 leader 估计误差（用于奖励）
+        old_est_error = (
+            torch.abs(self.leader_est_pos[:, 1:] - self.positions[:, 0:1]).mean(dim=1)
+            + 0.5 * torch.abs(self.leader_est_vel[:, 1:] - self.velocities[:, 0:1]).mean(dim=1)
+        )
+
         self.leader_est_pos = torch.where(update_mask, best_pos, self.leader_est_pos)
         self.leader_est_vel = torch.where(update_mask, best_vel, self.leader_est_vel)
         self.leader_est_seq = torch.where(update_mask, seq_max, self.leader_est_seq)
+
+        # 计算信息更新后的 leader 估计误差
+        new_est_error = (
+            torch.abs(self.leader_est_pos[:, 1:] - self.positions[:, 0:1]).mean(dim=1)
+            + 0.5 * torch.abs(self.leader_est_vel[:, 1:] - self.velocities[:, 0:1]).mean(dim=1)
+        )
+
+        # 信息增益奖励：通信使得 leader 估计更准确
+        info_gain = (old_est_error - new_est_error).clamp(min=0.0)
+        info_gain_bonus = info_gain * self.info_gain_scale
 
         pos_error = torch.abs(self.positions[:, 1:] - self.positions[:, 0:1])
         vel_error = torch.abs(self.velocities[:, 1:] - self.velocities[:, 0:1])
@@ -656,7 +674,7 @@ class BatchedModelFreeEnv:
         comm_rate = is_triggered.float().mean(dim=1)
         comm_penalty = -comm_rate * self.comm_penalty_base * comm_weight
 
-        raw_reward = tracking_penalty + improvement_bonus + comm_penalty
+        raw_reward = tracking_penalty + improvement_bonus + comm_penalty + info_gain_bonus
         rewards = self._scale_reward_batch(raw_reward)
 
         dones = torch.zeros(self.num_envs, dtype=torch.bool, device=DEVICE)
@@ -672,6 +690,7 @@ class BatchedModelFreeEnv:
             "tracking_penalty": tracking_penalty.mean(),
             "improvement_bonus": improvement_bonus.mean(),
             "comm_penalty": comm_penalty.mean(),
+            "info_gain_bonus": info_gain_bonus.mean(),
             "leader_amplitude_mean": self.leader_amplitude.mean(),
             "leader_omega_mean": self.leader_omega.mean(),
         }

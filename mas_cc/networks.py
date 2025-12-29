@@ -10,7 +10,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributions import Normal
+from torch.distributions import Normal, Beta
 
 from .config import (
     ACTION_DIM,
@@ -246,12 +246,14 @@ class DecentralizedActor(nn.Module):
         self.v_mean = nn.Linear(hidden_dim // 2, 1)
         self.v_log_std = nn.Linear(hidden_dim // 2, 1)
 
-        # 通信概率头（直接输出 logit，sigmoid 后为概率）
-        self.comm_mean = nn.Linear(hidden_dim // 2, 1)
-        self.comm_log_std = nn.Linear(hidden_dim // 2, 1)
+        # 通信概率头：Beta 分布参数 (alpha, beta)
+        # 使用 softplus 确保 alpha, beta > 0
+        self.comm_alpha = nn.Linear(hidden_dim // 2, 1)
+        self.comm_beta = nn.Linear(hidden_dim // 2, 1)
 
         self.v_scale = float(V_SCALE)
         self._eps = 1e-6
+        self._beta_min = 1.0  # Beta 分布参数下界，避免极端分布
 
         self.register_buffer("_log_v_scale", torch.log(torch.tensor(self.v_scale)), persistent=False)
 
@@ -263,6 +265,17 @@ class DecentralizedActor(nn.Module):
                 nn.init.orthogonal_(m.weight, gain=0.01)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
+
+        # 特殊初始化：Beta 分布通信概率头
+        # 目标：初始通信概率 ≈ 0.85，让智能体一开始就能获得好的跟踪效果
+        # Beta(alpha, beta) 的均值 = alpha / (alpha + beta)
+        # softplus(2.5) + 1.0 ≈ 3.7, softplus(-1.5) + 1.0 ≈ 1.2 → mean ≈ 0.76
+        # softplus(3.0) + 1.0 ≈ 4.0, softplus(-2.0) + 1.0 ≈ 1.1 → mean ≈ 0.78
+        # 更激进：alpha_bias=3.5, beta_bias=-2.5 → alpha≈4.5, beta≈1.1 → mean≈0.80
+        nn.init.zeros_(self.comm_alpha.weight)
+        nn.init.constant_(self.comm_alpha.bias, 4.0)  # softplus(4.0)+1.0 ≈ 5.0
+        nn.init.zeros_(self.comm_beta.weight)
+        nn.init.constant_(self.comm_beta.bias, -3.0)  # softplus(-3.0)+1.0 ≈ 1.05
 
     def compute_action_params(self, state: torch.Tensor):
         local_obs, self_role, neighbor_data, neighbor_mask = _parse_flat_state(state)
@@ -279,22 +292,22 @@ class DecentralizedActor(nn.Module):
         v_mean = self.v_mean(shared_feat)
         v_log_std = torch.clamp(self.v_log_std(shared_feat), LOG_STD_MIN, LOG_STD_MAX)
 
-        comm_mean = self.comm_mean(shared_feat)
-        comm_log_std = torch.clamp(self.comm_log_std(shared_feat), LOG_STD_MIN, LOG_STD_MAX)
+        # Beta 分布参数：softplus + min 确保 > 1.0（避免 U 形分布）
+        comm_alpha = F.softplus(self.comm_alpha(shared_feat)) + self._beta_min
+        comm_beta = F.softplus(self.comm_beta(shared_feat)) + self._beta_min
 
-        return v_mean, v_log_std, comm_mean, comm_log_std
+        return v_mean, v_log_std, comm_alpha, comm_beta
 
     def forward(self, state: torch.Tensor, deterministic: bool = False):
-        v_mean, v_log_std, comm_mean, comm_log_std = self.compute_action_params(state)
+        v_mean, v_log_std, comm_alpha, comm_beta = self.compute_action_params(state)
 
         v_std = torch.exp(v_log_std)
-        comm_std = torch.exp(comm_log_std)
 
         if deterministic:
             # 速度：tanh squash
             v = torch.tanh(v_mean) * self.v_scale
-            # 通信概率：sigmoid squash 到 [0, 1]
-            comm_prob = torch.sigmoid(comm_mean)
+            # 通信概率：Beta 分布的均值
+            comm_prob = comm_alpha / (comm_alpha + comm_beta)
             log_prob = None
         else:
             # 速度采样
@@ -303,20 +316,17 @@ class DecentralizedActor(nn.Module):
             v_tanh = torch.tanh(v_sample)
             v = v_tanh * self.v_scale
 
-            # 通信概率采样
-            comm_dist = Normal(comm_mean, comm_std)
-            comm_sample = comm_dist.rsample()
-            comm_sigmoid = torch.sigmoid(comm_sample)
-            comm_prob = comm_sigmoid
+            # 通信概率采样：Beta 分布
+            comm_dist = Beta(comm_alpha, comm_beta)
+            # rsample 需要 Beta 支持重参数化（PyTorch >= 1.8 支持）
+            comm_prob = comm_dist.rsample().clamp(self._eps, 1.0 - self._eps)
 
-            # log_prob 计算（含 squash 修正）
+            # log_prob 计算
             log_prob_v = v_dist.log_prob(v_sample) - torch.log(
                 torch.clamp(1.0 - v_tanh.pow(2), min=self._eps, max=1.0)
             ) - self._log_v_scale.to(v_sample.device)
 
-            log_prob_comm = comm_dist.log_prob(comm_sample) - torch.log(
-                torch.clamp(comm_sigmoid * (1.0 - comm_sigmoid), min=self._eps, max=0.25)
-            )
+            log_prob_comm = comm_dist.log_prob(comm_prob)
 
             log_prob = (log_prob_v + log_prob_comm).sum(dim=-1, keepdim=True)
 
@@ -334,30 +344,25 @@ class DecentralizedActor(nn.Module):
             log_prob: shape=(B, 1)
         """
 
-        v_mean, v_log_std, comm_mean, comm_log_std = self.compute_action_params(state)
+        v_mean, v_log_std, comm_alpha, comm_beta = self.compute_action_params(state)
         v_std = torch.exp(v_log_std)
-        comm_std = torch.exp(comm_log_std)
 
         v = action[:, 0:1]
-        comm_prob = action[:, 1:2]
+        comm_prob = action[:, 1:2].clamp(self._eps, 1.0 - self._eps)
 
-        # 反向计算 pre-squash 值
+        # 反向计算 pre-squash 值（仅速度需要）
         v_tanh = (v / self.v_scale).clamp(-1.0 + self._eps, 1.0 - self._eps)
-        comm_sigmoid = comm_prob.clamp(self._eps, 1.0 - self._eps)
-
         v_pre = _atanh(v_tanh, eps=self._eps)
-        comm_pre = _logit(comm_sigmoid, eps=self._eps)
 
         v_dist = Normal(v_mean, v_std)
-        comm_dist = Normal(comm_mean, comm_std)
+        comm_dist = Beta(comm_alpha, comm_beta)
 
         log_prob_v = v_dist.log_prob(v_pre) - torch.log(
             torch.clamp(1.0 - v_tanh.pow(2), min=self._eps, max=1.0)
         ) - self._log_v_scale.to(v_pre.device)
 
-        log_prob_comm = comm_dist.log_prob(comm_pre) - torch.log(
-            torch.clamp(comm_sigmoid * (1.0 - comm_sigmoid), min=self._eps, max=0.25)
-        )
+        # Beta 分布直接计算 log_prob，无需反向变换
+        log_prob_comm = comm_dist.log_prob(comm_prob)
 
         log_prob = (log_prob_v + log_prob_comm).sum(dim=-1, keepdim=True)
         return log_prob

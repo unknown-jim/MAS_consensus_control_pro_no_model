@@ -187,6 +187,7 @@ TRACKING_PENALTY_MAX = 1.0
 COMM_WEIGHT_DECAY = 1.5  # 增大衰减（原 0.8），误差大时通信惩罚更低
 IMPROVEMENT_SCALE = 1.5
 IMPROVEMENT_CLIP = 0.3
+INFO_GAIN_SCALE = 0.5  # 信息增益奖励系数：通信使 leader 估计更准确时的奖励
 
 REWARD_MIN = -2.0
 REWARD_MAX = 2.0
