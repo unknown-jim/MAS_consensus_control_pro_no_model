@@ -411,7 +411,7 @@ class TrainingDashboard:
             if self.best_trajectory is not None and "comm_rates" in self.best_trajectory:
                 t_comm = self.best_trajectory["times"][1:]
                 comm_rates = self.best_trajectory["comm_rates"]
-                comm_probs = self.best_trajectory.get("comm_probs", None)
+                theta_norms = self.best_trajectory.get("theta_norms", None)
 
                 window = min(20, len(comm_rates) // 5) if len(comm_rates) > 20 else 5
                 if window >= 2:
@@ -424,25 +424,25 @@ class TrainingDashboard:
                 ax3.plot(t_smooth, comm_smooth * 100, color=comm_color, lw=2.5, label=f"Comm Rate (smooth w={window})")
                 ax3.fill_between(t_smooth, 0, comm_smooth * 100, color=comm_color, alpha=0.2)
 
-                # 如果有通信概率数据，在副轴显示
-                if comm_probs is not None and len(comm_probs) > 0:
+                # 如果有阈值归一化数据，在副轴显示
+                if theta_norms is not None and len(theta_norms) > 0:
                     ax3t = ax3.twinx()
-                    num_followers = comm_probs.shape[1]
+                    num_followers = theta_norms.shape[1]
                     pinned_indices = [i for i in range(num_followers) if (i + 1) in self.pinned_followers]
                     normal_indices = [i for i in range(num_followers) if (i + 1) not in self.pinned_followers]
 
                     if pinned_indices:
-                        pinned_prob = comm_probs[:, pinned_indices].mean(axis=1)
-                        ax3t.plot(t_comm, pinned_prob, color="#27ae60", lw=1.5, linestyle="--", label="Pinned Prob", alpha=0.8)
+                        pinned_theta = theta_norms[:, pinned_indices].mean(axis=1)
+                        ax3t.plot(t_comm, pinned_theta, color="#27ae60", lw=1.5, linestyle="--", label="Pinned θ_norm", alpha=0.8)
 
                     if normal_indices:
-                        normal_prob = comm_probs[:, normal_indices].mean(axis=1)
-                        ax3t.plot(t_comm, normal_prob, color="#3498db", lw=1.5, linestyle="--", label="Normal Prob", alpha=0.8)
+                        normal_theta = theta_norms[:, normal_indices].mean(axis=1)
+                        ax3t.plot(t_comm, normal_theta, color="#3498db", lw=1.5, linestyle="--", label="Normal θ_norm", alpha=0.8)
 
-                    avg_prob = comm_probs.mean(axis=1)
-                    ax3t.plot(t_comm, avg_prob, color="#8e44ad", lw=2, linestyle="-", label="Avg Prob", alpha=0.9)
+                    avg_theta = theta_norms.mean(axis=1)
+                    ax3t.plot(t_comm, avg_theta, color="#8e44ad", lw=2, linestyle="-", label="Avg θ_norm", alpha=0.9)
 
-                    ax3t.set_ylabel("Comm Prob", color="#8e44ad", fontsize=10)
+                    ax3t.set_ylabel("θ_norm (↑=more comm)", color="#8e44ad", fontsize=10)
                     ax3t.tick_params(axis="y", labelcolor="#8e44ad")
                     ax3t.set_ylim(0, 1)
 

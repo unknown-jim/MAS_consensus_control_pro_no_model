@@ -59,7 +59,7 @@ def collect_trajectory(agent, env, max_steps: int = MAX_STEPS):
         - `leader_pos/leader_vel`: shape=(T+1,)
         - `follower_pos/follower_vel`: shape=(T+1, num_followers)
         - `comm_rates`: shape=(T,)
-        - `comm_probs`: shape=(T, num_followers)（智能体输出的通信概率）
+        - `theta_norms`: shape=(T, num_followers)（智能体输出的阈值归一化值）
     """
 
     restore = _set_eval_for_inference(agent)
@@ -72,7 +72,7 @@ def collect_trajectory(agent, env, max_steps: int = MAX_STEPS):
     follower_vel = [env.velocities[1:].cpu().numpy()]
 
     comm_rates = []
-    comm_probs = []
+    theta_norms = []
 
     for _ in range(int(max_steps)):
         if state.dim() == 1:
@@ -89,9 +89,9 @@ def collect_trajectory(agent, env, max_steps: int = MAX_STEPS):
 
         comm_rates.append(info["comm_rate"])
 
-        # 通信概率直接从 action 获取
-        comm_prob = action[:, 1].clamp(0.0, 1.0)
-        comm_probs.append(comm_prob.cpu().numpy())
+        # 阈值归一化值直接从 action 获取
+        theta_norm = action[:, 1].clamp(0.0, 1.0)
+        theta_norms.append(theta_norm.cpu().numpy())
 
     out = {
         "times": np.array(times),
@@ -100,7 +100,7 @@ def collect_trajectory(agent, env, max_steps: int = MAX_STEPS):
         "follower_pos": np.array(follower_pos),
         "follower_vel": np.array(follower_vel),
         "comm_rates": np.array(comm_rates),
-        "comm_probs": np.array(comm_probs),
+        "theta_norms": np.array(theta_norms),
     }
 
     restore()

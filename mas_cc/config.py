@@ -75,7 +75,7 @@ LIGHTWEIGHT_MODE = True
 
 # ==================== 算法选择 ====================
 # 可选："MASAC"（CTDE-SAC） / "MAPPO"（CTDE-MAPPO）
-ALGO = "MASAC"
+ALGO = "MAPPO"
 
 # ==================== 输出目录（按算法隔离）====================
 _ALGO_TAG = str(ALGO).lower().strip() if str(ALGO).strip() else "unknown"
@@ -177,17 +177,29 @@ COMM_RANGE = 5.0
 # 事件触发阈值范围：当 |pos - last_broadcast_pos| > threshold 时触发通信
 # 注意：每步最大位置变化 = VEL_LIMIT × DT = 0.5
 # 阈值应该 < 0.5 才能有效触发通信
-COMM_PENALTY = 0.1  # 适中的通信惩罚（0.3太强导致熵崩溃）
-THRESHOLD_MIN = 0.02  # 最小阈值（高通信率）
-THRESHOLD_MAX = 0.3   # 最大阈值（低通信率），必须 < VEL_LIMIT * DT
+COMM_PENALTY = 0.15  # 通信惩罚（增大以鼓励节省通信）
+THRESHOLD_MIN = 0.05  # 最小阈值（高通信率）- 提高下限，避免过于敏感
+THRESHOLD_MAX = 0.5   # 最大阈值（低通信率）- 提高上限，允许更低通信率
+
+# ==================== 确定性事件触发（ETC）参数 ====================
+# 触发条件：delta = |x - x_b| + ETC_VEL_COEF * DT * |v - v_b| > theta
+ETC_VEL_COEF = 0.5  # 速度增量映射系数（降低，减少速度对 delta 的贡献）
+
+# 新鲜度保底触发：当 leader_age > AGE_MAX_STEPS 时强制触发（即便 delta <= theta）
+# 这对"低误差"目标非常关键：防止 gossip 链路不畅时 leader 估计过旧
+AGE_MAX_STEPS = 10  # 放宽保底触发（原5太紧，限制了策略探索空间）
+
+# 去抖/最小触发间隔：触发后 COOLDOWN_STEPS 步内不再触发
+# 防止阈值边界来回跨越导致频繁开关
+COOLDOWN_STEPS = 1  # 降低 cooldown（原2太紧，锁死通信率上限在33%）
 
 # ==================== 奖励参数 ====================
 TRACKING_PENALTY_SCALE = 2.0
 TRACKING_PENALTY_MAX = 1.0
-COMM_WEIGHT_DECAY = 1.5  # 增大衰减（原 0.8），误差大时通信惩罚更低
+COMM_WEIGHT_DECAY = 0.8  # 降低衰减（原1.5太大），让通信惩罚在低误差时更显著
 IMPROVEMENT_SCALE = 1.5
 IMPROVEMENT_CLIP = 0.3
-INFO_GAIN_SCALE = 0.5  # 信息增益奖励系数：通信使 leader 估计更准确时的奖励
+INFO_GAIN_SCALE = 0.3  # 信息增益奖励系数（降低，避免过度鼓励通信）
 
 REWARD_MIN = -2.0
 REWARD_MAX = 2.0

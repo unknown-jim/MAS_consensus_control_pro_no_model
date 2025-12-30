@@ -199,8 +199,9 @@ class DecentralizedActor(nn.Module):
 
     动作空间：
     - action[0]: 速度增量 delta_v，范围 [-V_SCALE, V_SCALE]
-    - action[1]: 通信概率 comm_prob，范围 [0, 1]
-      （环境中会用这个概率采样决定是否通信）
+    - action[1]: 阈值归一化值 theta_norm，范围 [0, 1]
+      环境会用反向映射：theta = TH_MAX - theta_norm * (TH_MAX - TH_MIN)
+      即 theta_norm 越大 → theta 越小 → 通信越频繁
 
     同时提供 `evaluate_actions(state, action)`：给定动作求 log_prob（PPO/MAPPO 需要）。
     """
@@ -246,8 +247,9 @@ class DecentralizedActor(nn.Module):
         self.v_mean = nn.Linear(hidden_dim // 2, 1)
         self.v_log_std = nn.Linear(hidden_dim // 2, 1)
 
-        # 通信概率头：Beta 分布参数 (alpha, beta)
+        # 阈值归一化头（theta_norm）：Beta 分布参数 (alpha, beta)
         # 使用 softplus 确保 alpha, beta > 0
+        # 注意：theta_norm 越大 → theta 越小 → 通信越频繁
         self.comm_alpha = nn.Linear(hidden_dim // 2, 1)
         self.comm_beta = nn.Linear(hidden_dim // 2, 1)
 
@@ -266,14 +268,14 @@ class DecentralizedActor(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-        # 特殊初始化：Beta 分布通信概率头
-        # 目标：初始通信概率 ≈ 0.80，让智能体一开始就能获得好的跟踪效果
-        # 然后通过通信惩罚学会降低通信
-        # softplus(2.0) + 0.5 ≈ 2.6, softplus(-1.0) + 0.5 ≈ 0.8 → mean ≈ 0.76
+        # 特殊初始化：Beta 分布阈值归一化头（theta_norm）
+        # 目标：初始 theta_norm ≈ 0.80（对应 theta 较小 → 高通信率）
+        # 这让智能体一开始就能获得好的跟踪效果，然后通过通信惩罚学会提高阈值
+        # softplus(2.0) + 1.0 ≈ 3.1, softplus(-1.0) + 1.0 ≈ 1.3 → mean ≈ 0.70
         nn.init.zeros_(self.comm_alpha.weight)
-        nn.init.constant_(self.comm_alpha.bias, 2.0)  # softplus(2.0)+0.5 ≈ 2.6
+        nn.init.constant_(self.comm_alpha.bias, 2.0)  # softplus(2.0)+1.0 ≈ 3.1
         nn.init.zeros_(self.comm_beta.weight)
-        nn.init.constant_(self.comm_beta.bias, -1.0)  # softplus(-1.0)+0.5 ≈ 0.8
+        nn.init.constant_(self.comm_beta.bias, -1.0)  # softplus(-1.0)+1.0 ≈ 1.3
 
     def compute_action_params(self, state: torch.Tensor):
         local_obs, self_role, neighbor_data, neighbor_mask = _parse_flat_state(state)
@@ -304,8 +306,8 @@ class DecentralizedActor(nn.Module):
         if deterministic:
             # 速度：tanh squash
             v = torch.tanh(v_mean) * self.v_scale
-            # 通信概率：Beta 分布的均值
-            comm_prob = comm_alpha / (comm_alpha + comm_beta)
+            # 阈值归一化：Beta 分布的均值
+            theta_norm = comm_alpha / (comm_alpha + comm_beta)
             log_prob = None
         else:
             # 速度采样
@@ -314,21 +316,21 @@ class DecentralizedActor(nn.Module):
             v_tanh = torch.tanh(v_sample)
             v = v_tanh * self.v_scale
 
-            # 通信概率采样：Beta 分布
+            # 阈值归一化采样：Beta 分布
             comm_dist = Beta(comm_alpha, comm_beta)
             # rsample 需要 Beta 支持重参数化（PyTorch >= 1.8 支持）
-            comm_prob = comm_dist.rsample().clamp(self._eps, 1.0 - self._eps)
+            theta_norm = comm_dist.rsample().clamp(self._eps, 1.0 - self._eps)
 
             # log_prob 计算
             log_prob_v = v_dist.log_prob(v_sample) - torch.log(
                 torch.clamp(1.0 - v_tanh.pow(2), min=self._eps, max=1.0)
             ) - self._log_v_scale.to(v_sample.device)
 
-            log_prob_comm = comm_dist.log_prob(comm_prob)
+            log_prob_comm = comm_dist.log_prob(theta_norm)
 
             log_prob = (log_prob_v + log_prob_comm).sum(dim=-1, keepdim=True)
 
-        action = torch.cat([v, comm_prob], dim=-1)
+        action = torch.cat([v, theta_norm], dim=-1)
         return action, log_prob
 
     def evaluate_actions(self, state: torch.Tensor, action: torch.Tensor):
@@ -337,6 +339,8 @@ class DecentralizedActor(nn.Module):
         Args:
             state: shape=(B, STATE_DIM)。
             action: shape=(B, ACTION_DIM)，为 post-squash 空间动作（与环境交互的动作）。
+                - action[:, 0]: delta_v
+                - action[:, 1]: theta_norm
 
         Returns:
             log_prob: shape=(B, 1)
@@ -346,7 +350,7 @@ class DecentralizedActor(nn.Module):
         v_std = torch.exp(v_log_std)
 
         v = action[:, 0:1]
-        comm_prob = action[:, 1:2].clamp(self._eps, 1.0 - self._eps)
+        theta_norm = action[:, 1:2].clamp(self._eps, 1.0 - self._eps)
 
         # 反向计算 pre-squash 值（仅速度需要）
         v_tanh = (v / self.v_scale).clamp(-1.0 + self._eps, 1.0 - self._eps)
@@ -360,7 +364,7 @@ class DecentralizedActor(nn.Module):
         ) - self._log_v_scale.to(v_pre.device)
 
         # Beta 分布直接计算 log_prob，无需反向变换
-        log_prob_comm = comm_dist.log_prob(comm_prob)
+        log_prob_comm = comm_dist.log_prob(theta_norm)
 
         log_prob = (log_prob_v + log_prob_comm).sum(dim=-1, keepdim=True)
         return log_prob

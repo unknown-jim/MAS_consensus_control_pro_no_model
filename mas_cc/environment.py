@@ -11,10 +11,13 @@ import torch
 
 from .config import (
     ACTION_DIM,
+    AGE_MAX_STEPS,
     COMM_PENALTY,
     COMM_WEIGHT_DECAY,
+    COOLDOWN_STEPS,
     DEVICE,
     DT,
+    ETC_VEL_COEF,
     FOLLOWER_INIT_POS_STD,
     FOLLOWER_INIT_POS_STD_RANGE,
     FOLLOWER_INIT_VEL_STD,
@@ -47,6 +50,8 @@ from .config import (
     REWARD_MIN,
     SELF_ROLE_DIM,
     STATE_DIM,
+    THRESHOLD_MAX,
+    THRESHOLD_MIN,
     TRACKING_PENALTY_MAX,
     TRACKING_PENALTY_SCALE,
     USE_SOFT_REWARD_SCALING,
@@ -141,6 +146,18 @@ class BatchedModelFreeEnv:
         self._prev_error = torch.zeros(self.num_envs, device=DEVICE)
         self._prev_error_valid = torch.zeros(self.num_envs, dtype=torch.bool, device=DEVICE)
 
+        # ETC 相关状态缓存
+        self._cooldown_counter = torch.zeros(self.num_envs, self.num_followers, dtype=torch.long, device=DEVICE)
+        # 方案(1)：距上次 leader 信息更新的步数（用于"多久没收到更新"保底触发）
+        self._since_leader_update = torch.zeros(self.num_envs, self.num_followers, dtype=torch.long, device=DEVICE)
+
+        # ETC 超参缓存（避免每步从 config 读取）
+        self._etc_vel_coef = float(ETC_VEL_COEF)
+        self._age_max_steps = int(AGE_MAX_STEPS)
+        self._cooldown_steps = int(COOLDOWN_STEPS)
+        self._threshold_min = float(THRESHOLD_MIN)
+        self._threshold_max = float(THRESHOLD_MAX)
+
         self._state_buffer = torch.zeros(self.num_envs, self.num_agents, STATE_DIM, device=DEVICE)
 
         # 评估场景支持任意 `num_agents`：全局状态维度与 buffer 按 topology 动态分配
@@ -184,6 +201,12 @@ class BatchedModelFreeEnv:
 
         self._max_actual_neighbors = int(self._neighbor_counts.max().item())
         self._max_candidate_neighbors = int(max_candidates)
+
+        # 方案(2)：预计算每个智能体的出度（是否有下游节点能接收自己的广播）
+        # out_degree[i] = 有多少 j 满足 adj_matrix[j, i] > 0（即 j 能接收 i 的广播）
+        self._out_degree = (self.topology.adj_matrix > 0).sum(dim=0).to(device=DEVICE)  # shape=(A,)
+        # 叶子节点 mask（出度为 0 的 follower）：这些节点禁用 age 保底触发
+        self._is_leaf_follower = self._out_degree[1:] == 0  # shape=(F,)
 
         self._precompute_role_info()
 
@@ -430,6 +453,11 @@ class BatchedModelFreeEnv:
         self._prev_error[env_ids] = 0.0
         self._prev_error_valid[env_ids] = False
 
+        # 重置 ETC cooldown 计数器
+        self._cooldown_counter[env_ids] = 0
+        # 重置 since_leader_update 计数器
+        self._since_leader_update[env_ids] = 0
+
         return self._get_state_optimized()
 
     def _randomize_topology(self):
@@ -555,7 +583,9 @@ class BatchedModelFreeEnv:
         Args:
             action: follower 动作，shape=(E, num_followers, ACTION_DIM)。
                 - action[..., 0]：速度增量（delta_v）
-                - action[..., 1]：通信概率（comm_prob），范围 [0, 1]
+                - action[..., 1]：阈值归一化值（theta_norm），范围 [0, 1]
+                  环境会用反向映射：theta = TH_MAX - theta_norm * (TH_MAX - TH_MIN)
+                  这样 theta_norm 越大，theta 越小，通信越频繁
 
         Returns:
             states: 下一步本地状态，shape=(E, num_agents, STATE_DIM)
@@ -583,7 +613,11 @@ class BatchedModelFreeEnv:
         self.last_broadcast_leader_seq[:, 0] = self.leader_seq
 
         delta_v = action[:, :, 0]
-        comm_prob = action[:, :, 1].clamp(0.0, 1.0)  # 通信概率
+        theta_norm = action[:, :, 1].clamp(0.0, 1.0)  # 阈值归一化值
+
+        # 反向映射：theta_norm 越大 → theta 越小 → 通信越频繁
+        # 这与原 Beta 分布"初始高通信"的初始化趋势一致
+        theta = self._threshold_max - theta_norm * (self._threshold_max - self._threshold_min)
 
         follower_vel = self.velocities[:, 1:]
         follower_pos = self.positions[:, 1:]
@@ -594,8 +628,40 @@ class BatchedModelFreeEnv:
         self.positions[:, 1:] = new_pos
         self.velocities[:, 1:] = new_vel
 
-        # 直接用通信概率采样决定是否通信
-        is_triggered = torch.rand_like(comm_prob) < comm_prob
+        # ============================================================
+        # 确定性事件触发（ETC）逻辑
+        # ============================================================
+        # 1. 计算触发增量 delta = |x - x_b| + coef * DT * |v - v_b|
+        pos_diff = torch.abs(new_pos - self.last_broadcast_pos[:, 1:])
+        vel_diff = torch.abs(new_vel - self.last_broadcast_vel[:, 1:])
+        delta = pos_diff + self._etc_vel_coef * DT * vel_diff
+
+        # 2. 阈值触发条件
+        threshold_triggered = delta > theta
+
+        # 3. 新鲜度保底触发（方案1改进）：用"多久没收到更新"而非"绝对滞后"
+        #    _since_leader_update 记录距上次 leader_est_seq 被更新的步数
+        #    当 since_leader_update > AGE_MAX_STEPS 时触发
+        age_triggered_raw = self._since_leader_update > self._age_max_steps
+
+        # 方案(2)：叶子节点（出度为 0）禁用 age 保底触发，因为它们发送的广播没有下游接收者
+        # _is_leaf_follower: shape=(F,)，需要 broadcast 到 (E, F)
+        is_leaf = self._is_leaf_follower.unsqueeze(0).expand(self.num_envs, -1)
+        age_triggered = age_triggered_raw & (~is_leaf)
+
+        # 4. Cooldown 去抖：触发后 COOLDOWN_STEPS 步内不再触发
+        cooldown_ok = self._cooldown_counter == 0
+
+        # 5. 综合触发条件：(阈值触发 OR 新鲜度保底) AND cooldown 允许
+        is_triggered = (threshold_triggered | age_triggered) & cooldown_ok
+
+        # 6. 更新 cooldown 计数器
+        # 触发的 follower 重置为 COOLDOWN_STEPS；未触发的递减（但不低于 0）
+        self._cooldown_counter = torch.where(
+            is_triggered,
+            torch.full_like(self._cooldown_counter, self._cooldown_steps),
+            (self._cooldown_counter - 1).clamp(min=0),
+        )
 
         self.last_broadcast_pos[:, 1:] = torch.where(is_triggered, self.positions[:, 1:], self.last_broadcast_pos[:, 1:])
         self.last_broadcast_vel[:, 1:] = torch.where(is_triggered, self.velocities[:, 1:], self.last_broadcast_vel[:, 1:])
@@ -637,6 +703,16 @@ class BatchedModelFreeEnv:
         self.leader_est_pos = torch.where(update_mask, best_pos, self.leader_est_pos)
         self.leader_est_vel = torch.where(update_mask, best_vel, self.leader_est_vel)
         self.leader_est_seq = torch.where(update_mask, seq_max, self.leader_est_seq)
+
+        # 方案(1)：更新 _since_leader_update 计数器
+        # follower 部分的 update_mask: shape=(E, A)，取 [:, 1:] 得到 (E, F)
+        follower_updated = update_mask[:, 1:]  # (E, F)
+        # 被更新的 follower 清零，否则 +1
+        self._since_leader_update = torch.where(
+            follower_updated,
+            torch.zeros_like(self._since_leader_update),
+            self._since_leader_update + 1,
+        )
 
         # 计算信息更新后的 leader 估计误差
         new_est_error = (
@@ -686,7 +762,7 @@ class BatchedModelFreeEnv:
             "leader_pos": self.positions[:, 0],
             "leader_vel": self.velocities[:, 0],
             "avg_follower_pos": self.positions[:, 1:].mean(dim=1),
-            "comm_prob_mean": comm_prob.mean(),
+            "theta_mean": theta.mean(),  # 改为阈值均值（原 comm_prob_mean）
             "tracking_penalty": tracking_penalty.mean(),
             "improvement_bonus": improvement_bonus.mean(),
             "comm_penalty": comm_penalty.mean(),
