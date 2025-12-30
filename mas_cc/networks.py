@@ -1,8 +1,9 @@
 """神经网络模型（CTDE 版本）。
 
-CTDE = Centralized Training Decentralized Execution
-- Actor: 分散式，只使用本地观测（flat state）
-- Critic/Value: 集中式，使用全局状态 +（可选）联合动作
+CTDE = Centralized Training, Decentralized Execution（集中训练、分散执行）。
+
+- Actor：分散式，只使用本地观测（flat state）。
+- Critic/Value：集中式，使用全局状态 +（可选）联合动作。
 """
 
 from __future__ import annotations
@@ -70,11 +71,31 @@ def _parse_flat_state(state: torch.Tensor):
 
 
 def _atanh(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """数值稳定的 atanh。
+
+    Args:
+        x: 输入张量（期望范围在 [-1, 1]）。
+        eps: 数值稳定项，用于把输入夹到 (-1, 1) 内。
+
+    Returns:
+        与 `x` 同形状的张量。
+    """
+
     x = x.clamp(min=-1.0 + eps, max=1.0 - eps)
     return 0.5 * (torch.log1p(x) - torch.log1p(-x))
 
 
 def _logit(p: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """数值稳定的 logit 变换。
+
+    Args:
+        p: 概率张量（期望范围在 [0, 1]）。
+        eps: 数值稳定项，用于把输入夹到 (0, 1) 内。
+
+    Returns:
+        与 `p` 同形状的张量。
+    """
+
     p = p.clamp(min=eps, max=1.0 - eps)
     return torch.log(p) - torch.log1p(-p)
 
@@ -146,7 +167,17 @@ class LightweightAttention(nn.Module):
 
 
 class LightweightAttentionEncoder(nn.Module):
-    """轻量版注意力编码器"""
+    """轻量版注意力编码器。
+
+    用一组轻量自注意力层对邻居序列特征进行编码，并输出一个固定维度的聚合表示。
+
+    Args:
+        neighbor_dim: 单个邻居的输入特征维度（`NEIGHBOR_FEAT_DIM`）。
+        hidden_dim: 隐层维度。
+        num_heads: 注意力 head 数。
+        num_layers: 注意力层数。
+        dropout: dropout 概率。
+    """
 
     def __init__(self, neighbor_dim: int, hidden_dim: int, num_heads: int, num_layers: int, dropout: float):
         super().__init__()
@@ -450,9 +481,14 @@ class DeepSetsEncoder(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None):
-        """Args:
-        x: (B, M, D)
-        mask: (B, M)；True 表示该实体无效（会被排除）
+        """对集合特征序列进行置换不变编码（pooling）。
+
+        Args:
+            x: shape=(B, M, D) 的实体特征序列。
+            mask: shape=(B, M)；True 表示该实体无效（会被排除）。
+
+        Returns:
+            shape=(B, out_dim) 的集合表示。
         """
         h = self.phi(x)
 
