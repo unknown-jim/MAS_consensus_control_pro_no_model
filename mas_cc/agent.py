@@ -6,6 +6,7 @@ try:
     import fcntl
 except ImportError:  # pragma: no cover - Windows fallback
     fcntl = None
+import copy
 import io
 import math
 import os
@@ -222,10 +223,8 @@ def _actor_weights_complete(weights: dict, actor) -> bool:
             or tensor.shape != param.shape
         ):
             return False
-    width = int(actor.local_encoder[0].out_features)
     try:
-        with torch.random.fork_rng(devices=[]):
-            probe = DecentralizedActor(hidden_dim=width)
+        probe = copy.deepcopy(actor).to("cpu")
         probe.load_state_dict(weights, strict=True)
     except _OOM_TYPES:
         raise
@@ -275,7 +274,12 @@ def save_canonical_best_actor(
     )
 
     with _canonical_file_lock(path_str):
-        if os.path.exists(path_str):
+        try:
+            os.stat(path_str)
+            file_exists = True
+        except FileNotFoundError:
+            file_exists = False
+        if file_exists:
             existing = None
             existing_width = None
             try:

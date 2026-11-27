@@ -320,7 +320,12 @@ class CanonicalCheckpointTests(unittest.TestCase):
             save_canonical_best_actor(ckpt_path, actor, "MAPPO", score=100.0, eval_signature="sig_v1")
             healthy_bytes = ckpt_path.read_bytes()
 
-            # 1) 复核时 fstat 报 EIO 必须上抛 OSError，不得降级跳过尺寸校验而覆盖高分原件
+            # 1) 首次存在性 stat 报 EIO 以及复核 fstat 报 EIO 均必须上抛 OSError，不得误覆盖高分原件
+            with patch.object(agents.os, "stat", side_effect=OSError(errno.EIO, "stat I/O error")):
+                with self.assertRaises(OSError):
+                    save_canonical_best_actor(ckpt_path, actor, "MAPPO", score=1.0, eval_signature="sig_v1")
+            self.assertEqual(ckpt_path.read_bytes(), healthy_bytes)
+
             with patch.object(agents.torch, "load", side_effect=RuntimeError("failed finding central directory")), \
                  patch.object(agents.os, "fstat", side_effect=OSError(errno.EIO, "I/O error")):
                 with self.assertRaises(OSError):
@@ -329,12 +334,12 @@ class CanonicalCheckpointTests(unittest.TestCase):
 
             # 2) Actor 校验阶段遇到 typed torch.OutOfMemoryError("OOM") 必须原样上抛，不覆盖原件
             oom_cls = getattr(torch, "OutOfMemoryError", MemoryError)
-            with patch.object(agents, "DecentralizedActor", side_effect=oom_cls("OOM")):
+            with patch.object(agents.copy, "deepcopy", side_effect=oom_cls("OOM")):
                 with self.assertRaises(oom_cls):
                     save_canonical_best_actor(ckpt_path, actor, "MAPPO", score=1.0, eval_signature="sig_v1")
             self.assertEqual(ckpt_path.read_bytes(), healthy_bytes)
 
-            # 3) 拒绝低分候选时不污染全局 CPU Torch RNG 状态
+            # 3) 拒绝低分候选时不消费也不回退全局 CPU Torch RNG 状态（包括多线程场景）
             torch.manual_seed(7101)
             expected_next = torch.rand(1).item()
             torch.manual_seed(7101)
