@@ -20,6 +20,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
+from . import environment as _env_mod
 from .agent import ActorOnlyPolicy, CTDEMAPPOAgent, CTDESACAgent
 from .config import DEVICE, DT, MAX_STEPS, OBS_LAYOUT
 from .environment import ModelFreeEnv
@@ -187,8 +188,18 @@ def evaluate_canonical_score(
             env = ModelFreeEnv(topo, max_steps=steps, auto_reset=False, randomize_topology_on_reset=False)
             benv = env.batched_env
             if idx == 0:
+                def _repr_range(val):
+                    return [repr(float(x)) for x in val]
+
                 sig_payload = {
-                    "dt": repr(float(DT)),
+                    "dt": repr(float(_env_mod.DT)),
+                    "dt_utils": repr(float(DT)),
+                    "obs_age_cap": repr(float(_env_mod.OBS_AGE_CAP)),
+                    "top_k": int(_env_mod.MAX_NEIGHBORS),
+                    "neighbor_feat_dim": int(_env_mod.NEIGHBOR_FEAT_DIM),
+                    "self_role_dim": int(_env_mod.SELF_ROLE_DIM),
+                    "state_dim": int(_env_mod.STATE_DIM),
+                    "action_dim": int(_env_mod.ACTION_DIM),
                     "pos_limit": repr(float(benv.pos_limit)),
                     "vel_limit": repr(float(benv.vel_limit)),
                     "v_scale": repr(float(benv.v_scale)),
@@ -207,6 +218,19 @@ def evaluate_canonical_score(
                     "reward_max": repr(float(benv.reward_max)),
                     "threshold_min": repr(float(benv._threshold_min)),
                     "threshold_max": repr(float(benv._threshold_max)),
+                    "randomize_leader": bool(_env_mod.RANDOMIZE_LEADER),
+                    "leader_amplitude": repr(float(_env_mod.LEADER_AMPLITUDE)),
+                    "leader_amplitude_range": _repr_range(_env_mod.LEADER_AMPLITUDE_RANGE),
+                    "leader_omega": repr(float(_env_mod.LEADER_OMEGA)),
+                    "leader_omega_range": _repr_range(_env_mod.LEADER_OMEGA_RANGE),
+                    "leader_phase": repr(float(_env_mod.LEADER_PHASE)),
+                    "leader_phase_range": _repr_range(_env_mod.LEADER_PHASE_RANGE),
+                    "leader_trajectory_types": [str(t) for t in _env_mod.LEADER_TRAJECTORY_TYPES],
+                    "randomize_follower": bool(_env_mod.RANDOMIZE_FOLLOWER),
+                    "follower_init_pos_std": repr(float(_env_mod.FOLLOWER_INIT_POS_STD)),
+                    "follower_init_pos_std_range": _repr_range(_env_mod.FOLLOWER_INIT_POS_STD_RANGE),
+                    "follower_init_vel_std": repr(float(_env_mod.FOLLOWER_INIT_VEL_STD)),
+                    "follower_init_vel_std_range": _repr_range(_env_mod.FOLLOWER_INIT_VEL_STD_RANGE),
                     "obs_layout": str(OBS_LAYOUT),
                 }
                 sig_hasher.update(json.dumps(sig_payload, sort_keys=True, separators=(",", ":")).encode("utf-8"))

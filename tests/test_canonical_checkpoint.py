@@ -260,6 +260,56 @@ class CanonicalCheckpointTests(unittest.TestCase):
             self.assertEqual(canon.read_bytes(), protected_bytes)
             self.assertNotEqual(protected_bytes, first_bytes)
 
+    def test_r4_signature_short_read_and_unloadable_weights(self):
+        from mas_cc import environment as env_mod
+
+        actor = DecentralizedActor(hidden_dim=16)
+        policy = ActorOnlyPolicy(actor)
+
+        # 1) OBS_AGE_CAP 和随机化区间变更必须改变 eval_signature
+        base = evaluate_canonical_score(policy, max_steps=4, cases=((5, "normal", "shallow", 1000),))
+        with patch.object(env_mod, "OBS_AGE_CAP", 2):
+            age_changed = evaluate_canonical_score(policy, max_steps=4, cases=((5, "normal", "shallow", 1000),))
+        self.assertNotEqual(base["eval_signature"], age_changed["eval_signature"])
+        with patch.object(env_mod, "LEADER_AMPLITUDE_RANGE", (1.5581355839967728, 1.8081355839967728)):
+            amp_changed = evaluate_canonical_score(policy, max_steps=4, cases=((5, "normal", "shallow", 1000),))
+        self.assertNotEqual(base["eval_signature"], amp_changed["eval_signature"])
+
+        # 2) 单次短读不得把健康高分原件误判为损坏而覆盖
+        with TemporaryDirectory() as tmp:
+            ckpt_path = Path(tmp) / "best_mappo.pt"
+            save_canonical_best_actor(ckpt_path, actor, "MAPPO", score=100.0, eval_signature="sig_v1")
+            healthy_bytes = ckpt_path.read_bytes()
+
+            real_load = torch.load
+            calls = {"n": 0}
+
+            def flaky_load(f, *args, **kwargs):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise RuntimeError("PytorchStreamReader failed reading zip archive: failed finding central directory")
+                return real_load(f, *args, **kwargs)
+
+            with patch.object(agents.torch, "load", side_effect=flaky_load):
+                res = save_canonical_best_actor(ckpt_path, actor, "MAPPO", score=1.0, eval_signature="sig_v1")
+            self.assertFalse(res["updated"])
+            self.assertEqual(res["reason"], "existing_better_or_equal")
+            self.assertEqual(ckpt_path.read_bytes(), healthy_bytes)
+
+            # 3) sparse / meta 等无法被 ActorOnlyPolicy 加载的同 shape 参数须判为不完整并恢复
+            for bad_kind in ("sparse", "meta"):
+                bad_ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+                orig_bias = bad_ckpt["actor"]["v_mean.bias"]
+                if bad_kind == "sparse":
+                    bad_ckpt["actor"]["v_mean.bias"] = orig_bias.to_sparse()
+                else:
+                    bad_ckpt["actor"]["v_mean.bias"] = torch.empty_like(orig_bias, device="meta")
+                with patch.object(agents, "_read_checkpoint", return_value=(bad_ckpt, 16)):
+                    res_bad = save_canonical_best_actor(ckpt_path, actor, "MAPPO", score=1.0, eval_signature="sig_v1")
+                self.assertTrue(res_bad["updated"])
+                self.assertEqual(res_bad["reason"], "schema_changed_or_unreadable")
+                ActorOnlyPolicy.from_checkpoint(str(ckpt_path))
+
 
 if __name__ == "__main__":
     unittest.main()

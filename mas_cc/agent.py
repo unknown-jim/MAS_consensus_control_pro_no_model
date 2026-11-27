@@ -6,9 +6,11 @@ try:
     import fcntl
 except ImportError:  # pragma: no cover - Windows fallback
     fcntl = None
+import io
 import math
 import os
 import pickle
+import stat
 import tempfile
 import weakref
 import zipfile
@@ -122,21 +124,74 @@ def _atomic_save_checkpoint(path, actor, algorithm, **training_state):
     os.makedirs(parent, exist_ok=True)
     schema = _actor_schema(actor.local_encoder[0].out_features, algorithm)
     payload = {**schema, "actor": {k: v.detach().cpu() for k, v in actor.state_dict().items()}, **training_state}
-    tmp_path = None
+    tmp_file = None
     replaced = False
     try:
-        with tempfile.NamedTemporaryFile(prefix=".tmp_ckpt_", suffix=".pt", dir=parent, delete=False) as tmp_file:
-            tmp_path = tmp_file.name
+        tmp_file = tempfile.NamedTemporaryFile(prefix=".tmp_ckpt_", suffix=".pt", dir=parent, delete=False)
+        try:
             torch.save(payload, tmp_file)
             tmp_file.flush()
-        os.replace(tmp_path, path_str)
+        finally:
+            tmp_file.close()
+        os.replace(tmp_file.name, path_str)
         replaced = True
     finally:
-        if not replaced and tmp_path and os.path.exists(tmp_path):
+        if tmp_file is not None:
+            if not tmp_file.closed:
+                tmp_file.close()
+            if not replaced:
+                try:
+                    os.remove(tmp_file.name)
+                except OSError:
+                    pass
+
+
+def _read_file_bytes_exact(path_str: str) -> bytes:
+    """完整读取文件字节；若常规文件实际读取字节数与 fstat 不一致则判为短读并抛 OSError。"""
+    with open(path_str, "rb") as f:
+        expected_size = None
+        try:
+            fd = f.fileno()
+        except (AttributeError, OSError, io.UnsupportedOperation):
+            fd = None
+        if isinstance(fd, int) and fd >= 0:
             try:
-                os.remove(tmp_path)
+                st = os.fstat(fd)
+                if stat.S_ISREG(st.st_mode):
+                    expected_size = int(st.st_size)
             except OSError:
-                pass
+                expected_size = None
+        chunks = []
+        while True:
+            chunk = f.read(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        data = b"".join(chunks)
+        if expected_size is not None and len(data) != expected_size:
+            raise OSError(f"Short read while verifying checkpoint {path_str}: got {len(data)} of {expected_size} bytes")
+        return data
+
+
+def _is_corruption_load_error(exc: BaseException) -> bool:
+    if isinstance(exc, (ValueError, EOFError, IndexError, pickle.UnpicklingError, zipfile.BadZipFile, KeyError, TypeError)):
+        return True
+    if isinstance(exc, RuntimeError):
+        msg = str(exc).lower()
+        format_markers = (
+            "pytorchstreamreader",
+            "failed finding central directory",
+            "invalid load key",
+            "unexpected eof",
+            "zip archive",
+            "magic number",
+            "corrupt",
+            "inline_container",
+        )
+        if any(tok in msg for tok in ("memory", "alloc")):
+            return False
+        return any(m in msg for m in format_markers)
+    return False
 
 
 def _actor_weights_complete(weights: dict, actor) -> bool:
@@ -145,8 +200,23 @@ def _actor_weights_complete(weights: dict, actor) -> bool:
         return False
     for key, param in expected.items():
         tensor = weights.get(key)
-        if not isinstance(tensor, torch.Tensor) or tensor.shape != param.shape:
+        if (
+            not isinstance(tensor, torch.Tensor)
+            or tensor.is_meta
+            or tensor.layout != torch.strided
+            or tensor.shape != param.shape
+        ):
             return False
+    width = int(actor.local_encoder[0].out_features)
+    try:
+        probe = DecentralizedActor(hidden_dim=width)
+        probe.load_state_dict(weights, strict=True)
+    except RuntimeError as exc:
+        if any(tok in str(exc).lower() for tok in ("memory", "alloc")):
+            raise
+        return False
+    except (ValueError, TypeError):
+        return False
     return True
 
 
@@ -166,7 +236,7 @@ def save_canonical_best_actor(
     规则：
     - 同算法、同观测/网络协议且评估签名完全一致时，仅当 `score > existing_score` 才替换；
     - 评估签名不一致（含一侧缺失）时默认保留原件不覆盖；
-    - 已有文件确实损坏、缺少参数或协议变化时可替换恢复；临时读写权限/IO 失败则保留原件并抛错。
+    - 已有文件经重读复核确实损坏、缺少参数或协议变化时可替换恢复；临时读写权限/IO/短读/OOM 失败则保留原件并抛错。
     """
     algo = normalize_algo_name(algorithm)
     if isinstance(score, (bool, np.bool_)) or not isinstance(score, (int, float, np.number)) or not math.isfinite(float(score)):
@@ -188,10 +258,31 @@ def save_canonical_best_actor(
 
     with _canonical_file_lock(path_str):
         if os.path.exists(path_str):
+            existing = None
+            existing_width = None
             try:
                 existing, existing_width = _read_checkpoint(
                     path_str, algorithm=None, hidden_dim=width, map_location="cpu"
                 )
+            except _oom_types:
+                raise
+            except Exception as first_exc:
+                if not _is_corruption_load_error(first_exc):
+                    raise
+                # 首次读取疑似格式损坏时，重新完整打开并校验字节数后复核，避免短读/瞬时 I/O 误覆盖高分原件
+                raw_bytes = _read_file_bytes_exact(path_str)
+                try:
+                    existing, existing_width = _read_checkpoint(
+                        io.BytesIO(raw_bytes), algorithm=None, hidden_dim=width, map_location="cpu"
+                    )
+                except _oom_types:
+                    raise
+                except Exception as second_exc:
+                    if not _is_corruption_load_error(second_exc):
+                        raise
+                    reason = "schema_changed_or_unreadable"
+
+            if existing is not None:
                 weights_ok = _actor_weights_complete(existing.get("actor"), actor)
                 same_schema = (
                     weights_ok
@@ -228,25 +319,6 @@ def save_canonical_best_actor(
                     reason = "improved"
                 else:
                     reason = "schema_changed_or_unreadable"
-            except _oom_types:
-                raise
-            except (ValueError, EOFError, IndexError, pickle.UnpicklingError, zipfile.BadZipFile, KeyError, TypeError):
-                reason = "schema_changed_or_unreadable"
-            except RuntimeError as exc:
-                msg = str(exc).lower()
-                format_markers = (
-                    "pytorchstreamreader",
-                    "failed finding central directory",
-                    "invalid load key",
-                    "unexpected eof",
-                    "zip archive",
-                    "magic number",
-                    "corrupt",
-                    "inline_container",
-                )
-                if any(tok in msg for tok in ("memory", "alloc")) or not any(m in msg for m in format_markers):
-                    raise
-                reason = "schema_changed_or_unreadable"
 
         clean_metrics = {}
         if isinstance(metrics, dict):
