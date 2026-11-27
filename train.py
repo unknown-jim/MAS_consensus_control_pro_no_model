@@ -124,7 +124,9 @@ def train(
 
             # 执行阶段：actor 只使用本地状态；训练阶段：MAPPO 还会用 global_state 估计 value
             if is_mappo:
-                actions, logp, values = agent.act(local_states, global_states, deterministic=False)
+                actions, logp, values, pre_squash_v = agent.act(
+                    local_states, global_states, deterministic=False, return_pre_squash=True
+                )
             else:
                 actions = agent.select_action(local_states, deterministic=False)
 
@@ -142,11 +144,12 @@ def train(
                 time_limit_done[:] = True
 
             if is_mappo:
-                # MAPPO：on-policy rollout（截断步记录重置前 next_global_states 用于精确 bootstrap）
+                # MAPPO：on-policy rollout（显式传入 pre_squash_v 与截断步重置前 next_global_states）
                 agent.store_rollout_step(
                     local_states, global_states, actions, logp, values,
                     rewards, dones, truncated=time_limit_done,
                     next_global_states=next_global_states if time_limit_done.any() else None,
+                    pre_squash_v=pre_squash_v,
                 )
 
                 do_update = agent.buffer.is_full() or (step == MAX_STEPS - 1)

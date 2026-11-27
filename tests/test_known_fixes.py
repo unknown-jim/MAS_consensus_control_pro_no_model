@@ -92,8 +92,9 @@ class TestKnownFixes(unittest.TestCase):
                 global_s = env.get_global_state()
                 self.assertGreater(float(local_s[:, 1:, 9:].abs().sum().item()), 0.0)
 
-                actions, old_logp, values = agent.act(local_s, global_s, deterministic=False)
-                pre_v = agent._last_sampled_pre_squash_v
+                actions, old_logp, values, pre_v = agent.act(
+                    local_s, global_s, deterministic=False, return_pre_squash=True
+                )
                 self.assertIsNotNone(pre_v)
                 if log_std_bias > 0.0:
                     # 确认高方差下确实产生了接近 tanh 饱和区的速度动作
@@ -101,7 +102,9 @@ class TestKnownFixes(unittest.TestCase):
 
                 next_local_s, rewards, dones, _ = env.step(actions)
                 next_global_s = env.get_global_state()
-                agent.store_rollout_step(local_s, global_s, actions, old_logp, values, rewards, dones)
+                agent.store_rollout_step(
+                    local_s, global_s, actions, old_logp, values, rewards, dones, pre_squash_v=pre_v
+                )
 
                 # 先直接核对逐元素 ratio 精度
                 fs_flat = local_s[:, 1:, :].reshape(-1, STATE_DIM)
@@ -133,6 +136,105 @@ class TestKnownFixes(unittest.TestCase):
                 new_logp_flat2.mean().backward()
                 grad_norm = sum(p.grad.norm().item() for p in agent.actor.parameters() if p.grad is not None)
                 self.assertGreater(grad_norm, 0.0)
+
+    def test_mappo_pre_squash_mixed_batch_and_interleaved_equal_actions(self):
+        """验证：(1) 混合批次中缺值步不会破坏有值步的精确 ratio；(2) 同值不同采样的交错调用不会串用 pre_squash_v。"""
+        # --- (1) 混合批次 + 中间穿插确定性 select_action ---
+        set_seed(42)
+        topo = CommunicationTopology(NUM_FOLLOWERS, num_pinned=NUM_PINNED)
+        env = BatchedModelFreeEnv(topo, num_envs=4)
+        agent = CTDEMAPPOAgent(topo)
+        with torch.no_grad():
+            agent.actor.v_log_std.bias.fill_(1.5)
+        agent.actor.train()
+
+        s1 = env.reset()
+        g1 = env.get_global_state()
+        a1, lp1, v1 = agent.act(s1, g1, deterministic=False)
+        # 在 act() 与 store_rollout_step() 之间插入确定性推理，不应破坏 a1 的绑定
+        _ = agent.select_action(s1, deterministic=True)
+        ns1, r1, d1, _ = env.step(a1)
+        ng1 = env.get_global_state()
+        agent.store_rollout_step(s1, g1, a1, lp1, v1, r1, d1)
+
+        # 第二步故意传入 clone()（失去对象身份且不传 pre_squash_v），构造混合 [True, False] 批次
+        a2, lp2, v2 = agent.act(ns1, ng1, deterministic=False)
+        ns2, r2, d2, _ = env.step(a2)
+        ng2 = env.get_global_state()
+        agent.store_rollout_step(ns1, ng1, a2.clone(), lp2, v2, r2, d2)
+
+        self.assertTrue(bool(agent.buffer.has_pre_squash_v[0].all().item()))
+        self.assertFalse(bool(agent.buffer.has_pre_squash_v[1].any().item()))
+
+        # 按记录逐条验证：第一步记录经 evaluate_actions(pre_squash_v, has_pre_squash_v) 必须精确 ratio==1
+        fs_all = torch.stack(agent.buffer.follower_states, dim=0).reshape(-1, STATE_DIM)
+        act_all = torch.stack(agent.buffer.actions, dim=0).reshape(-1, ACTION_DIM)
+        pre_all = torch.stack(agent.buffer.pre_squash_v, dim=0).reshape(-1, 1)
+        has_all = torch.stack(agent.buffer.has_pre_squash_v, dim=0).reshape(-1, 1)
+        old_lp_all = torch.stack(agent.buffer.logp, dim=0).reshape(-1, 1)
+
+        agent._disable_actor_dropout()
+        new_lp_all, _ = agent.actor.evaluate_actions(
+            fs_all, act_all, return_entropy=True, pre_squash_v=pre_all, has_pre_squash_v=has_all
+        )
+        n_step1 = 4 * NUM_FOLLOWERS
+        ratio_step1 = torch.exp(new_lp_all[:n_step1] - old_lp_all[:n_step1])
+        self.assertTrue(torch.allclose(ratio_step1, torch.ones_like(ratio_step1), atol=1e-4))
+        agent.buffer.clear()
+
+        # --- (2) 交错采样产生完全相同动作值但不同原始速度：对象身份绑定绝不串用 ---
+        topo_s = CommunicationTopology(1, num_pinned=1)
+        agent_s = CTDEMAPPOAgent(topo_s)
+        with torch.no_grad():
+            for p in agent_s.actor.parameters():
+                p.zero_()
+            agent_s.actor.v_log_std.bias.fill_(1.5)
+            agent_s.actor.comm_alpha.bias.fill_(2.0)
+            agent_s.actor.comm_beta.bias.fill_(-1.0)
+            # 让 v_mean 对 state 线性敏感，从而不同状态产生不同 pre-squash 速度但 tanh 后均饱和到 +1.0
+            agent_s.actor.local_encoder[0].weight.fill_(1.0)
+            agent_s.actor.fusion[0].weight.fill_(1.0)
+            agent_s.actor.shared[0].weight.fill_(1.0)
+            agent_s.actor.v_mean.weight.fill_(1.0)
+
+        st_a = torch.zeros(1, 2, STATE_DIM, device=DEVICE)
+        st_b = torch.zeros(1, 2, STATE_DIM, device=DEVICE)
+        st_b[:, 1, 0] = 0.5
+        gs_dummy = torch.zeros(1, agent_s.value_net.ctx_dim + 2 * agent_s.value_net.agent_feat_dim, device=DEVICE)
+
+        # 两次高均值采样：动作速度均饱和到 1.0，但 v_pre 不同
+        with torch.no_grad():
+            agent_s.actor.v_mean.bias.fill_(11.5)
+        set_seed(777)
+        act_a, lp_a, val_a = agent_s.act(st_a, gs_dummy, deterministic=False)
+
+        with torch.no_grad():
+            agent_s.actor.v_mean.bias.fill_(18.5)
+        set_seed(777)
+        act_b, lp_b, val_b = agent_s.act(st_b, gs_dummy, deterministic=False)
+
+        # 确认两份动作值完全相等（复现审计反例）
+        self.assertTrue(torch.equal(act_a, act_b))
+
+        # 恢复第一份的参数并存入 act_a（此时 act_b 是最近一次采样），验证未串用 act_b 的 18.5
+        with torch.no_grad():
+            agent_s.actor.v_mean.bias.fill_(11.5)
+        agent_s.store_rollout_step(
+            st_a, gs_dummy, act_a, lp_a, val_a,
+            torch.zeros(1, device=DEVICE), torch.zeros(1, dtype=torch.bool, device=DEVICE),
+        )
+        stored_pre = float(agent_s.buffer.pre_squash_v[0].item())
+        self.assertLess(abs(stored_pre - 11.5), 5.0)
+        self.assertNotAlmostEqual(stored_pre, 18.5, delta=2.0)
+
+        orig_lr = agent_s.actor_optimizer.param_groups[0]["lr"]
+        agent_s.actor_optimizer.param_groups[0]["lr"] = 0.0
+        try:
+            losses_s = agent_s.update(next_global_states=gs_dummy, next_dones=torch.zeros(1, dtype=torch.bool, device=DEVICE))
+        finally:
+            agent_s.actor_optimizer.param_groups[0]["lr"] = orig_lr
+        self.assertLess(abs(losses_s["kl"]), 1e-6)
+        self.assertEqual(losses_s["clipfrac"], 0.0)
 
     def test_mappo_per_agent_logp_and_update(self):
         topo = CommunicationTopology(NUM_FOLLOWERS, num_pinned=NUM_PINNED)

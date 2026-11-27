@@ -383,6 +383,7 @@ class DecentralizedActor(nn.Module):
         action: torch.Tensor,
         return_entropy: bool = False,
         pre_squash_v: torch.Tensor | None = None,
+        has_pre_squash_v: torch.Tensor | None = None,
     ):
         """给定动作计算 log_prob，以及（可选）解析分布熵（用于 PPO/MAPPO）。
 
@@ -395,6 +396,8 @@ class DecentralizedActor(nn.Module):
             pre_squash_v: 可选的采集时原始 pre-squash 速度样本，shape=(B, 1)。
                 提供时直接复用该样本与 `tanh(pre_squash_v)` 计算精确对数概率，避免
                 饱和区 `clamp + atanh` 反演带来的数值失真。
+            has_pre_squash_v: 可选的逐条布尔掩码，shape=(B, 1)。提供时按记录选择：
+                True 的条目使用 `pre_squash_v`，False 的条目回退到从 `action[:, 0:1]` 反演。
 
         Returns:
             - return_entropy=False: log_prob，shape=(B, 1)
@@ -407,8 +410,21 @@ class DecentralizedActor(nn.Module):
         theta_norm = action[:, 1:2].clamp(self._eps, 1.0 - self._eps)
 
         if pre_squash_v is not None:
-            v_pre = pre_squash_v.view(-1, 1).to(device=v_mean.device, dtype=v_mean.dtype)
-            v_tanh = torch.tanh(v_pre)
+            v_pre_stored = pre_squash_v.view(-1, 1).to(device=v_mean.device, dtype=v_mean.dtype)
+            if has_pre_squash_v is None:
+                v_pre = v_pre_stored
+                v_tanh = torch.tanh(v_pre)
+            else:
+                mask = has_pre_squash_v.view(-1, 1).to(device=v_mean.device, dtype=torch.bool)
+                if bool(mask.all().item()):
+                    v_pre = v_pre_stored
+                    v_tanh = torch.tanh(v_pre)
+                else:
+                    v = action[:, 0:1]
+                    v_tanh_inv = (v / self.v_scale).clamp(-1.0 + self._eps, 1.0 - self._eps)
+                    v_pre_inv = _atanh(v_tanh_inv, eps=self._eps)
+                    v_pre = torch.where(mask, v_pre_stored, v_pre_inv)
+                    v_tanh = torch.where(mask, torch.tanh(v_pre_stored), v_tanh_inv)
         else:
             # 兼容未提供 pre_squash_v 的调用方：从 post-squash 动作反演
             v = action[:, 0:1]

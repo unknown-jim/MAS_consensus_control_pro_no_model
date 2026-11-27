@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import weakref
 
 import numpy as np
 import torch
@@ -502,6 +503,7 @@ class _PPOBuffer:
         self.global_states = []
         self.actions = []
         self.pre_squash_v = []
+        self.has_pre_squash_v = []
         self.logp = []
         self.values = []
         self.rewards = []
@@ -527,7 +529,12 @@ class _PPOBuffer:
         self.follower_states.append(follower_states)
         self.global_states.append(global_states)
         self.actions.append(actions)
-        self.pre_squash_v.append(pre_squash_v)
+        if pre_squash_v is None:
+            self.pre_squash_v.append(torch.zeros_like(logp, dtype=torch.float32))
+            self.has_pre_squash_v.append(torch.zeros_like(logp, dtype=torch.bool))
+        else:
+            self.pre_squash_v.append(pre_squash_v.reshape_as(logp).float())
+            self.has_pre_squash_v.append(torch.ones_like(logp, dtype=torch.bool))
         self.logp.append(logp)
         self.values.append(values)
         self.rewards.append(rewards)
@@ -579,9 +586,9 @@ class CTDEMAPPOAgent:
 
         self.buffer = _PPOBuffer(rollout_steps=PPO_ROLLOUT_STEPS)
         self.last_losses = {}
-        # 缓存最近一次 act() 采样的原始 pre-squash 速度样本与对应动作，供紧随其后的 store_rollout_step 精确复用
-        self._last_sampled_actions: torch.Tensor | None = None
-        self._last_sampled_pre_squash_v: torch.Tensor | None = None
+        # 按返回动作 Tensor 的对象身份 (id + weakref) 精确绑定随机采样时的原始 pre-squash 速度，
+        # 避免按值匹配串用不同采样，并由 weakref.finalize 自动清理防止内存泄漏。
+        self._sampled_pre_squash_by_id: dict[int, tuple[weakref.ref, torch.Tensor]] = {}
 
         print("📊 CTDE MAPPO Agent initialized:")
         print(f"   Actor input: Local state ({STATE_DIM})")
@@ -608,18 +615,25 @@ class CTDEMAPPOAgent:
         return actions
 
     @torch.inference_mode()
-    def act(self, local_states: torch.Tensor, global_states: torch.Tensor | None = None, deterministic: bool = False):
-        """采样动作并（可选）返回 value 估计。
+    def act(
+        self,
+        local_states: torch.Tensor,
+        global_states: torch.Tensor | None = None,
+        deterministic: bool = False,
+        return_pre_squash: bool = False,
+    ):
+        """采样动作并（可选）返回 value 估计及原始 pre-squash 速度样本。
 
         Args:
             local_states: shape=(E, num_agents, STATE_DIM)。
             global_states: shape=(E, GLOBAL_STATE_DIM)；若为 None 则不计算 value。
             deterministic: 是否使用确定性动作。
+            return_pre_squash: 若为 True，额外返回第 4 个元素 `pre_squash_v`（shape=(E, F, 1)），
+                便于调用方显式传给 `store_rollout_step(..., pre_squash_v=...)`。
 
         Returns:
-            actions: shape=(E, num_followers, ACTION_DIM)
-            logp: per-agent 对数概率，shape=(E, num_followers, 1)
-            values: shape=(E, 1)；当 global_states 为 None 时填充 NaN。
+            - return_pre_squash=False: (actions, logp, values)
+            - return_pre_squash=True:  (actions, logp, values, pre_squash_v)
         """
         assert local_states.dim() == 3, "MAPPO 训练需要 batched local_states"
         E = int(local_states.shape[0])
@@ -630,9 +644,13 @@ class CTDEMAPPOAgent:
             follower_states, deterministic=deterministic, return_pre_squash=True
         )
         actions = act_flat.view(E, self.num_followers, ACTION_DIM).float()
-        v_pre = v_pre_flat.view(E, self.num_followers, 1).float()
-        self._last_sampled_actions = actions.detach().clone()
-        self._last_sampled_pre_squash_v = v_pre.detach().clone()
+        v_pre = v_pre_flat.view(E, self.num_followers, 1).float().detach().clone()
+
+        if not deterministic:
+            # 仅为随机训练采样按对象身份绑定 pre_squash_v，确定性推理不污染映射表
+            act_id = id(actions)
+            self._sampled_pre_squash_by_id[act_id] = (weakref.ref(actions), v_pre)
+            weakref.finalize(actions, self._sampled_pre_squash_by_id.pop, act_id, None)
 
         if logp_flat is None:
             logp = torch.zeros((E, self.num_followers, 1), device=DEVICE)
@@ -644,6 +662,8 @@ class CTDEMAPPOAgent:
         else:
             values = self.value_net(global_states).float()
 
+        if return_pre_squash:
+            return actions, logp, values, v_pre
         return actions, logp, values
 
     def store_rollout_step(
@@ -668,18 +688,16 @@ class CTDEMAPPOAgent:
 
         if pre_squash_v is not None:
             pre_squash_v_f = pre_squash_v.detach().float()
-        elif (
-            self._last_sampled_pre_squash_v is not None
-            and self._last_sampled_actions is not None
-            and self._last_sampled_actions.shape == actions_f.shape
-            and torch.equal(self._last_sampled_actions, actions_f)
-        ):
-            pre_squash_v_f = self._last_sampled_pre_squash_v
+            # 同步清理该对象身份上的隐式绑定（若存在）
+            entry = self._sampled_pre_squash_by_id.get(id(actions))
+            if entry is not None and entry[0]() is actions:
+                self._sampled_pre_squash_by_id.pop(id(actions), None)
         else:
             pre_squash_v_f = None
-        # 消费缓存，防止跨步误用
-        self._last_sampled_actions = None
-        self._last_sampled_pre_squash_v = None
+            entry = self._sampled_pre_squash_by_id.get(id(actions))
+            if entry is not None and entry[0]() is actions:
+                pre_squash_v_f = entry[1]
+                self._sampled_pre_squash_by_id.pop(id(actions), None)
 
         trunc_nv = torch.zeros_like(rewards_f)
         has_trunc_nv = torch.zeros_like(dones_b, dtype=torch.bool)
@@ -810,12 +828,9 @@ class CTDEMAPPOAgent:
         follower_states_env = follower_states.reshape(N, self.num_followers, STATE_DIM)
         global_states_env = global_states.reshape(N, -1)
         actions_env = actions.reshape(N, self.num_followers, ACTION_DIM)
-        has_all_pre_squash = all(p is not None for p in self.buffer.pre_squash_v)
-        pre_squash_v_env = (
-            torch.stack(self.buffer.pre_squash_v, dim=0).reshape(N, self.num_followers, 1)
-            if has_all_pre_squash
-            else None
-        )
+        pre_squash_v_env = torch.stack(self.buffer.pre_squash_v, dim=0).reshape(N, self.num_followers, 1)
+        has_pre_squash_v_env = torch.stack(self.buffer.has_pre_squash_v, dim=0).reshape(N, self.num_followers, 1)
+        any_pre_squash = bool(has_pre_squash_v_env.any().item())
         old_logp_env = old_logp.reshape(N, self.num_followers, 1)
         adv_env = adv.reshape(N, 1)
         ret_env = ret.reshape(N, 1)
@@ -838,7 +853,8 @@ class CTDEMAPPOAgent:
                 mb_gs = global_states_env[idx]
                 mb_fs = follower_states_env[idx]
                 mb_act = actions_env[idx]
-                mb_pre_v = pre_squash_v_env[idx] if pre_squash_v_env is not None else None
+                mb_pre_v = pre_squash_v_env[idx] if any_pre_squash else None
+                mb_has_pre_v = has_pre_squash_v_env[idx] if any_pre_squash else None
                 mb_old_logp = old_logp_env[idx]  # (mb, F, 1)
                 mb_adv = adv_env[idx]  # (mb, 1)
                 mb_ret = ret_env[idx]  # (mb, 1)
@@ -846,10 +862,15 @@ class CTDEMAPPOAgent:
                 fs_flat = mb_fs.reshape(-1, STATE_DIM)
                 act_flat = mb_act.reshape(-1, ACTION_DIM)
                 pre_v_flat = mb_pre_v.reshape(-1, 1) if mb_pre_v is not None else None
+                has_pre_v_flat = mb_has_pre_v.reshape(-1, 1) if mb_has_pre_v is not None else None
 
-                # 标准 MAPPO：逐智能体 (per-agent) 计算重要度比率与解析分布熵，避免联合乘积随 N 爆炸
+                # 标准 MAPPO：逐智能体 (per-agent) 计算重要度比率与解析分布熵，按记录选择原始 pre-squash 速度
                 new_logp_flat, entropy_flat = self.actor.evaluate_actions(
-                    fs_flat, act_flat, return_entropy=True, pre_squash_v=pre_v_flat
+                    fs_flat,
+                    act_flat,
+                    return_entropy=True,
+                    pre_squash_v=pre_v_flat,
+                    has_pre_squash_v=has_pre_v_flat,
                 )
                 new_logp = new_logp_flat.view(-1, self.num_followers, 1)
                 entropy = entropy_flat.view(-1, self.num_followers, 1)
