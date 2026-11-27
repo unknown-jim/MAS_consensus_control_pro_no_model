@@ -501,40 +501,100 @@ class TestPhase2Collection(unittest.TestCase):
                     self.assertIs(s["exp_avg"], prev)
             moments = [s["exp_avg"] for s in states]
 
-    def test_collection_rejects_stale_frame_or_graph_before_writing(self):
-        for mutation in ("step", "partial_reset", "reset", "randomize", "precompute"):
-            with self.subTest(mutation=mutation):
-                graph = CommunicationTopology(10, num_pinned=2)
-                env = BatchedModelFreeEnv(graph, 2)
-                agent = agents.CTDEMAPPOAgent(graph)
-                session = agent.start_episode(env)
+    def test_public_adjacency_is_a_snapshot_before_bind_and_in_value_hook(self):
+        graph = CommunicationTopology(10, num_pinned=2)
+        env = BatchedModelFreeEnv(graph, 1, max_steps=1)
+        original = graph.adj_matrix.clone()
+        receiver, sender = next((r, j) for r in range(1, 11) for j in range(1, 11)
+                                if r != j and not original[r, j])
+        revision = graph.revision
+
+        def edit_snapshots(*_):
+            for adj in (graph.adj_matrix, graph.adj):
+                adj[receiver, sender] = 1
+            self.assertTrue(torch.equal(graph.adj_matrix, original))
+            self.assertNotIn(sender, env._neighbor_indices_list[receiver].tolist())
+            self.assertEqual(graph.revision, revision)
+
+        edit_snapshots()
+        agent = agents.CTDEMAPPOAgent(graph)
+        session = agent.start_episode(env)
+        with agent.value_net.register_forward_pre_hook(edit_snapshots):
+            session.step_collect()
+            session.flush_update(is_episode_end=True)
+        session.close()
+
+    def test_changed_graph_before_bind_rejects_stale_cache_and_releases_lease(self):
+        graph = CommunicationTopology(5)
+        env = BatchedModelFreeEnv(graph, 1, max_steps=1)
+        agent = agents.CTDEMAPPOAgent(graph)
+        revision = graph.revision
+        graph.randomize()
+        self.assertEqual(graph.revision, revision + 1)
+        with self.assertRaisesRegex(ValueError, "up-to-date graph"):
+            agent.start_episode(env)
+        env.reset()
+        session = agent.start_episode(env)
+        session.step_collect()
+        session.flush_update(is_episode_end=True)
+        session.close()
+
+    def test_episode_lease_rejects_external_writes_and_allows_final_flush(self):
+        graph = CommunicationTopology(10, num_pinned=2)
+        env = BatchedModelFreeEnv(graph, 2, max_steps=2)
+        agent = agents.CTDEMAPPOAgent(graph)
+        session = agent.start_episode(env)
+        session.step_collect()
+        s, g = env._get_state_optimized(), env.get_global_state()
+        a, lp, v = agent.act(s, g)
+        z = torch.zeros(2, device=DEVICE)
+        with self.assertRaises(RuntimeError):
+            agent.update(next_global_states=g)
+        with self.assertRaises(RuntimeError):
+            agent.store_rollout_step(s, g, a, lp, v, z, z.bool())
+
+        def reject_writes(*_):
+            before = (env.frame_rev, env.episode_gen, env.graph_rev, graph.revision)
+            state = env.get_global_state()
+            adj = graph.adj_matrix.clone()
+            rng = graph.rng.bit_generator.state
+            for write in (env.reset, lambda: env.reset([1]), lambda: env.step(a),
+                          lambda: env.step(a, _session=session), graph.randomize,
+                          lambda: env.install_scenario(chain_scenario(10)),
+                          lambda: env._precompute_neighbor_indices(verbose=False)):
+                with self.assertRaises(RuntimeError):
+                    write()
+                self.assertEqual((env.frame_rev, env.episode_gen, env.graph_rev, graph.revision), before)
+                self.assertIs(env.topology, graph)
+                self.assertTrue(torch.equal(env.get_global_state(), state))
+                self.assertTrue(torch.equal(graph.adj_matrix, adj))
+                self.assertEqual(graph.rng.bit_generator.state, rng)
+
+        reject_writes()
+        self.assertEqual(len(session.buffer), 1)
+        with agent.value_net.register_forward_pre_hook(reject_writes):
+            session.step_collect()
+            session.flush_update(is_episode_end=True)
+        reject_writes()
+        session.close()
+        env.reset()
+        self.assertGreater(graph.revision, 1)
+
+    def test_session_reentrant_collect_in_value_hook_is_rejected(self):
+        graph = CommunicationTopology(5)
+        env = BatchedModelFreeEnv(graph, 1, max_steps=1)
+        agent = agents.CTDEMAPPOAgent(graph)
+        session = agent.start_episode(env)
+
+        def nested_collect(*_):
+            with self.assertRaises(RuntimeError):
                 session.step_collect()
-                with self.assertRaises((RuntimeError, ValueError)):
-                    agent.update(next_global_states=env.get_global_state())
-                s, g = env._get_state_optimized(), env.get_global_state()
-                a, lp, v = agent.act(s, g)
-                z = torch.zeros(2, device=DEVICE)
-                with self.assertRaises((RuntimeError, ValueError)):
-                    agent.store_rollout_step(s, g, a, lp, v, z, z.bool())
-                if mutation == "step":
-                    env.step(a)
-                elif mutation == "partial_reset":
-                    env.reset([1])
-                elif mutation == "reset":
-                    env.reset()
-                elif mutation == "randomize":
-                    graph.randomize()
-                else:
-                    env._precompute_neighbor_indices(verbose=False)
-                with patch.object(agent.actor_optimizer, "step") as actor_step, patch.object(
-                    agent.value_optimizer, "step"
-                ) as value_step:
-                    for attempt in (session.step_collect, session.flush_update):
-                        with self.assertRaises((RuntimeError, ValueError)):
-                            attempt()
-                        self.assertEqual(len(session.buffer), 1)
-                    actor_step.assert_not_called()
-                    value_step.assert_not_called()
+
+        with agent.value_net.register_forward_pre_hook(nested_collect):
+            session.step_collect()
+        self.assertEqual(len(session.buffer), 1)
+        session.flush_update(is_episode_end=True)
+        session.close()
 
     def test_sac_rejects_multiscale_before_allocating_replay(self):
         with self.assertRaisesRegex(ValueError, "(?i)scale|fixed|规模"):
@@ -672,3 +732,71 @@ class TestTrainingAndTrajectory(unittest.TestCase):
             loaded = agents.ActorOnlyPolicy.from_checkpoint(str(final))
             for key, value in agent.actor.state_dict().items():
                 torch.testing.assert_close(value, loaded.actor.state_dict()[key], rtol=0, atol=0)
+
+
+class TestAuditMicrobatchAndProfiler(unittest.TestCase):
+    def test_early_stop_at_float32_boundary_matches_full_batch(self):
+        self.addCleanup(torch.set_num_threads, torch.get_num_threads())
+        torch.set_num_threads(1)
+        n, records = 100, 64
+        graph = CommunicationTopology(n, seed=2)
+        with patch.object(agents, "DEVICE", torch.device("cpu")), patch.object(agents, "HIDDEN_DIM", 16), \
+             patch.object(agents, "PPO_TARGET_KL", .015), patch.object(agents, "PPO_EPOCHS", 2), \
+             patch.object(torch, "randperm", side_effect=lambda size, **kw: torch.arange(size, **kw)):
+            full = CTDEMAPPOAgent(graph, actor_microbatch_max_rows=None)
+            split = CTDEMAPPOAgent(graph, actor_microbatch_max_rows=4096)
+            local = torch.zeros(records, n + 1, STATE_DIM)
+            glob = torch.zeros(records, full.expected_global_state_dim)
+            actions = torch.zeros(records, n, 2)
+            actions[..., 1] = .06
+            with torch.no_grad():
+                for parameter in full.actor.parameters():
+                    parameter.zero_()
+                split.actor.load_state_dict(full.actor.state_dict())
+                split.value_net.load_state_dict(full.value_net.state_dict())
+                logp = full.actor.evaluate_actions(local[:, 1:].reshape(-1, STATE_DIM),
+                                                   actions.reshape(-1, 2)).reshape(records, n, 1)
+                old_logp = logp - torch.rand(records, n, 1, generator=torch.Generator().manual_seed(2)) * 0.3551493853330613
+                log_ratio = logp - old_logp
+                expected_kl = (log_ratio.exp() - 1 - log_ratio).mean().item()
+            self.assertGreater(expected_kl, .0225)
+            for learner in (full, split):
+                with self.subTest(cap=learner.actor_microbatch_max_rows):
+                    learner.store_rollout_step(local, glob, actions, old_logp, torch.zeros(records, 1),
+                                               torch.arange(records), torch.ones(records, dtype=torch.bool))
+                    report = learner.update()
+                    adam_steps = [opt.state[param]["step"].item() for opt, param in
+                                  ((learner.actor_optimizer, learner.actor.v_mean.bias),
+                                   (learner.value_optimizer, learner.value_net.v_net[-1].bias))]
+                    self.assertEqual((report["kl"], report["early_stopped"], adam_steps),
+                                     (expected_kl, True, [1, 1]))
+
+    def test_cap_must_fit_one_record_at_construction_and_scale_switch(self):
+        graph = CommunicationTopology(5)
+        with self.assertRaisesRegex(ValueError, "num_followers"):
+            CTDEMAPPOAgent(graph, actor_microbatch_max_rows=2)
+        learner = CTDEMAPPOAgent(CommunicationTopology(2), actor_microbatch_max_rows=2)
+        with self.assertRaisesRegex(ValueError, "num_followers"):
+            learner.start_episode(BatchedModelFreeEnv(graph, 1))
+
+    def test_scale_switch_leak_fails_cli_and_preserves_measurements(self):
+        import json
+        import profile_bottleneck as profiler
+
+        self.addCleanup(torch.set_num_threads, torch.get_num_threads())
+        scale_switch = profiler.scale_switch
+
+        def measured_switch(args, agent, cuda, report):
+            with patch.object(profiler, "episode"), patch.object(torch.cuda, "memory_allocated", side_effect=[100, 110]):
+                scale_switch(args, agent, True, report)
+
+        with TemporaryDirectory() as tmp, patch.object(profiler, "scale_switch", measured_switch):
+            path = Path(tmp) / "report.json"
+            rc = profiler.main(["--algo", "mappo", "--num-envs", "1", "--steps", "1",
+                                "--warmup-episodes", "0", "--measure-episodes", "1",
+                                "--scale-switch-cycles", "2", "--output", str(path)])
+            report = json.loads(path.read_text())
+        switch = report["scale_switch"]
+        self.assertEqual([c["live_allocated_mb"] * 1024**2 for c in switch["cycles"]], [100, 110])
+        self.assertFalse(switch["growth_within_5pct"])
+        self.assertEqual((report["status"], rc), ("failed", 1))

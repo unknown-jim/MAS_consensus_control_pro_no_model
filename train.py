@@ -225,7 +225,7 @@ def train(
         if dashboard:
             dashboard.update_episode(
                 episode, avg_reward, avg_tracking_err, avg_comm,
-                agent.last_losses, trajectory_data
+                agent.last_losses, trajectory_data, current_num_followers=n
             )
         elif episode % log_interval == 0:
             elapsed = time.time() - start_time

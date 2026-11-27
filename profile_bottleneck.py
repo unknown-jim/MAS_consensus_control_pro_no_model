@@ -253,7 +253,7 @@ def scale_switch(args, agent, cuda, report):
         record["live_allocated_mb"] = live / 1024**2 if cuda else None
         if cuda:
             base = cycles[0]["live_allocated_mb"]
-            record["growth_ratio"] = record["live_allocated_mb"]/base - 1
+            record["growth_ratio"] = (record["live_allocated_mb"] - base) / base
     result["cache_ok"] = result["env_build_count"] == 3 and all(c["cache_size"] == 3 for c in cycles)
     if cuda:
         result["live_allocated_growth_ratio"] = max(c["growth_ratio"] for c in cycles)
@@ -301,11 +301,14 @@ def profile_mappo(args, report):
     expected = sum(sum(e["update_minibatches"]) for e in report["episodes"])
     if steps["actor"] != expected or steps["value"] != expected:
         raise RuntimeError("Observed Adam step counts disagree with flushed minibatches")
+    report["status"] = "ok"
     if args.scale_switch_cycles:
         del env
         scale_switch(args, agent, cuda, report)
+        switch = report["scale_switch"]
+        if not switch["cache_ok"] or switch.get("growth_within_5pct") is False:
+            report["status"] = "failed"
     report.pop("active_load")
-    report["status"] = "ok"
 
 
 def main(argv=None):

@@ -12,7 +12,7 @@
 from __future__ import annotations
 
 import argparse
-from collections import defaultdict
+from collections import defaultdict, deque
 from contextlib import ExitStack, redirect_stdout
 import hashlib
 import itertools
@@ -51,6 +51,34 @@ def write_json(path, obj):
         print(data)
 
 
+def validate_frozen_graph(s):
+    """按 adj[receiver, sender] 从 leader 重算可达性及评测所用的分层。"""
+    matrix = np.asarray(s["adj_matrix"])
+    n = s["N"] + 1
+    if (s["leader_id"] != 0 or matrix.shape != (n, n) or not np.isin(matrix, (0, 1)).all()
+            or matrix.diagonal().any()):
+        raise ValueError("Invalid frozen adjacency matrix or leader")
+    pins = np.flatnonzero(matrix[:, 0]).tolist()
+    declared = np.asarray(s["pinned_ids"])
+    if (not pins or declared.ndim != 1 or declared.dtype.kind not in "iu"
+            or pins != sorted(declared.tolist())):
+        raise ValueError("Frozen pinned IDs must match leader column 0")
+    depths = np.full(n, -1, dtype=int)
+    depths[0] = 0
+    queue = deque([0])
+    while queue:
+        sender = queue.popleft()
+        receivers = np.flatnonzero((matrix[:, sender] != 0) & (depths < 0))
+        depths[receivers] = depths[sender] + 1
+        queue.extend(receivers)
+    if (depths < 0).any():
+        raise ValueError("Every frozen node must be reachable from leader 0")
+    stats = s.get("bfs_stats", {})
+    if not np.array_equal(stats.get("node_depths"), depths) or stats.get("max_depth") != depths.max():
+        raise ValueError("Frozen BFS statistics disagree with directed distances from leader 0")
+    return matrix, pins
+
+
 def read_manifest(path):
     m = json.loads(Path(path).read_text())
     if m["schema_version"] != 1 or m["steps"] < 1 or not m["scenarios"]:
@@ -61,6 +89,8 @@ def read_manifest(path):
     ids = [s["scenario_id"] for s in m["scenarios"]]
     if len(set(ids)) != len(ids):
         raise ValueError("Duplicate scenario_id")
+    for s in m["scenarios"]:
+        validate_frozen_graph(s)
     return m
 
 
@@ -128,14 +158,9 @@ class FrozenGraph:
 
     def __init__(self, s, device):
         import torch
-        matrix = np.asarray(s["adj_matrix"])
+        matrix, pins = validate_frozen_graph(s)
         self.num_followers = s["N"]
         self.num_agents = self.num_followers + 1
-        pins = np.flatnonzero(matrix[:, 0]).tolist()
-        if (s["leader_id"] != 0 or matrix.shape != (self.num_agents, self.num_agents)
-                or not np.isin(matrix, (0, 1)).all() or matrix.diagonal().any()
-                or not pins or pins != sorted(s["pinned_ids"])):
-            raise ValueError("Invalid frozen graph or pinned IDs")
         self._pins = tuple(pins)
         self._matrix = torch.tensor(matrix, dtype=torch.float32, device=device)
 
@@ -384,8 +409,11 @@ def run_worker(args, stream):
     load_error = None
     checkpoint_sha = None
     try:
+        h = hashlib.sha256()
         with checkpoint.open("rb") as f:
-            checkpoint_sha = hashlib.file_digest(f, "sha256").hexdigest()
+            for block in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(block)
+        checkpoint_sha = h.hexdigest()
         if device_unavailable:
             raise ValueError(f"Requested device {args.device} unavailable")
         policy = ActorOnlyPolicy.from_checkpoint(str(checkpoint))
@@ -555,6 +583,24 @@ def read_results(paths, version):
     return runs
 
 
+def complete_benchmark_run(meta, rows, required_cells):
+    per_cell = defaultdict(list)
+    for row in rows.values():
+        steps = row.get("steps", meta.get("steps"))
+        if not isinstance(steps, int) or steps < 300:
+            return False
+        per_cell[tuple(row[k] for k in CELL)].append(row)
+    if per_cell.keys() != required_cells:
+        return False
+    required_seeds = set(range(1000, 1020))
+    for cell in per_cell.values():
+        seeds = {row["seed"] for row in cell}
+        hashes = {row["scenario_sha256"] for row in cell}
+        if not required_seeds <= seeds or len(seeds) != len(cell) or len(hashes) != len(cell):
+            return False
+    return True
+
+
 def compare(args):
     paths = [list(args.v1_results or []), list(args.v2_results or [])]
     if args.compare:
@@ -567,7 +613,7 @@ def compare(args):
         raise ValueError("v1 and v2 must cover the same training seeds")
     seeds = sorted(left)
     hashes = {meta["manifest_sha256"] for runs in (left, right) for meta, _ in runs.values()}
-    if len(hashes) != 1:
+    if len(hashes) != 1 or not all(hashes):
         raise ValueError("Cannot pair different scenario manifests")
     catalog = {}
     identity_fields = (*STRATA, "scenario_sha256", "seed", "pinned_ratio_coincident")
@@ -577,7 +623,7 @@ def compare(args):
             complete &= len(rows) == meta.get("manifest_scenario_count", len(rows))
             for sid, row in rows.items():
                 sample = catalog.setdefault(sid, row)
-                if any(sample[k] != row[k] for k in identity_fields):
+                if not sid or not row["scenario_sha256"] or any(sample[k] != row[k] for k in identity_fields):
                     raise ValueError(f"Scenario identity mismatch for {sid}")
     grouped = defaultdict(list)
     pairs = []
@@ -635,13 +681,21 @@ def compare(args):
                                 and all(c["n_ok"] == c["n_total"] for c in hard_cells)))
     required = set(itertools.product((5, 10, 20, 50, 100), ("normal", "low"), ("shallow", "deep")))
     missing = sorted(required - grouped.keys())
+    matrix_complete = complete and all(
+        rows.keys() == catalog.keys() and complete_benchmark_run(meta, rows, required)
+        for runs in (left, right) for meta, rows in runs.values())
     stable = complete and not missing and all(c["all_finite"] and c["stability_rate"] >= .95 for c in cells)
     small = len(small_cells) == 3 and all(c["small_passed"] for c in small_cells)
     failures = [p for p in pairs if not p["paired_ok"]]
     report = dict(manifest_sha256=hashes.pop(), training_seeds=seeds, bootstrap_seed=42, bootstrap_samples=len(seed_draws),
                   inputs=[dict(v1=left[s][0], v2=right[s][0]) for s in seeds], hard=hard, cells=cells,
                   acceptance=dict(hard=hard["passed"], small=small, stability=stable,
-                                  complete_manifests=complete, missing_cells=missing, passed=bool(hard["passed"] and small and stable)),
+                                  complete_manifests=complete, missing_cells=missing,
+                                  complete_benchmark_matrix=matrix_complete,
+                                  matrix_note=("满足正式验收矩阵。" if matrix_complete else
+                                               "探索性子集，不满足正式 20×20×300 步验收矩阵。每格须覆盖独立场景 "
+                                               "seed 1000–1019，两侧每场至少运行 300 步。"),
+                                  passed=bool(matrix_complete and not failures and hard["passed"] and small and stable)),
                   failures=failures, pairs=pairs)
     write_json(args.output, report)
     if args.markdown_out:
@@ -658,6 +712,7 @@ def markdown(report):
     h = report["hard"]
     gates = report["acceptance"]
     lines = ["# 跨版本配对评测", "", f"综合验收 {'通过' if report['acceptance']['passed'] else '未通过'}",
+             "", gates["matrix_note"],
              "", "、".join(label + ("通过" if gates[key] else "未通过") for key, label in
                           (("hard", "困难格"), ("small", "小规模常规格"), ("stability", "稳定性"))),
              "", f"困难格等权误差降幅 {fmt(h['error_reduction'])}，误差差值 95% CI {ci(h['error_delta_ci95'])}，"
@@ -734,6 +789,7 @@ def main(argv=None):
         if args.evaluate:
             if not args.output or not args.checkpoint:
                 ap.error("--evaluate requires --output and --checkpoint")
+            read_manifest(args.scenario_manifest)
             return subprocess.run(worker_command(args, args.worker_version, args.repo_path, "evaluate")).returncode
         if not args.v1_repo:
             ap.error("--parity-check requires --v1-repo")

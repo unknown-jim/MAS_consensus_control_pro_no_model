@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import weakref
+from contextlib import ExitStack
 from threading import Lock
 
 import numpy as np
@@ -725,9 +726,8 @@ class CTDEMAPPOAgent:
 
     def __init__(self, topology, use_amp: bool = False, *,
                  actor_microbatch_max_rows: int | None = ACTOR_MICROBATCH_MAX_FOLLOWER_ROWS):
-        if actor_microbatch_max_rows is not None and actor_microbatch_max_rows < 1:
-            raise ValueError("actor_microbatch_max_rows must be positive or None")
         self.actor_microbatch_max_rows = actor_microbatch_max_rows
+        self._validate_microbatch_cap(topology.num_followers)
         self._session = None
         self._session_lock = Lock()
         self.topology = topology
@@ -765,7 +765,13 @@ class CTDEMAPPOAgent:
         return self._fixed_buffer if self._session is None else self._session.buffer
 
     def start_episode(self, env):
+        self._validate_microbatch_cap(env.num_followers)
         return MultiScaleEpisodeSession(self, env)
+
+    def _validate_microbatch_cap(self, num_followers):
+        if self.actor_microbatch_max_rows is not None and self.actor_microbatch_max_rows < num_followers:
+            raise ValueError(f"One environment record contains num_followers={num_followers} rows; "
+                             f"actor_microbatch_max_rows={self.actor_microbatch_max_rows} must fit one record")
 
     def _disable_actor_dropout(self) -> None:
         """在 MAPPO 采样与更新阶段一致关闭 Actor 内部 Dropout。
@@ -1127,9 +1133,9 @@ class CTDEMAPPOAgent:
                 mb_gs = global_states_env[idx]
                 mb_ret = ret_env[idx]
                 chunk_size = (len(idx) if self.actor_microbatch_max_rows is None else
-                              max(1, self.actor_microbatch_max_rows // buffer.num_followers))
+                              self.actor_microbatch_max_rows // buffer.num_followers)
                 self.actor_optimizer.zero_grad(set_to_none=True)
-                stats = torch.zeros(4, device=DEVICE)
+                policy_rows, entropy_rows, kl_rows, clipped_rows = [], [], [], []
                 for chunk in idx.split(chunk_size):
                     pre_v = pre_squash_v_env[chunk].reshape(-1, 1) if any_pre_squash else None
                     has_pre_v = has_pre_squash_v_env[chunk].reshape(-1, 1) if any_pre_squash else None
@@ -1141,17 +1147,17 @@ class CTDEMAPPOAgent:
                     log_ratio = new_logp.reshape(-1, buffer.num_followers, 1) - old_logp_env[chunk]
                     ratio = log_ratio.exp()
                     advantage = adv_env[chunk].unsqueeze(1)
-                    policy_loss = -torch.minimum(
+                    policy = -torch.minimum(
                         ratio * advantage, ratio.clamp(1.0 - clip_eps, 1.0 + clip_eps) * advantage
-                    ).mean()
-                    entropy_mean = entropy.mean()
+                    )
                     # 完整环境记录含相同数量的 follower；尾块按实际行数计权。
                     weight = len(chunk) / len(idx)
-                    ((policy_loss - float(PPO_ENTROPY_COEF) * entropy_mean) * weight).backward()
+                    ((policy.mean() - float(PPO_ENTROPY_COEF) * entropy.mean()) * weight).backward()
                     with torch.no_grad():
-                        kl = ((ratio - 1.0) - log_ratio).mean()
-                        clipfrac = ((ratio - 1.0).abs() > clip_eps).float().mean()
-                        stats += weight * torch.stack((policy_loss, entropy_mean, kl, clipfrac))
+                        policy_rows.append(policy.detach())
+                        entropy_rows.append(entropy.detach())
+                        kl_rows.append((ratio - 1.0) - log_ratio)
+                        clipped_rows.append(((ratio - 1.0).abs() > clip_eps).float())
                 torch.nn.utils.clip_grad_norm_(self.actor.parameters(), float(PPO_MAX_GRAD_NORM))
                 self.actor_optimizer.step()
 
@@ -1163,7 +1169,9 @@ class CTDEMAPPOAgent:
                 torch.nn.utils.clip_grad_norm_(self.value_net.parameters(), float(PPO_MAX_GRAD_NORM))
                 self.value_optimizer.step()
 
-                policy_mean, entropy_mean, kl_val, clipfrac_mean = stats.tolist()
+                # 在同一逻辑批内按原行序归约，避免分块舍入改变 KL 早停边界。
+                stats = [torch.cat(parts).mean() for parts in (policy_rows, entropy_rows, kl_rows, clipped_rows)]
+                policy_mean, entropy_mean, kl_val, clipfrac_mean = torch.stack(stats).tolist()
                 pol_losses.append(policy_mean)
                 v_losses.append(float(value_loss.detach().item()))
                 entropies.append(entropy_mean)
@@ -1235,25 +1243,23 @@ class MultiScaleEpisodeSession:
     """在一次完整 reset 与末帧更新之间持有环境、当前帧以及专用 rollout。"""
 
     def __init__(self, agent, env):
-        with _try_lock(agent._session_lock), env._session_operation(self):
+        with _try_lock(agent._session_lock), env._session_operation(self), ExitStack() as lease:
             if agent._session is not None or len(agent._fixed_buffer):
                 raise RuntimeError("Close the active session and flush pending rollout records first")
-            if getattr(env, "_episode_session", None) is not None:
-                raise RuntimeError("Environment already belongs to an active session")
+            lease.enter_context(env.topology._hold_revision())
             self._bind(agent, env)
+            self._graph_lease = lease.pop_all()
             agent._session = env._episode_session = self
 
     def _bind(self, agent, env):
         topology = env.topology
         if (env.frame_rev != env._episode_start_frame or
-                env._precomputed_topology is not topology or env._precomputed_revision != topology.revision):
+                env._precomputed_topology is not topology or env._cached_topology_rev != topology.revision):
             raise ValueError("Start the episode after a full reset with an up-to-date graph")
         self._agent = agent
         self._env = env
         self._topology = topology
         self._topology_revision = topology.revision
-        self._adjacency = None if topology.fixed else topology.adj_matrix
-        self._adjacency_version = None if self._adjacency is None else self._adjacency._version
         self._episode_gen = env.episode_gen
         self._graph_rev = env.graph_rev
         self._frame_rev = env.frame_rev
@@ -1279,15 +1285,13 @@ class MultiScaleEpisodeSession:
         if (env.frame_rev != expected_frame or env.episode_gen != self._episode_gen or
                 env.graph_rev != self._graph_rev or env.topology is not self._topology or
                 env.topology.revision != self._topology_revision or
+                env.topology.revision != env._cached_topology_rev or
                 env.num_envs != self._num_envs or env.num_followers != self._buffer.num_followers or
                 env.state_dim != self._buffer.state_dim or env.global_state_dim != self._buffer.global_state_dim):
             raise RuntimeError("Environment frame, graph or episode changed outside the active session")
-        if self._adjacency is not None and (env.topology.adj_matrix is not self._adjacency or
-                                             self._adjacency._version != self._adjacency_version):
-            raise RuntimeError("Adjacency matrix changed outside the active session")
 
     def step_collect(self):
-        with self._env._session_operation(self):
+        with self._env._session_operation(self) as token:
             self._check_frame(self._frame_rev)
             if self._frame_rev == self._last_frame:
                 raise RuntimeError("Time limit reached; flush the final rollout before closing")
@@ -1297,7 +1301,7 @@ class MultiScaleEpisodeSession:
                 self._local, self._global, self._buffer, False, True, bind_sample=False
             )
             self._check_frame(self._frame_rev)
-            next_local, rewards, dones, infos = self._env.step(actions, _session=self)
+            next_local, rewards, dones, infos = self._env.step(actions, _session=token)
             next_global = self._env.get_global_state()
             self._check_frame(self._frame_rev + 1)
             self._buffer.add(self._local[:, 1:], self._global, actions, logp, values,
@@ -1324,5 +1328,6 @@ class MultiScaleEpisodeSession:
             if not self._ended or len(self._buffer):
                 raise RuntimeError("Flush the final rollout with is_episode_end=True before close()")
             if self._agent._session is self:
+                self._graph_lease.close()
                 self._agent._session = None
                 self._env._episode_session = None

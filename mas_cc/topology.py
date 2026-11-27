@@ -11,7 +11,8 @@ from __future__ import annotations
 import math
 from collections import deque
 from contextlib import contextmanager
-from threading import Lock
+from functools import wraps
+from threading import RLock
 
 import numpy as np
 import torch
@@ -32,6 +33,16 @@ def _try_lock(lock):
         lock.release()
 
 
+def _topology_write(method):
+    @wraps(method)
+    def guarded(self, *args, **kwargs):
+        with _try_lock(self._mutation_lock):
+            if self._readers:
+                raise RuntimeError("An active environment owns this graph revision")
+            return method(self, *args, **kwargs)
+    return guarded
+
+
 class CommunicationTopology:
     """有向广播图。BFS 人口包含第 0 层 leader，平均入度只统计 follower。"""
 
@@ -43,7 +54,8 @@ class CommunicationTopology:
         self.num_followers = int(num_followers)
         self.num_agents = self.num_followers + 1
         self.leader_id = 0
-        self._mutation_lock = Lock()
+        self._mutation_lock = RLock()
+        self._readers = 0
         self.device = device
         if rng is not None and not isinstance(rng, np.random.Generator):
             raise ValueError("rng must be a numpy.random.Generator")
@@ -51,7 +63,7 @@ class CommunicationTopology:
         self.pinned_mode = pinned_mode
         self.depth_mode = depth_mode
         self._explicit_pinned = num_pinned
-        self.revision = 0
+        self._revision = 0
         self.fixed = adj_matrix is not None
         if self.fixed:
             matrix = self._cpu_array(adj_matrix)
@@ -90,7 +102,22 @@ class CommunicationTopology:
 
     @property
     def adj_matrix(self):
-        return self._adj.clone() if self.fixed else self._adj
+        return self._adj.clone()
+
+    @property
+    def revision(self):
+        return self._revision
+
+    @contextmanager
+    def _hold_revision(self):
+        """读者可共享同一版本；构建缓存或使用该版本的会话结束后才允许写图。"""
+        with _try_lock(self._mutation_lock):
+            self._readers += 1
+        try:
+            yield
+        finally:
+            with self._mutation_lock:
+                self._readers -= 1
 
     @property
     def adj(self):
@@ -104,12 +131,9 @@ class CommunicationTopology:
     def pinned_followers(self):
         return self.pinned_ids
 
+    @_topology_write
     def randomize(self, num_pinned=None, *, pinned_mode=None, depth_mode=None):
         """用本图的 Generator 重建。显式构造的 pinned 数量在后续 reset 中保留。"""
-        with _try_lock(self._mutation_lock):
-            return self._randomize(num_pinned, pinned_mode, depth_mode)
-
-    def _randomize(self, num_pinned, pinned_mode, depth_mode):
         if self.fixed:
             raise ValueError("Cannot randomize a frozen topology")
         mode = self.pinned_mode if pinned_mode is None else pinned_mode
@@ -156,6 +180,7 @@ class CommunicationTopology:
         self.depth_mode, self.pinned_mode = depth, mode
         return self.pinned_ids
 
+    @_topology_write
     def _install(self, matrix):
         depths = np.full(self.num_agents, -1, dtype=int)
         depths[0] = 0
@@ -181,7 +206,7 @@ class CommunicationTopology:
         self._adj = torch.tensor(matrix, device=self.device, dtype=torch.float32)
         self.in_degree = self._adj.sum(dim=1)
         self.out_degree = self._adj.sum(dim=0)
-        self.revision += 1
+        self._revision += 1
 
     @property
     def stats(self):

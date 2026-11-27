@@ -95,6 +95,57 @@ class BenchmarkTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "scenario_sha256"):
             read_manifest(self.manifest)
 
+    def test_frozen_graph_integrity_before_workers(self):
+        from unittest.mock import patch
+        import evaluate_scaling as bench
+        from mas_cc.topology import CommunicationTopology
+
+        chain = [[0, 0, 0], [1, 0, 0], [0, 1, 0]]
+        base = dict(N=2, leader_id=0, pinned_ids=[1], adj_matrix=chain,
+                    bfs_stats=dict(node_depths=[0, 1, 2], max_depth=2), scenario_id="chain")
+        self.assertEqual(bench.FrozenGraph(base, "cpu").get_receivers(1), [2])
+        disconnected = dict(base, adj_matrix=chain[:2] + [[0, 0, 0]])
+        with self.assertRaises(ValueError):
+            CommunicationTopology.from_frozen(disconnected["adj_matrix"], [1], device="cpu")
+        for change in [disconnected, dict(base, pinned_ids=[2]), dict(base, pinned_ids=[True]),
+                       dict(base, pinned_ids=[1.0]),
+                       dict(base, adj_matrix=chain[:2] + [[0, 1, 1]]),
+                       dict(base, bfs_stats=dict(node_depths=[0, 2, 1], max_depth=2)),
+                       dict(base, bfs_stats=dict(node_depths=[0, 1, 2], max_depth=1))]:
+            with self.subTest(change=change):
+                row = dict(change, scenario_sha256=digest(change))
+                manifest = dict(schema_version=1, steps=300, scenarios=[row])
+                manifest["manifest_sha256"] = digest(manifest)
+                self.manifest.write_text(json.dumps(manifest))
+                with self.assertRaises(ValueError):
+                    bench.FrozenGraph(change, "cpu")
+                with self.assertRaises(ValueError):
+                    bench.read_manifest(self.manifest)
+                with patch.object(bench, "worker_command") as command:
+                    for v in ("v1", "v2"):
+                        with self.assertRaises(ValueError):
+                            bench.main(["--evaluate", "--worker-version", v, "--scenario-manifest",
+                                        str(self.manifest), "--checkpoint", "unused", "--output", str(self.out)])
+                    command.assert_not_called()
+
+    def test_python310_checkpoint_digest(self):
+        self.generate("--steps", "2", "--depth-modes", "deep", "--pinned-modes", "low")
+        checkpoint = self.dir / "checkpoint.bin"
+        # 即使权重内容无法加载，仍能核对实际 worker 读取的多块 SHA。
+        data = bytes(range(256)) * 10000
+        checkpoint.write_bytes(data)
+        worker = """
+import hashlib, sys
+import evaluate_scaling
+if hasattr(hashlib, 'file_digest'):
+    del hashlib.file_digest
+raise SystemExit(evaluate_scaling.main(sys.argv[1:]))
+"""
+        self.run_cli("-c", worker, "--worker", "evaluate", "--scenario-manifest", self.manifest,
+                     "--checkpoint", checkpoint, "--output", self.out, "--device", "cpu", code=1)
+        result = json.loads(self.out.read_text())
+        self.assertEqual(result["checkpoint_sha256"], hashlib.sha256(data).hexdigest())
+
     def test_metric_denominators_and_raw_age(self):
         from evaluate_scaling import metrics
         # 第 0 帧只用于门禁。两名 follower 的第 1 个动作后误差分别为 0、2。
@@ -238,7 +289,7 @@ torch.save(DecentralizedActor().state_dict(), sys.argv[2])
                 rows = []
                 for n in [5, 10, 20, 50, 100]:
                     hard = n >= 50
-                    for i in range(3 if n == 50 else 1):
+                    for i in range(22 if n == 50 else 20):
                         err = (1 if n == 50 else 3) if hard else .2
                         if version == "v2":
                             err *= (.9 if n == 50 else .8) if hard else 1.075
@@ -253,7 +304,7 @@ torch.save(DecentralizedActor().state_dict(), sys.argv[2])
                                     mean_tracking_error=err, mean_comm_rate=.21))
                 path = self.dir / f"{version}-{train_seed}.json"
                 path.write_text(json.dumps(dict(worker_version=version, training_seed=train_seed,
-                                                manifest_sha256="same", scenarios=rows)))
+                                                manifest_sha256="same", steps=300, scenarios=rows)))
                 paths[version].append(path)
         md = self.dir / "report.md"
         flags = ["evaluate_scaling.py", "--compare", "--v1-results", *paths["v1"],
@@ -265,6 +316,37 @@ torch.save(DecentralizedActor().state_dict(), sys.argv[2])
         self.assertTrue(np.allclose(result["hard"]["error_delta_ci95"], [-.35, -.35]))
         self.run_cli(*flags)
         self.assertEqual(json.loads(self.out.read_text()), result)
+        # 每次只改变覆盖条件。所有配对仍完整，性能门槛保持通过。
+        for case in ("one_per_cell", "short_row", "short_run", "unknown_steps", "wrong_seeds", "duplicate_seed"):
+            with self.subTest(case=case):
+                variant = []
+                for path in (paths["v1"][0], paths["v2"][0]):
+                    doc = json.loads(path.read_text())
+                    rows = doc["scenarios"]
+                    if case == "one_per_cell":
+                        doc["scenarios"] = [r for r in rows if r["seed"] == 1000]
+                    elif case == "short_row" and doc["worker_version"] == "v2":
+                        rows[0]["steps"] = 299
+                    elif case == "short_run":
+                        doc["steps"] = 299
+                    elif case == "unknown_steps":
+                        del doc["steps"]
+                    elif case == "wrong_seeds":
+                        rows[0]["seed"] = 999
+                    elif case == "duplicate_seed":
+                        rows[0]["seed"] = 1001
+                    doc["manifest_scenario_count"] = len(doc["scenarios"])
+                    dst = self.dir / ("variant-" + path.name)
+                    dst.write_text(json.dumps(doc))
+                    variant.append(dst)
+                self.run_cli("evaluate_scaling.py", "--compare", *variant, "--output", self.out, "--markdown-out", md)
+                report = json.loads(self.out.read_text())
+                self.assertFalse(report["acceptance"]["passed"])
+                self.assertFalse(report["acceptance"]["complete_benchmark_matrix"])
+                self.assertIn("探索性", md.read_text())
+                self.assertTrue(report["hard"]["passed"])
+                self.assertEqual(len(report["cells"]), 20)
+        self.assertTrue(result["acceptance"]["complete_benchmark_matrix"])
         doc = json.loads(paths["v2"][0].read_text())
         doc["scenarios"][0].update(status="oom", error="out of memory")
         paths["v2"][0].write_text(json.dumps(doc))

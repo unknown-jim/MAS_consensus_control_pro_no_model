@@ -164,7 +164,7 @@ results/
 #### 拓扑 v2
 
 - 有向广播图：leader 为 index 0，pinned followers 直接收 leader 广播。
-- **控制期望入度**：每个节点按概率 `min(1, 2 / |候选|)` 选邻居，平均入度约为 2。
+- **控制期望入度**：每个 follower 按概率 `min(1, 2 / |候选|)` 选额外邻居，每节点额外入边期望 ≤2。候选充足时，叠加 1 条骨架入边后总期望入度约为 3。
 - **比例 pinned**：`pinned_mode=normal` 取 15%~30%，`pinned_mode=low` 取 2%~6%。
 - **分层深图**：`depth_mode=deep` 用 `height=max(4, ceil(sqrt(N)))` 构造多层链，并以 BFS 验收（`reachable_count == num_agents`、`layer_counts`、`max_depth`）。
 

@@ -179,7 +179,7 @@ class TrainingDashboard:
         """
 
     def _set_title(self, n=None):
-        """标题随当前轨迹的 N 更新；多规模训练切换 N 时不显示过期规模。"""
+        """更新仪表盘显示的当局训练规模。"""
         if n is not None:
             self.current_num_followers = int(n)
         self.title_html.value = self._title_html(self.current_num_followers)
@@ -329,7 +329,8 @@ class TrainingDashboard:
     def update_step(self, step, max_steps):
         self.step_progress.value = (step / max_steps) * 100
 
-    def update_episode(self, episode, reward, tracking_err, comm, losses, trajectory_data=None):
+    def update_episode(self, episode, reward, tracking_err, comm, losses, trajectory_data=None,
+                       *, current_num_followers=None):
         elapsed = self._get_elapsed()
 
         self.reward_history.append(reward)
@@ -341,9 +342,9 @@ class TrainingDashboard:
             if trajectory_data is not None:
                 self.best_trajectory = trajectory_data
 
-        traj_n = self._trajectory_num_followers(trajectory_data)
-        if traj_n is not None:
-            self._set_title(traj_n)
+        if current_num_followers is None:
+            current_num_followers = self._trajectory_num_followers(trajectory_data)
+        self._set_title(current_num_followers)
 
         self.main_progress.value = (episode / self.total_episodes) * 100
         self.step_progress.value = 0
@@ -397,10 +398,9 @@ class TrainingDashboard:
             # 每次重绘都从当前轨迹读取 N / pinned_ids，避免跨规模训练时越界或错色。
             traj = self.best_trajectory
             traj_n = self._trajectory_num_followers(traj)
-            if traj_n is not None:
-                self._set_title(traj_n)
-            n_label = str(self.current_num_followers) if self.current_num_followers else "?"
-            fig.suptitle(f"CTDE Training Dashboard (N={n_label} followers)", fontsize=14, fontweight="bold")
+            n_label = str(traj_n) if traj_n is not None else "?"
+            fig.suptitle(f"CTDE Training Dashboard (N={self.current_num_followers or '?'} followers)",
+                         fontsize=14, fontweight="bold")
             pinned_ids = self._trajectory_pinned_ids(traj)
 
             leader_color = "#e74c3c"
@@ -647,12 +647,9 @@ class TrainingDashboard:
         algo = str(ALGO).lower().strip()
         mode = "light" if LIGHTWEIGHT_MODE else "full"
 
-        # 保存图标题/文件名跟随当前轨迹的 N，而非全局 NUM_FOLLOWERS。
+        # 导出文件名标识 best 轨迹规模，图中保留当局训练标题。
         traj_n = self._trajectory_num_followers(self.best_trajectory)
-        if traj_n is not None:
-            self._set_title(traj_n)
-        n_label = str(self.current_num_followers) if self.current_num_followers else "?"
-        self._last_progress_fig.suptitle(f"CTDE Training Dashboard (N={n_label} followers)", fontsize=14, fontweight="bold")
+        n_label = str(traj_n) if traj_n is not None else "?"
 
         if save_path is None:
             save_path = os.path.join(FIGS_DIR, f"training_progress_{algo}_{n_label}f_{mode}_{ts}.png")

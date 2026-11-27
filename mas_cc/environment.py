@@ -93,7 +93,7 @@ class BatchedModelFreeEnv:
     def __init__(self, topology, num_envs: int = 64, *, auto_reset=True,
                  randomize_topology_on_reset=RANDOMIZE_TOPOLOGY, fixed_scenario=None,
                  max_steps=MAX_STEPS):
-        self.topology = topology
+        self._topology = topology
         self.num_envs = int(num_envs)
         if self.num_envs < 1:
             raise ValueError("num_envs must be positive")
@@ -124,7 +124,8 @@ class BatchedModelFreeEnv:
         self.episode_gen = self._graph_rev = self.frame_rev = 0
         self._episode_start_frame = None
         self._mutation_lock = RLock()
-        self._operation_owner = None
+        self._episode_session = None
+        self._operation_token = None
         self._fixed_scenario = None
 
         self.amplitude_range = LEADER_AMPLITUDE_RANGE
@@ -199,26 +200,33 @@ class BatchedModelFreeEnv:
 
     @contextmanager
     def _session_operation(self, owner):
-        """同时占用当前环境和图，防止采集/更新中途换图，包括 forward hook 重入。"""
-        with _try_lock(self._mutation_lock), _try_lock(self.topology._mutation_lock):
-            self._operation_owner = owner
+        """令牌只在一次会话操作内有效，阻止同线程的 forward hook 重入。"""
+        with _try_lock(self._mutation_lock):
+            if (self._operation_token is not None or
+                    (self._episode_session is not None and self._episode_session is not owner)):
+                raise RuntimeError("Environment already belongs to an active session or operation")
+            self._operation_token = object()
             try:
-                yield
+                yield self._operation_token
             finally:
-                self._operation_owner = None
+                self._operation_token = None
 
     @contextmanager
-    def _write_access(self, owner=None):
+    def _write_access(self, token=None):
         with _try_lock(self._mutation_lock):
-            if self._operation_owner is not owner:
-                raise RuntimeError("Active collection/update owns the environment")
+            if token is not self._operation_token or (token is None and self._episode_session is not None):
+                raise RuntimeError("Active episode owns the environment")
             yield
+
+    @property
+    def topology(self):
+        return self._topology
 
     @property
     def graph_rev(self):
         # 调用方可直接 randomize 同一张图；即使邻居缓存尚未刷新也要暴露该变更。
         if getattr(self, "_precomputed_topology", None) is self.topology:
-            return self._graph_rev + self.topology.revision - self._precomputed_revision
+            return self._graph_rev + self.topology.revision - self._cached_topology_rev
         return self._graph_rev
 
     @_environment_write
@@ -232,10 +240,14 @@ class BatchedModelFreeEnv:
             2) 构造观测时按 `leader_age` 选择 Top-K
         """
 
+        with self.topology._hold_revision():
+            self._cache_neighbor_indices(verbose)
+
+    def _cache_neighbor_indices(self, verbose):
         self._neighbor_indices_list = []
         self._neighbor_counts = torch.zeros(self.num_agents, dtype=torch.long, device=DEVICE)
 
-        adj = self.topology.adj_matrix.to(DEVICE)
+        adj = self.topology._adj.to(DEVICE)
         for i in range(self.num_agents):
             can_receive_mask = adj[i, :] > 0
             indices = torch.where(can_receive_mask)[0]
@@ -269,7 +281,7 @@ class BatchedModelFreeEnv:
         self._graph_rev = max(self._graph_rev + 1, self.graph_rev)
         self._episode_start_frame = None
         self._precomputed_topology = self.topology
-        self._precomputed_revision = self.topology.revision
+        self._cached_topology_rev = self.topology.revision
 
         if verbose:
             print("📊 Precomputed neighbor indices:")
@@ -468,7 +480,7 @@ class BatchedModelFreeEnv:
                 value = value[:, 1:]
             fixed[name] = value.clone()
         self._graph_rev = self.graph_rev
-        self.topology = graph
+        self._topology = graph
         self._fixed_scenario = fixed
         self._precompute_neighbor_indices(verbose=False)
 
