@@ -526,28 +526,54 @@ class _PPOBuffer:
         has_truncated_next_values=None,
         pre_squash_v=None,
     ):
-        self.follower_states.append(follower_states)
-        self.global_states.append(global_states)
-        self.actions.append(actions)
-        if pre_squash_v is None:
-            self.pre_squash_v.append(torch.zeros_like(logp, dtype=torch.float32))
-            self.has_pre_squash_v.append(torch.zeros_like(logp, dtype=torch.bool))
-        else:
-            self.pre_squash_v.append(pre_squash_v.reshape_as(logp).float())
-            self.has_pre_squash_v.append(torch.ones_like(logp, dtype=torch.bool))
-        self.logp.append(logp)
-        self.values.append(values)
-        self.rewards.append(rewards)
-        self.dones.append(dones)
+        # 先完成全部形状校验与独立快照准备，全部成功后才原子追加各列，防止异常留下半写入脏状态
+        fs_c = follower_states.detach().float().clone()
+        gs_c = global_states.detach().float().clone()
+        act_c = actions.detach().float().clone()
+        logp_c = logp.detach().float().clone()
+        val_c = values.detach().float().clone()
+        rew_c = rewards.detach().float().clone()
+        done_c = dones.detach().bool().clone()
+
         if truncated is None:
-            truncated = torch.zeros_like(dones, dtype=torch.bool)
-        self.truncated.append(truncated)
+            trunc_c = torch.zeros_like(done_c, dtype=torch.bool)
+        else:
+            trunc_c = truncated.detach().bool().reshape_as(done_c).clone()
+
         if truncated_next_values is None:
-            truncated_next_values = torch.zeros_like(rewards, dtype=torch.float32)
+            trunc_nv_c = torch.zeros_like(rew_c, dtype=torch.float32)
+        else:
+            trunc_nv_c = truncated_next_values.detach().float().reshape_as(rew_c).clone()
+
         if has_truncated_next_values is None:
-            has_truncated_next_values = torch.zeros_like(dones, dtype=torch.bool)
-        self.truncated_next_values.append(truncated_next_values)
-        self.has_truncated_next_values.append(has_truncated_next_values)
+            has_trunc_nv_c = torch.zeros_like(done_c, dtype=torch.bool)
+        else:
+            has_trunc_nv_c = has_truncated_next_values.detach().bool().reshape_as(done_c).clone()
+
+        if pre_squash_v is None:
+            pre_v_c = torch.zeros_like(logp_c, dtype=torch.float32)
+            has_pre_v_c = torch.zeros_like(logp_c, dtype=torch.bool)
+        else:
+            if pre_squash_v.numel() != logp_c.numel():
+                raise ValueError(
+                    f"pre_squash_v shape {tuple(pre_squash_v.shape)} does not match logp shape {tuple(logp_c.shape)}"
+                )
+            pre_v_c = pre_squash_v.detach().float().reshape_as(logp_c).clone()
+            has_pre_v_c = torch.ones_like(logp_c, dtype=torch.bool)
+
+        # 所有准备就绪后一次性追加
+        self.follower_states.append(fs_c)
+        self.global_states.append(gs_c)
+        self.actions.append(act_c)
+        self.pre_squash_v.append(pre_v_c)
+        self.has_pre_squash_v.append(has_pre_v_c)
+        self.logp.append(logp_c)
+        self.values.append(val_c)
+        self.rewards.append(rew_c)
+        self.dones.append(done_c)
+        self.truncated.append(trunc_c)
+        self.truncated_next_values.append(trunc_nv_c)
+        self.has_truncated_next_values.append(has_trunc_nv_c)
 
     def __len__(self):
         return len(self.rewards)
@@ -671,44 +697,75 @@ class CTDEMAPPOAgent:
         local_states,
         global_states,
         actions,
-        logp,
-        values,
-        rewards,
-        dones,
+        logp=None,
+        values=None,
+        rewards=None,
+        dones=None,
         truncated=None,
         next_global_states=None,
         truncated_next_values=None,
         pre_squash_v=None,
+        *,
+        logp_joint=None,
     ):
+        # 兼容旧关键字参数 `logp_joint=` 别名，并统一校验必需参数与 per-agent 形状
+        if logp is not None and logp_joint is not None:
+            raise TypeError("Specify only one of 'logp' or legacy alias 'logp_joint', not both.")
+        if logp is None:
+            logp = logp_joint
+        if logp is None or values is None or rewards is None or dones is None:
+            raise TypeError("store_rollout_step requires logp (or logp_joint), values, rewards, and dones.")
+
+        if local_states.dim() != 3:
+            raise ValueError(f"Expected local_states dim=3 (E, A, S), got shape={tuple(local_states.shape)}")
+        E = int(local_states.shape[0])
+        expected_logp_shape = (E, self.num_followers, 1)
+        if tuple(logp.shape) != expected_logp_shape:
+            raise ValueError(
+                f"Expected per-agent logp with shape {expected_logp_shape}, got {tuple(logp.shape)}"
+            )
+        if tuple(actions.shape) != (E, self.num_followers, ACTION_DIM):
+            raise ValueError(
+                f"Expected actions with shape {(E, self.num_followers, ACTION_DIM)}, got {tuple(actions.shape)}"
+            )
+
         follower_states = local_states[:, 1:, :].detach()
         actions_f = actions.detach().float()
         dones_b = dones.detach().bool()
         truncated_b = truncated.detach().bool() if truncated is not None else torch.zeros_like(dones_b, dtype=torch.bool)
         rewards_f = rewards.detach().float()
 
+        # 先查询但不消费对象身份绑定；待 buffer.add 校验和快照全部成功后再消费
+        bound_entry = self._sampled_pre_squash_by_id.get(id(actions))
+        has_bound_entry = bound_entry is not None and bound_entry[0]() is actions
+
         if pre_squash_v is not None:
-            pre_squash_v_f = pre_squash_v.detach().float()
-            # 同步清理该对象身份上的隐式绑定（若存在）
-            entry = self._sampled_pre_squash_by_id.get(id(actions))
-            if entry is not None and entry[0]() is actions:
-                self._sampled_pre_squash_by_id.pop(id(actions), None)
+            if tuple(pre_squash_v.shape) != expected_logp_shape and tuple(pre_squash_v.shape) != (E, self.num_followers):
+                raise ValueError(
+                    f"Expected pre_squash_v with shape {expected_logp_shape} or {(E, self.num_followers)}, "
+                    f"got {tuple(pre_squash_v.shape)}"
+                )
+            pre_squash_v_f = pre_squash_v.detach().float().reshape(expected_logp_shape).clone()
+        elif has_bound_entry:
+            pre_squash_v_f = bound_entry[1].detach().float().clone()
         else:
             pre_squash_v_f = None
-            entry = self._sampled_pre_squash_by_id.get(id(actions))
-            if entry is not None and entry[0]() is actions:
-                pre_squash_v_f = entry[1]
-                self._sampled_pre_squash_by_id.pop(id(actions), None)
 
         trunc_nv = torch.zeros_like(rewards_f)
         has_trunc_nv = torch.zeros_like(dones_b, dtype=torch.bool)
 
         if truncated_b.any():
             if truncated_next_values is not None:
-                trunc_nv = truncated_next_values.detach().float().reshape_as(rewards_f)
+                if truncated_next_values.numel() != rewards_f.numel():
+                    raise ValueError(
+                        f"Expected truncated_next_values with {rewards_f.numel()} elements, "
+                        f"got shape {tuple(truncated_next_values.shape)}"
+                    )
+                trunc_nv = truncated_next_values.detach().float().reshape_as(rewards_f).clone()
                 has_trunc_nv = truncated_b.clone()
             elif next_global_states is not None:
                 with torch.no_grad():
-                    trunc_nv = self.value_net(next_global_states.detach().float()).squeeze(-1).float()
+                    trunc_nv = self.value_net(next_global_states.detach().float()).squeeze(-1).float().clone()
                 has_trunc_nv = truncated_b.clone()
 
         self.buffer.add(
@@ -724,6 +781,10 @@ class CTDEMAPPOAgent:
             has_trunc_nv,
             pre_squash_v=pre_squash_v_f,
         )
+
+        # 仅在原子入库成功后才消费该动作的对象身份绑定
+        if has_bound_entry:
+            self._sampled_pre_squash_by_id.pop(id(actions), None)
 
     def _compute_gae(
         self,

@@ -236,6 +236,112 @@ class TestKnownFixes(unittest.TestCase):
         self.assertLess(abs(losses_s["kl"]), 1e-6)
         self.assertEqual(losses_s["clipfrac"], 0.0)
 
+    def test_store_rollout_step_snapshot_atomicity_and_legacy_keyword_alias(self):
+        """验证：(1) 复用同一输入张量不污染已入库快照；(2) 入库校验失败保持原子性与绑定不丢失且可重试；(3) 兼容旧 logp_joint= 关键字并拒绝已求和旧形状。"""
+        set_seed(42)
+        topo = CommunicationTopology(NUM_FOLLOWERS, num_pinned=NUM_PINNED)
+        env = BatchedModelFreeEnv(topo, num_envs=4)
+        agent = CTDEMAPPOAgent(topo)
+        with torch.no_grad():
+            agent.actor.v_log_std.bias.fill_(1.5)
+        agent.actor.train()
+
+        # --- (1) 复用同一张 pre_squash_v 缓冲张量依次写入两步 ---
+        s1 = env.reset()
+        g1 = env.get_global_state()
+        a1, lp1, v1, pre1 = agent.act(s1, g1, deterministic=False, return_pre_squash=True)
+        ns1, r1, d1, _ = env.step(a1)
+        ng1 = env.get_global_state()
+
+        shared_pre = torch.empty_like(pre1)
+        shared_pre.copy_(pre1)
+        expected_pre1 = pre1.clone()
+        agent.store_rollout_step(s1, g1, a1, lp1, v1, r1, d1, pre_squash_v=shared_pre)
+
+        a2, lp2, v2, pre2 = agent.act(ns1, ng1, deterministic=False, return_pre_squash=True)
+        ns2, r2, d2, _ = env.step(a2)
+        ng2 = env.get_global_state()
+        shared_pre.copy_(pre2)
+        agent.store_rollout_step(ns1, ng1, a2, lp2, v2, r2, d2, pre_squash_v=shared_pre)
+
+        # 第一步已存快照必须与 expected_pre1 逐元素相等，未被第二步就地覆盖
+        self.assertTrue(torch.equal(agent.buffer.pre_squash_v[0], expected_pre1))
+
+        # 用 lr=0 走真实 update() 校验两步全部精确 ratio==1, KL==0, ClipFrac==0
+        orig_lr = agent.actor_optimizer.param_groups[0]["lr"]
+        agent.actor_optimizer.param_groups[0]["lr"] = 0.0
+        try:
+            losses = agent.update(next_global_states=ng2, next_dones=d2)
+        finally:
+            agent.actor_optimizer.param_groups[0]["lr"] = orig_lr
+        self.assertLess(abs(losses["kl"]), 1e-6)
+        self.assertEqual(losses["clipfrac"], 0.0)
+
+        # --- (2) 入库参数错误时不损坏已有 buffer 且不消费绑定，修正后可直接重试并 update ---
+        s_ok = env.reset()
+        g_ok = env.get_global_state()
+        a_ok, lp_ok, v_ok = agent.act(s_ok, g_ok, deterministic=False)
+        ns_ok, r_ok, d_ok, _ = env.step(a_ok)
+        ng_ok = env.get_global_state()
+        agent.store_rollout_step(s_ok, g_ok, a_ok, lp_ok, v_ok, r_ok, d_ok)
+
+        a_retry, lp_retry, v_retry = agent.act(ns_ok, ng_ok, deterministic=False)
+        ns_retry, r_retry, d_retry, _ = env.step(a_retry)
+        ng_retry = env.get_global_state()
+
+        # 故意传错形状的 pre_squash_v（少一个 env 维度）
+        bad_pre = torch.zeros(3, NUM_FOLLOWERS, 1, device=DEVICE)
+        with self.assertRaises(ValueError):
+            agent.store_rollout_step(ns_ok, ng_ok, a_retry, lp_retry, v_retry, r_retry, d_retry, pre_squash_v=bad_pre)
+
+        # 验证 buffer 各列长度仍保持一致为 1，且 a_retry 的对象身份绑定未被消费
+        self.assertEqual(len(agent.buffer.follower_states), 1)
+        self.assertEqual(len(agent.buffer.actions), 1)
+        self.assertEqual(len(agent.buffer.pre_squash_v), 1)
+        self.assertEqual(len(agent.buffer.rewards), 1)
+        self.assertIn(id(a_retry), agent._sampled_pre_squash_by_id)
+
+        # 修正后直接重试（不传 pre_squash_v，依赖未丢失的对象身份绑定）并成功 update
+        agent.store_rollout_step(ns_ok, ng_ok, a_retry, lp_retry, v_retry, r_retry, d_retry)
+        self.assertEqual(len(agent.buffer.follower_states), 2)
+        self.assertEqual(len(agent.buffer.pre_squash_v), 2)
+        self.assertTrue(bool(agent.buffer.has_pre_squash_v[1].all().item()))
+        losses_retry = agent.update(next_global_states=ng_retry, next_dones=d_retry)
+        self.assertTrue(math.isfinite(losses_retry["policy"]))
+
+        # --- (3) 兼容旧关键字 `logp_joint=` 别名，且拒绝已求和的旧 (E, 1) 形状 ---
+        s_leg = env.reset()
+        g_leg = env.get_global_state()
+        a_leg, lp_leg, v_leg = agent.act(s_leg, g_leg, deterministic=False)
+        ns_leg, r_leg, d_leg, _ = env.step(a_leg)
+        ng_leg = env.get_global_state()
+
+        # 已求和旧形状 (E, 1) 必须报清晰 ValueError
+        with self.assertRaises(ValueError):
+            agent.store_rollout_step(
+                local_states=s_leg,
+                global_states=g_leg,
+                actions=a_leg,
+                logp_joint=lp_leg.sum(dim=1),
+                values=v_leg,
+                rewards=r_leg,
+                dones=d_leg,
+            )
+        self.assertEqual(len(agent.buffer), 0)
+
+        # 原样转交 act() 的三返回值配合 logp_joint= 关键字正常入库并更新
+        agent.store_rollout_step(
+            local_states=s_leg,
+            global_states=g_leg,
+            actions=a_leg,
+            logp_joint=lp_leg,
+            values=v_leg,
+            rewards=r_leg,
+            dones=d_leg,
+        )
+        losses_leg = agent.update(next_global_states=ng_leg, next_dones=d_leg)
+        self.assertTrue(math.isfinite(losses_leg["policy"]))
+
     def test_mappo_per_agent_logp_and_update(self):
         topo = CommunicationTopology(NUM_FOLLOWERS, num_pinned=NUM_PINNED)
         env = BatchedModelFreeEnv(topo, num_envs=4)
