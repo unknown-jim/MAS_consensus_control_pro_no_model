@@ -211,10 +211,12 @@ class TrainingDashboard:
                 f"Qμ: <b>{losses.get('q1_mean', float('nan')):.2f}</b> / tgtQμ: <b>{losses.get('target_q_mean', float('nan')):.2f}</b>"
             )
         elif ("policy" in losses) or ("value" in losses):
+            h_label = "H(agent)" if "entropy" in losses else "H(joint)"
+            h_val = losses.get("entropy", losses.get("entropy_joint", float("nan")))
             loss_line = (
                 f"Policy: <b>{losses.get('policy', float('nan')):.4f}</b> | "
                 f"Value: <b>{losses.get('value', float('nan')):.4f}</b> | "
-                f"H(joint): <b>{losses.get('entropy_joint', float('nan')):.2f}</b> | "
+                f"{h_label}: <b>{h_val:.2f}</b> | "
                 f"KL: <b>{losses.get('kl', float('nan')):.4f}</b> | "
                 f"ClipFrac: <b>{losses.get('clipfrac', float('nan')):.2f}</b>"
             )
@@ -301,15 +303,15 @@ class TrainingDashboard:
             else:
                 st = "⚠️"
 
-            entropy = losses.get("entropy_joint", float("nan"))
+            entropy = losses.get("entropy", losses.get("entropy_joint", float("nan")))
             if ("q1" in losses) or ("alpha" in losses):
                 alpha = losses.get("alpha", float("nan"))
-                tail = f"α:{alpha:.3f} | H:{entropy:.2f}"
+                tail = f"α:{alpha:.3f} | H:{losses.get('entropy_joint', entropy):.2f}"
             elif ("policy" in losses) or ("value" in losses):
                 pol = losses.get("policy", float("nan"))
                 val = losses.get("value", float("nan"))
                 kl = losses.get("kl", float("nan"))
-                tail = f"π:{pol:.3f} | V:{val:.3f} | KL:{kl:.3f} | H:{entropy:.2f}"
+                tail = f"π:{pol:.3f} | V:{val:.3f} | KL:{kl:.4f} | H:{entropy:.2f}"
             else:
                 tail = f"H:{entropy:.2f}"
 

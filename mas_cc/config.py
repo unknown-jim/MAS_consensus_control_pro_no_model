@@ -251,7 +251,7 @@ PPO_ROLLOUT_STEPS = 128
 PPO_MINIBATCH_SIZE = 1024
 PPO_GAE_LAMBDA = 0.95
 PPO_VALUE_COEF = 0.5
-PPO_ENTROPY_COEF = 0.05  # 大幅增加熵系数，防止 Beta 分布熵崩溃
+PPO_ENTROPY_COEF = 0.01  # per-agent 解析熵系数（原 0.05 系针对错误联合熵尺度）
 PPO_MAX_GRAD_NORM = 0.5  # 减小梯度裁剪（原 1.0），提高稳定性
 PPO_TARGET_KL = 0.015  # 减小目标 KL（原 0.02），更保守的更新
 
@@ -287,7 +287,11 @@ _SAVE_TAG = "mappo" if str(ALGO).upper().strip() == "MAPPO" else "masac"
 
 SAVE_MODEL_PATH = os.path.join(
     MODELS_DIR,
-    (f"best_model_ctde_14f_{_SAVE_TAG}_light.pt" if LIGHTWEIGHT_MODE else f"best_model_ctde_14f_{_SAVE_TAG}.pt"),
+    (
+        f"best_model_ctde_{NUM_FOLLOWERS}f_{_SAVE_TAG}_light.pt"
+        if LIGHTWEIGHT_MODE
+        else f"best_model_ctde_{NUM_FOLLOWERS}f_{_SAVE_TAG}.pt"
+    ),
 )
 
 EVAL_NUM_TESTS = 3

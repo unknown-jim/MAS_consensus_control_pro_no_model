@@ -9,25 +9,25 @@
 """
 import torch
 
-from mas_cc.config import NUM_FOLLOWERS, NUM_PINNED, MAX_STEPS, DEVICE, THRESHOLD_MIN, THRESHOLD_MAX, TH_SCALE
+from mas_cc.config import NUM_FOLLOWERS, NUM_PINNED, MAX_STEPS, DEVICE, THRESHOLD_MIN, THRESHOLD_MAX
 from mas_cc.environment import ModelFreeEnv
 from mas_cc.topology import CommunicationTopology
 
 def _raw_threshold_from_env_threshold(threshold_env: float) -> float:
-    """把“环境实际阈值”反算为策略动作的 raw 阈值。
+    """把“环境实际阈值”反算为策略动作的 theta_norm 值。
 
-    环境内部的映射关系为：
-        threshold_env = THRESHOLD_MIN + (THRESHOLD_MAX - THRESHOLD_MIN) * clamp(raw/TH_SCALE, 0, 1)
+    环境内部的反向映射关系为（见 `mas_cc/environment.py`）：
+        threshold_env = THRESHOLD_MAX - clamp(theta_norm, 0, 1) * (THRESHOLD_MAX - THRESHOLD_MIN)
 
     Args:
         threshold_env: 环境实际阈值（位于 [THRESHOLD_MIN, THRESHOLD_MAX]）。
 
     Returns:
-        raw 阈值（对应 actor 动作第 2 维的 raw 值）。
+        theta_norm 值（范围 [0, 1]，越大对应环境阈值越小、通信越频繁）。
     """
-    x = (threshold_env - THRESHOLD_MIN) / (THRESHOLD_MAX - THRESHOLD_MIN + 1e-12)
-    x = float(min(1.0, max(0.0, x)))
-    return x * TH_SCALE
+    theta_norm = (THRESHOLD_MAX - threshold_env) / (THRESHOLD_MAX - THRESHOLD_MIN + 1e-12)
+    theta_norm = float(min(1.0, max(0.0, theta_norm)))
+    return theta_norm
 
 
 def test_zero_control():

@@ -58,6 +58,7 @@ class ActorOnlyPolicy:
     def __init__(self, actor: DecentralizedActor, use_amp: bool = False):
         self.actor = actor.to(DEVICE)
         self.actor.eval()
+        self.value_net = None  # 与 CTDESACAgent / CTDEMAPPOAgent 接口对齐，兼容评估工具
         self.use_amp = bool(use_amp and DEVICE.type == "cuda")
         self._autocast = None
         if self.use_amp:
@@ -490,7 +491,7 @@ class CTDESACAgent:
 
 
 class _PPOBuffer:
-    """On-policy rollout buffer（按时间步存储，支持并行环境）。"""
+    """On-policy rollout buffer（按时间步存储，支持并行环境与 per-agent logp）。"""
 
     def __init__(self, rollout_steps: int = PPO_ROLLOUT_STEPS):
         self.rollout_steps = int(rollout_steps)
@@ -500,19 +501,43 @@ class _PPOBuffer:
         self.follower_states = []
         self.global_states = []
         self.actions = []
-        self.logp_joint = []
+        self.logp = []
         self.values = []
         self.rewards = []
         self.dones = []
+        self.truncated = []
+        self.truncated_next_values = []
+        self.has_truncated_next_values = []
 
-    def add(self, follower_states, global_states, actions, logp_joint, values, rewards, dones):
+    def add(
+        self,
+        follower_states,
+        global_states,
+        actions,
+        logp,
+        values,
+        rewards,
+        dones,
+        truncated=None,
+        truncated_next_values=None,
+        has_truncated_next_values=None,
+    ):
         self.follower_states.append(follower_states)
         self.global_states.append(global_states)
         self.actions.append(actions)
-        self.logp_joint.append(logp_joint)
+        self.logp.append(logp)
         self.values.append(values)
         self.rewards.append(rewards)
         self.dones.append(dones)
+        if truncated is None:
+            truncated = torch.zeros_like(dones, dtype=torch.bool)
+        self.truncated.append(truncated)
+        if truncated_next_values is None:
+            truncated_next_values = torch.zeros_like(rewards, dtype=torch.float32)
+        if has_truncated_next_values is None:
+            has_truncated_next_values = torch.zeros_like(dones, dtype=torch.bool)
+        self.truncated_next_values.append(truncated_next_values)
+        self.has_truncated_next_values.append(has_truncated_next_values)
 
     def __len__(self):
         return len(self.rewards)
@@ -544,6 +569,7 @@ class CTDEMAPPOAgent:
 
         self.actor = DecentralizedActor(hidden_dim=HIDDEN_DIM).to(DEVICE)
         self.value_net = CentralizedValue(global_state_dim=GLOBAL_STATE_DIM, hidden_dim=HIDDEN_DIM).to(DEVICE)
+        self._disable_actor_dropout()
 
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=PPO_LR)
         self.value_optimizer = optim.Adam(self.value_net.parameters(), lr=PPO_LR)
@@ -555,6 +581,17 @@ class CTDEMAPPOAgent:
         print(f"   Actor input: Local state ({STATE_DIM})")
         print(f"   Value input: Global state ({GLOBAL_STATE_DIM})")
         print(f"   Rollout steps: {PPO_ROLLOUT_STEPS} | Epochs: {PPO_EPOCHS} | Minibatch: {PPO_MINIBATCH_SIZE}")
+
+    def _disable_actor_dropout(self) -> None:
+        """在 MAPPO 采样与更新阶段一致关闭 Actor 内部 Dropout。
+
+        原因：PPO 重要度采样比率 ratio = exp(new_logp - old_logp) 与 k3 KL 近似要求
+        采样与重评估对应同一个确定性策略分布；若训练期启用随机 Dropout，即使参数未更新
+        也会产生随机 mask 偏差，破坏 ratio=1 / KL=0 契约。关闭 Dropout 同时保留全部参数梯度。
+        """
+        for module in self.actor.modules():
+            if isinstance(module, torch.nn.Dropout):
+                module.eval()
 
     @torch.inference_mode()
     def select_action(self, local_states: torch.Tensor, deterministic: bool = False):
@@ -575,50 +612,118 @@ class CTDEMAPPOAgent:
 
         Returns:
             actions: shape=(E, num_followers, ACTION_DIM)
-            logp_joint: shape=(E, 1)
+            logp: per-agent 对数概率，shape=(E, num_followers, 1)
             values: shape=(E, 1)；当 global_states 为 None 时填充 NaN。
         """
         assert local_states.dim() == 3, "MAPPO 训练需要 batched local_states"
         E = int(local_states.shape[0])
+        self._disable_actor_dropout()
 
         follower_states = local_states[:, 1:, :].reshape(-1, STATE_DIM)
         act_flat, logp_flat = self.actor(follower_states, deterministic=deterministic)
         actions = act_flat.view(E, self.num_followers, ACTION_DIM).float()
 
         if logp_flat is None:
-            logp_joint = torch.zeros((E, 1), device=DEVICE)
+            logp = torch.zeros((E, self.num_followers, 1), device=DEVICE)
         else:
-            logp_joint = logp_flat.view(E, self.num_followers, 1).sum(dim=1)
+            logp = logp_flat.view(E, self.num_followers, 1).float()
 
         if global_states is None:
             values = torch.full((E, 1), float("nan"), device=DEVICE)
         else:
             values = self.value_net(global_states).float()
 
-        return actions, logp_joint, values
+        return actions, logp, values
 
-    def store_rollout_step(self, local_states, global_states, actions, logp_joint, values, rewards, dones):
+    def store_rollout_step(
+        self,
+        local_states,
+        global_states,
+        actions,
+        logp,
+        values,
+        rewards,
+        dones,
+        truncated=None,
+        next_global_states=None,
+        truncated_next_values=None,
+    ):
         follower_states = local_states[:, 1:, :].detach()
+        dones_b = dones.detach().bool()
+        truncated_b = truncated.detach().bool() if truncated is not None else torch.zeros_like(dones_b, dtype=torch.bool)
+        rewards_f = rewards.detach().float()
+
+        trunc_nv = torch.zeros_like(rewards_f)
+        has_trunc_nv = torch.zeros_like(dones_b, dtype=torch.bool)
+
+        if truncated_b.any():
+            if truncated_next_values is not None:
+                trunc_nv = truncated_next_values.detach().float().reshape_as(rewards_f)
+                has_trunc_nv = truncated_b.clone()
+            elif next_global_states is not None:
+                with torch.no_grad():
+                    trunc_nv = self.value_net(next_global_states.detach().float()).squeeze(-1).float()
+                has_trunc_nv = truncated_b.clone()
+
         self.buffer.add(
             follower_states.float(),
             global_states.detach().float(),
             actions.detach().float(),
-            logp_joint.detach().float(),
+            logp.detach().float(),
             values.detach().float(),
-            rewards.detach().float(),
-            dones.detach(),
+            rewards_f,
+            dones_b,
+            truncated_b,
+            trunc_nv,
+            has_trunc_nv,
         )
 
-    def _compute_gae(self, rewards, dones, values, last_value):
+    def _compute_gae(
+        self,
+        rewards,
+        dones,
+        values,
+        last_value,
+        truncated=None,
+        truncated_next_values=None,
+        has_truncated_next_values=None,
+    ):
+        """计算 GAE 与回报，正确区分真实终止 (dones) 与时间截断 (truncated)。
+
+        - 真实终止 (`dones[t]=True`，即使同时 `truncated[t]=True`)：不 bootstrap (`next_value * 0`)，且中断 GAE 递推。
+        - 时间截断 (`truncated[t]=True, dones[t]=False`)：中断跨 episode 的 GAE 递推，
+          并使用截断前真实的 `V(s_{t+1})`（`truncated_next_values[t]` 或末步 `last_value`）做 bootstrap，
+          避免跨 episode 错用下一 episode 初始状态价值或 `values[t]`。
+        """
         T, E = rewards.shape
+        if truncated is None:
+            truncated = torch.zeros_like(dones, dtype=torch.bool)
+        if truncated_next_values is None:
+            truncated_next_values = torch.zeros_like(rewards, dtype=torch.float32)
+        if has_truncated_next_values is None:
+            has_truncated_next_values = torch.zeros_like(dones, dtype=torch.bool)
+
         advantages = torch.zeros(T, E, device=DEVICE)
         gae = torch.zeros(E, device=DEVICE)
 
         for t in reversed(range(T)):
             nonterminal = (~dones[t]).float()
-            next_value = last_value if t == T - 1 else values[t + 1]
+            episode_continue = (~(dones[t] | truncated[t])).float()
+            need_trunc_bootstrap = truncated[t] & (~dones[t])
+
+            if t == T - 1:
+                use_stored = need_trunc_bootstrap & has_truncated_next_values[t]
+                next_value = torch.where(use_stored, truncated_next_values[t], last_value)
+            else:
+                if need_trunc_bootstrap.any() and not bool(has_truncated_next_values[t][need_trunc_bootstrap].all().item()):
+                    raise ValueError(
+                        "Truncated step before rollout end requires next_global_states or truncated_next_values "
+                        "to compute exact bootstrap V(s_{t+1})."
+                    )
+                next_value = torch.where(need_trunc_bootstrap, truncated_next_values[t], values[t + 1])
+
             delta = rewards[t] + GAMMA * next_value * nonterminal - values[t]
-            gae = delta + GAMMA * PPO_GAE_LAMBDA * nonterminal * gae
+            gae = delta + GAMMA * PPO_GAE_LAMBDA * episode_continue * gae
             advantages[t] = gae
 
         returns = advantages + values
@@ -628,13 +733,18 @@ class CTDEMAPPOAgent:
         if len(self.buffer) == 0:
             return {}
 
+        self._disable_actor_dropout()
+
         follower_states = torch.stack(self.buffer.follower_states, dim=0)  # (T,E,F,S)
         global_states = torch.stack(self.buffer.global_states, dim=0)  # (T,E,G)
         actions = torch.stack(self.buffer.actions, dim=0)  # (T,E,F,A)
-        old_logp_joint = torch.stack(self.buffer.logp_joint, dim=0)  # (T,E,1)
+        old_logp = torch.stack(self.buffer.logp, dim=0)  # (T,E,F,1)
         values = torch.stack(self.buffer.values, dim=0)  # (T,E,1)
         rewards = torch.stack(self.buffer.rewards, dim=0)  # (T,E)
         dones = torch.stack(self.buffer.dones, dim=0)  # (T,E)
+        truncated = torch.stack(self.buffer.truncated, dim=0)  # (T,E)
+        truncated_next_values = torch.stack(self.buffer.truncated_next_values, dim=0)  # (T,E)
+        has_truncated_next_values = torch.stack(self.buffer.has_truncated_next_values, dim=0)  # (T,E)
 
         T, E = rewards.shape
 
@@ -644,10 +754,18 @@ class CTDEMAPPOAgent:
             else:
                 lv = self.value_net(next_global_states).squeeze(-1)
                 if next_dones is not None:
-                    lv = lv * (~next_dones).float()
+                    lv = lv * (~next_dones.bool()).float()
                 last_value = lv
 
-            adv, ret = self._compute_gae(rewards=rewards, dones=dones, values=values.squeeze(-1), last_value=last_value)
+            adv, ret = self._compute_gae(
+                rewards=rewards,
+                dones=dones,
+                values=values.squeeze(-1),
+                last_value=last_value,
+                truncated=truncated,
+                truncated_next_values=truncated_next_values,
+                has_truncated_next_values=has_truncated_next_values,
+            )
 
             adv_flat = adv.reshape(-1)
             adv = (adv - adv_flat.mean()) / (adv_flat.std(unbiased=False) + 1e-8)
@@ -656,7 +774,7 @@ class CTDEMAPPOAgent:
         follower_states_env = follower_states.reshape(N, self.num_followers, STATE_DIM)
         global_states_env = global_states.reshape(N, -1)
         actions_env = actions.reshape(N, self.num_followers, ACTION_DIM)
-        old_logp_env = old_logp_joint.reshape(N, 1)
+        old_logp_env = old_logp.reshape(N, self.num_followers, 1)
         adv_env = adv.reshape(N, 1)
         ret_env = ret.reshape(N, 1)
 
@@ -668,6 +786,7 @@ class CTDEMAPPOAgent:
         entropies = []
         kls = []
         clipfracs = []
+        early_stop = False
 
         for _ in range(int(PPO_EPOCHS)):
             perm = torch.randperm(N, device=DEVICE)
@@ -677,26 +796,32 @@ class CTDEMAPPOAgent:
                 mb_gs = global_states_env[idx]
                 mb_fs = follower_states_env[idx]
                 mb_act = actions_env[idx]
-                mb_old_logp = old_logp_env[idx]
-                mb_adv = adv_env[idx]
-                mb_ret = ret_env[idx]
+                mb_old_logp = old_logp_env[idx]  # (mb, F, 1)
+                mb_adv = adv_env[idx]  # (mb, 1)
+                mb_ret = ret_env[idx]  # (mb, 1)
 
                 fs_flat = mb_fs.reshape(-1, STATE_DIM)
                 act_flat = mb_act.reshape(-1, ACTION_DIM)
 
-                new_logp_flat = self.actor.evaluate_actions(fs_flat, act_flat)
-                new_logp_joint = new_logp_flat.view(-1, self.num_followers, 1).sum(dim=1)
+                # 标准 MAPPO：逐智能体 (per-agent) 计算重要度比率与解析分布熵，避免联合乘积随 N 爆炸
+                new_logp_flat, entropy_flat = self.actor.evaluate_actions(fs_flat, act_flat, return_entropy=True)
+                new_logp = new_logp_flat.view(-1, self.num_followers, 1)
+                entropy = entropy_flat.view(-1, self.num_followers, 1)
 
-                ratio = torch.exp(new_logp_joint - mb_old_logp)
-                surr1 = ratio * mb_adv
-                surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * mb_adv
+                log_ratio = new_logp - mb_old_logp
+                ratio = torch.exp(log_ratio)
+                mb_adv_expanded = mb_adv.unsqueeze(1)  # (mb, 1, 1) -> broadcast 到 (mb, F, 1)
+
+                surr1 = ratio * mb_adv_expanded
+                surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * mb_adv_expanded
                 policy_loss = -(torch.min(surr1, surr2)).mean()
 
-                entropy_joint = (-new_logp_joint).mean()
-                approx_kl = (mb_old_logp - new_logp_joint).mean()
+                entropy_mean = entropy.mean()
+                # Schulman k3 无偏非负 KL 近似（per-agent 均值）
+                approx_kl = ((ratio - 1.0) - log_ratio).mean()
                 clipfrac = (torch.abs(ratio - 1.0) > clip_eps).float().mean()
 
-                actor_loss = policy_loss - float(PPO_ENTROPY_COEF) * entropy_joint
+                actor_loss = policy_loss - float(PPO_ENTROPY_COEF) * entropy_mean
 
                 self.actor_optimizer.zero_grad(set_to_none=True)
                 actor_loss.backward()
@@ -713,21 +838,30 @@ class CTDEMAPPOAgent:
 
                 pol_losses.append(float(policy_loss.detach().item()))
                 v_losses.append(float(value_loss.detach().item()))
-                entropies.append(float(entropy_joint.detach().item()))
-                kls.append(float(approx_kl.detach().item()))
+                entropies.append(float(entropy_mean.detach().item()))
+                kl_val = float(approx_kl.detach().item())
+                kls.append(kl_val)
                 clipfracs.append(float(clipfrac.detach().item()))
 
-                if float(PPO_TARGET_KL) > 0 and float(approx_kl.detach().item()) > 1.5 * float(PPO_TARGET_KL):
+                if float(PPO_TARGET_KL) > 0 and kl_val > 1.5 * float(PPO_TARGET_KL):
+                    early_stop = True
                     break
+
+            if early_stop:
+                break
 
         self.buffer.clear()
 
+        mean_entropy = float(np.mean(entropies)) if entropies else float("nan")
         self.last_losses = {
             "policy": float(np.mean(pol_losses)) if pol_losses else float("nan"),
             "value": float(np.mean(v_losses)) if v_losses else float("nan"),
-            "entropy_joint": float(np.mean(entropies)) if entropies else float("nan"),
+            "entropy": mean_entropy,
+            "entropy_joint": mean_entropy * float(self.num_followers) if entropies else float("nan"),
             "kl": float(np.mean(kls)) if kls else float("nan"),
             "clipfrac": float(np.mean(clipfracs)) if clipfracs else float("nan"),
+            "early_stopped": early_stop,
+            "update_minibatches": len(pol_losses),
         }
         return self.last_losses
 
