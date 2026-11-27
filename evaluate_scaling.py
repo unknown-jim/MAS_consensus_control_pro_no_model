@@ -28,6 +28,7 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parent
 BASELINE = "4115d00412d14cc2600235aa0e99af5e90f131f9"
+BASELINE_MAS_CC_SHA256 = "bca16136b2831bff6666cc695b4df9011325cb9fce2c152e16db03b1637754c0"
 METRICS = ("mean_tracking_error", "last50_error", "final_tracking_error", "max_tracking_error",
            "deepest_layer_error", "mean_comm_rate", "mean_reward", "reward_per_step",
            "convergence_step", "converged", "penalized_convergence_step", "stable",
@@ -306,7 +307,34 @@ def worker_command(args, version, repo, mode):
 
 
 def git(repo, *args):
-    return subprocess.check_output(["git", "--no-optional-locks", "-C", str(repo), *args], text=True).strip()
+    return subprocess.check_output(["git", "--no-optional-locks", "-C", str(repo), *args], text=True, stderr=subprocess.PIPE).strip()
+
+
+def mas_cc_digest(repo):
+    root = Path(repo) / "mas_cc"
+    if not root.is_dir():
+        raise ValueError(f"Missing mas_cc directory under {repo}")
+    h = hashlib.sha256()
+    for path in sorted(root.rglob("*.py")):
+        if any(part.startswith(".") or part == "__pycache__" for part in path.relative_to(root).parts):
+            continue
+        rel = path.relative_to(root).as_posix()
+        h.update(rel.encode("utf-8") + b"\0" + path.read_bytes() + b"\0")
+    return h.hexdigest()
+
+
+def resolve_repo_identity(repo, worker_version):
+    if (Path(repo) / ".git").exists():
+        sha = git(repo, "rev-parse", "HEAD")
+        if worker_version == "v1" and (sha != BASELINE or git(repo, "status", "--porcelain", "--", "mas_cc")):
+            raise ValueError(f"v1 requires the unmodified baseline {BASELINE}")
+        return sha
+    code_hash = mas_cc_digest(repo)
+    if worker_version == "v1" and code_hash != BASELINE_MAS_CC_SHA256:
+        raise ValueError(
+            f"v1 non-git export mas_cc digest mismatch: got {code_hash}, expected {BASELINE_MAS_CC_SHA256}"
+        )
+    return f"nongit:{code_hash}"
 
 
 def error_status(exc):
@@ -323,9 +351,7 @@ def run_worker(args, stream):
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
     if args.top_k is not None:
         os.environ["MAX_NEIGHBORS"] = str(args.top_k)
-    sha = git(repo, "rev-parse", "HEAD")
-    if args.worker_version == "v1" and (sha != BASELINE or git(repo, "status", "--porcelain", "--", "mas_cc")):
-        raise ValueError(f"v1 requires the unmodified baseline {BASELINE}")
+    sha = resolve_repo_identity(repo, args.worker_version)
     sys.path.insert(0, str(repo))
     import torch
     from mas_cc import config as c

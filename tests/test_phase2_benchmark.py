@@ -357,3 +357,17 @@ with patch.object(profile_bottleneck, 'build_env', side_effect=RuntimeError('CUD
         self.assertEqual(profile_bottleneck.parser().parse_args([]).algo, "sac")
         cmd = profile_bottleneck.parser().parse_args(["--algo", "sac", "--steps", "1", "--warmup", "0"])
         self.assertEqual((cmd.algo, cmd.steps, cmd.warmup), ("sac", 1, 0))
+
+    def test_non_git_export_identity(self):
+        import shutil
+        import evaluate_scaling as es
+        export_v1 = self.dir / "export_v1"
+        shutil.copytree(V1 / "mas_cc", export_v1 / "mas_cc", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        # macOS tar 产生的 AppleDouble 隐藏文件不得破坏校验
+        (export_v1 / "mas_cc" / "._agent.py").write_bytes(b"appledouble")
+        ident = es.resolve_repo_identity(export_v1, "v1")
+        self.assertEqual(ident, f"nongit:{es.BASELINE_MAS_CC_SHA256}")
+        # 篡改 v1 源码必须被拒绝
+        (export_v1 / "mas_cc" / "config.py").write_text("# tampered\n", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            es.resolve_repo_identity(export_v1, "v1")
