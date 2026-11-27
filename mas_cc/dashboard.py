@@ -25,8 +25,6 @@ from .config import (
     FIGS_DIR,
     LIGHTWEIGHT_MODE,
     MAX_STEPS,
-    NUM_AGENTS,
-    NUM_FOLLOWERS,
     POS_LIMIT,
     REWARD_MAX,
     REWARD_MIN,
@@ -61,7 +59,10 @@ class TrainingDashboard:
         self.max_steps = int(MAX_STEPS)
 
         self.topology = topology
-        self.pinned_followers = topology.pinned_followers if topology else []
+        # 轨迹自带的 pinned_ids 优先；这里只保留默认的拓扑快照用于旧轨迹回退。
+        self.pinned_ids = list(getattr(topology, "pinned_ids", []) or [])
+        self.pinned_followers = self.pinned_ids  # 旧属性名兼容
+        self.current_num_followers = int(getattr(topology, "num_followers", 0) or 0)
 
         def _scale_reward_np(r: float) -> float:
             if USE_SOFT_REWARD_SCALING:
@@ -112,16 +113,63 @@ class TrainingDashboard:
             f"   Comm:   Good < {self.comm_good_threshold*100:.0f}%, Poor > {self.comm_poor_threshold*100:.0f}%"
         )
 
-    def _create_widgets(self):
+    @staticmethod
+    def _trajectory_num_followers(traj) -> int | None:
+        """读取轨迹自身的 follower 数；旧轨迹回退到形状推断。"""
+        if not isinstance(traj, dict):
+            return None
+        n = traj.get("num_followers")
+        if n is not None:
+            return int(n)
+        for key in ("positions", "follower_pos", "follower_vel", "theta_norms"):
+            value = traj.get(key)
+            if value is None:
+                continue
+            arr = np.asarray(value)
+            if arr.ndim >= 2 and arr.shape[1] > 0:
+                # positions 含 leader 列（index=0），其余只含 follower。
+                return int(arr.shape[1] - 1 if key == "positions" else arr.shape[1])
+        return None
+
+    def _trajectory_pinned_ids(self, traj) -> set[int]:
+        """优先取轨迹快照的 pinned_ids；旧轨迹回退到仪表盘默认拓扑。"""
+        if isinstance(traj, dict) and traj.get("pinned_ids") is not None:
+            return {int(i) for i in traj["pinned_ids"]}
+        return {int(i) for i in self.pinned_ids}
+
+    @staticmethod
+    def _follower_array(traj, key):
+        """兼容旧轨迹：follower_* 缺失时从含 leader 的 positions/velocities 切片。"""
+        if not isinstance(traj, dict):
+            return None
+        if key in traj and traj[key] is not None:
+            return np.asarray(traj[key])
+        source = "positions" if key == "follower_pos" else "velocities" if key == "follower_vel" else None
+        if source and traj.get(source) is not None:
+            arr = np.asarray(traj[source])
+            if arr.ndim >= 2 and arr.shape[1] > 0:
+                return arr[:, 1:]
+        return None
+
+    @staticmethod
+    def _entropy_from_losses(losses) -> float:
+        """熵曲线兼容旧字段：优先 entropy，缺失时回退 entropy_joint。"""
+        return losses.get("entropy", losses.get("entropy_joint", float("nan")))
+
+    def _title_text(self, n=None) -> str:
+        if n is None:
+            n = self.current_num_followers
         algo = str(ALGO).upper().strip()
         mode = "Light" if LIGHTWEIGHT_MODE else "Full"
-        title = (
+        n_text = "?" if not n else str(int(n))
+        return (
             f"🎯 CTDE Leader-Follower MAS Event-Triggered Consensus "
-            f"({algo} | {NUM_AGENTS} agents = 1 leader + {NUM_FOLLOWERS} followers | {mode})"
+            f"({algo} | 1 leader + {n_text} followers | {mode})"
         )
 
-        self.title_html = widgets.HTML(
-            value=f"""
+    def _title_html(self, n=None) -> str:
+        title = self._title_text(n)
+        return f"""
             <div style=\"background: linear-gradient(90deg, #11998e 0%, #38ef7d 100%);
                         padding: 15px; border-radius: 10px; margin-bottom: 10px;\">
                 <h2 style=\"color: white; margin: 0; text-align: center;\">
@@ -129,7 +177,15 @@ class TrainingDashboard:
                 </h2>
             </div>
         """
-        )
+
+    def _set_title(self, n=None):
+        """标题随当前轨迹的 N 更新；多规模训练切换 N 时不显示过期规模。"""
+        if n is not None:
+            self.current_num_followers = int(n)
+        self.title_html.value = self._title_html(self.current_num_followers)
+
+    def _create_widgets(self):
+        self.title_html = widgets.HTML(value=self._title_html(self.current_num_followers))
 
         self.main_progress = widgets.FloatProgress(
             value=0,
@@ -212,7 +268,7 @@ class TrainingDashboard:
             )
         elif ("policy" in losses) or ("value" in losses):
             h_label = "H(agent)" if "entropy" in losses else "H(joint)"
-            h_val = losses.get("entropy", losses.get("entropy_joint", float("nan")))
+            h_val = self._entropy_from_losses(losses)
             loss_line = (
                 f"Policy: <b>{losses.get('policy', float('nan')):.4f}</b> | "
                 f"Value: <b>{losses.get('value', float('nan')):.4f}</b> | "
@@ -285,6 +341,10 @@ class TrainingDashboard:
             if trajectory_data is not None:
                 self.best_trajectory = trajectory_data
 
+        traj_n = self._trajectory_num_followers(trajectory_data)
+        if traj_n is not None:
+            self._set_title(traj_n)
+
         self.main_progress.value = (episode / self.total_episodes) * 100
         self.step_progress.value = 0
 
@@ -303,7 +363,7 @@ class TrainingDashboard:
             else:
                 st = "⚠️"
 
-            entropy = losses.get("entropy", losses.get("entropy_joint", float("nan")))
+            entropy = self._entropy_from_losses(losses)
             if ("q1" in losses) or ("alpha" in losses):
                 alpha = losses.get("alpha", float("nan"))
                 tail = f"α:{alpha:.3f} | H:{losses.get('entropy_joint', entropy):.2f}"
@@ -334,6 +394,15 @@ class TrainingDashboard:
 
             fig, axes = plt.subplots(2, 3, figsize=(18, 10), constrained_layout=True)
 
+            # 每次重绘都从当前轨迹读取 N / pinned_ids，避免跨规模训练时越界或错色。
+            traj = self.best_trajectory
+            traj_n = self._trajectory_num_followers(traj)
+            if traj_n is not None:
+                self._set_title(traj_n)
+            n_label = str(self.current_num_followers) if self.current_num_followers else "?"
+            fig.suptitle(f"CTDE Training Dashboard (N={n_label} followers)", fontsize=14, fontweight="bold")
+            pinned_ids = self._trajectory_pinned_ids(traj)
+
             leader_color = "#e74c3c"
             raw_color = "#95a5a6"
             smooth_color = "#11998e"
@@ -342,14 +411,14 @@ class TrainingDashboard:
 
             # ========== 子图 1: 位置跟踪 ==========
             ax1 = axes[0, 0]
-            if self.best_trajectory is not None:
-                t = self.best_trajectory["times"]
-                fp = self.best_trajectory["follower_pos"]
-                lp = self.best_trajectory["leader_pos"]
-                num_followers = fp.shape[1]
+            if traj is not None:
+                t = traj["times"]
+                fp = self._follower_array(traj, "follower_pos")
+                lp = traj["leader_pos"]
+                num_followers = min(traj_n, fp.shape[1]) if traj_n is not None else fp.shape[1]
 
-                pinned_indices = [i for i in range(num_followers) if (i + 1) in self.pinned_followers]
-                normal_indices = [i for i in range(num_followers) if (i + 1) not in self.pinned_followers]
+                pinned_indices = [i for i in range(num_followers) if (i + 1) in pinned_ids]
+                normal_indices = [i for i in range(num_followers) if (i + 1) not in pinned_ids]
 
                 if normal_indices:
                     colors_normal = plt.cm.Blues(np.linspace(0.4, 0.8, len(normal_indices)))
@@ -368,7 +437,7 @@ class TrainingDashboard:
                 avg_fp = fp.mean(axis=1)
                 ax1.plot(t, avg_fp, color="#9b59b6", lw=2, linestyle="--", label="Avg Follower", alpha=0.8, zorder=9)
 
-            ax1.set_title(f"Position Tracking (Best R={self.best_reward:.2f})", fontsize=12, fontweight="bold")
+            ax1.set_title(f"Position Tracking (N={n_label}, Best R={self.best_reward:.2f})", fontsize=12, fontweight="bold")
             ax1.set_xlabel("Time (s)", fontsize=10)
             ax1.set_ylabel("Position", fontsize=10)
             ax1.legend(loc="upper right", fontsize=8)
@@ -376,14 +445,14 @@ class TrainingDashboard:
 
             # ========== 子图 2: 速度跟踪 ==========
             ax2 = axes[0, 1]
-            if self.best_trajectory is not None:
-                t = self.best_trajectory["times"]
-                fv = self.best_trajectory["follower_vel"]
-                lv = self.best_trajectory["leader_vel"]
-                num_followers = fv.shape[1]
+            if traj is not None:
+                t = traj["times"]
+                fv = self._follower_array(traj, "follower_vel")
+                lv = traj["leader_vel"]
+                num_followers = min(traj_n, fv.shape[1]) if traj_n is not None else fv.shape[1]
 
-                pinned_indices = [i for i in range(num_followers) if (i + 1) in self.pinned_followers]
-                normal_indices = [i for i in range(num_followers) if (i + 1) not in self.pinned_followers]
+                pinned_indices = [i for i in range(num_followers) if (i + 1) in pinned_ids]
+                normal_indices = [i for i in range(num_followers) if (i + 1) not in pinned_ids]
 
                 if normal_indices:
                     colors_normal = plt.cm.Blues(np.linspace(0.4, 0.8, len(normal_indices)))
@@ -402,7 +471,7 @@ class TrainingDashboard:
                 avg_fv = fv.mean(axis=1)
                 ax2.plot(t, avg_fv, color="#9b59b6", lw=2, linestyle="--", label="Avg Follower", alpha=0.8, zorder=9)
 
-            ax2.set_title("Velocity Tracking", fontsize=12, fontweight="bold")
+            ax2.set_title(f"Velocity Tracking (N={n_label})", fontsize=12, fontweight="bold")
             ax2.set_xlabel("Time (s)", fontsize=10)
             ax2.set_ylabel("Velocity", fontsize=10)
             ax2.legend(loc="upper right", fontsize=8)
@@ -410,12 +479,12 @@ class TrainingDashboard:
 
             # ========== 子图 3: 通信分析 ==========
             ax3 = axes[0, 2]
-            if self.best_trajectory is not None and "comm_rates" in self.best_trajectory:
-                t_comm = self.best_trajectory["times"][1:]
-                comm_rates = self.best_trajectory["comm_rates"]
-                theta_norms = self.best_trajectory.get("theta_norms", None)
+            if traj is not None and "comm_rates" in traj:
+                t_comm = traj["times"][1:]
+                comm_rates = traj["comm_rates"]
+                theta_norms = traj.get("theta_norms", None)
 
-                window = min(20, len(comm_rates) // 5) if len(comm_rates) > 20 else 5
+                window = min(20, len(comm_rates) // 5) if len(comm_rates) > 20 else min(5, len(comm_rates))
                 if window >= 2:
                     comm_smooth = np.convolve(comm_rates, np.ones(window) / window, mode="valid")
                     t_smooth = t_comm[window - 1 :]
@@ -429,9 +498,9 @@ class TrainingDashboard:
                 # 如果有阈值归一化数据，在副轴显示
                 if theta_norms is not None and len(theta_norms) > 0:
                     ax3t = ax3.twinx()
-                    num_followers = theta_norms.shape[1]
-                    pinned_indices = [i for i in range(num_followers) if (i + 1) in self.pinned_followers]
-                    normal_indices = [i for i in range(num_followers) if (i + 1) not in self.pinned_followers]
+                    num_followers = min(traj_n, theta_norms.shape[1]) if traj_n is not None else theta_norms.shape[1]
+                    pinned_indices = [i for i in range(num_followers) if (i + 1) in pinned_ids]
+                    normal_indices = [i for i in range(num_followers) if (i + 1) not in pinned_ids]
 
                     if pinned_indices:
                         pinned_theta = theta_norms[:, pinned_indices].mean(axis=1)
@@ -460,7 +529,7 @@ class TrainingDashboard:
                 ax3.tick_params(axis="y", labelcolor=comm_color)
 
                 avg_comm = np.mean(comm_rates) * 100
-                ax3.set_title(f"Communication Analysis (Avg: {avg_comm:.1f}%)", fontsize=12, fontweight="bold")
+                ax3.set_title(f"Communication Analysis (N={n_label}, Avg: {avg_comm:.1f}%)", fontsize=12, fontweight="bold")
             else:
                 ax3.set_title("Communication Analysis", fontsize=12, fontweight="bold")
                 ax3.text(0.5, 0.5, "No data yet", ha="center", va="center", transform=ax3.transAxes, fontsize=12, color="gray")
@@ -578,8 +647,15 @@ class TrainingDashboard:
         algo = str(ALGO).lower().strip()
         mode = "light" if LIGHTWEIGHT_MODE else "full"
 
+        # 保存图标题/文件名跟随当前轨迹的 N，而非全局 NUM_FOLLOWERS。
+        traj_n = self._trajectory_num_followers(self.best_trajectory)
+        if traj_n is not None:
+            self._set_title(traj_n)
+        n_label = str(self.current_num_followers) if self.current_num_followers else "?"
+        self._last_progress_fig.suptitle(f"CTDE Training Dashboard (N={n_label} followers)", fontsize=14, fontweight="bold")
+
         if save_path is None:
-            save_path = os.path.join(FIGS_DIR, f"training_progress_{algo}_{NUM_FOLLOWERS}f_{mode}_{ts}.png")
+            save_path = os.path.join(FIGS_DIR, f"training_progress_{algo}_{n_label}f_{mode}_{ts}.png")
         else:
             root, ext = os.path.splitext(save_path)
             ext = ext if ext else ".png"

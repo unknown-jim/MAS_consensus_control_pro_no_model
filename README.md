@@ -152,6 +152,61 @@ results/
 
 ---
 
+### Phase 2：观测 v2 / 拓扑 v2 / 多规模训练与冻结场景评测
+
+#### 观测 v2（`OBS_VERSION=2`）
+
+- Actor 输入固定为 **`10 + 7K`** 维：`K = MAX_NEIGHBORS = TOP_K`，默认 `K=4` → **38 维**。
+- 自状态 10 维 = 本地 7 维 + 角色 3 维；每个邻居槽位 7 维 = 6 个可见特征 + **显式 `valid` 位**。
+- 邻居特征使用**相对坐标/相对广播与估计**（相对自身），含 `age`、`has_leader_est`（代码中的 `has_est` 位）与 `valid`；无效槽位由 `valid=0` 掩码。
+- 注意力对邻居槽位是**置换不变**的（DeepSets/Attention），因此维度与 follower 数 `N` 无关，`ActorOnlyPolicy` 可用同一份 Actor 跑不同 `N`。
+
+#### 拓扑 v2
+
+- 有向广播图：leader 为 index 0，pinned followers 直接收 leader 广播。
+- **控制期望入度**：每个节点按概率 `min(1, 2 / |候选|)` 选邻居，平均入度约为 2。
+- **比例 pinned**：`pinned_mode=normal` 取 15%~30%，`pinned_mode=low` 取 2%~6%。
+- **分层深图**：`depth_mode=deep` 用 `height=max(4, ceil(sqrt(N)))` 构造多层链，并以 BFS 验收（`reachable_count == num_agents`、`layer_counts`、`max_depth`）。
+
+#### 多规模训练
+
+- `TRAIN_FOLLOWER_SCALES = (10, 20, 30)`：每个 block 各覆盖一个规模，MAPPO 共享同一 Actor/Value。
+- 固定规模回退：`train(train_follower_scales=(20,))`。
+- MASAC 的 replay 只支持单一规模，多规模请使用 `ALGO = "MAPPO"`。
+
+#### 冻结场景跨版本评测（`evaluate_scaling.py`）
+
+先生成冻结场景 manifest，再做 v1/v2 门禁与配对评测。CLI 与 `python evaluate_scaling.py --help` 一致：
+
+```bash
+python evaluate_scaling.py --generate-manifest scenes.json --scales 5 20 100 --num-seeds 2
+python evaluate_scaling.py --parity-check --scenario-manifest scenes.json --v1-repo ../baseline --output parity.json
+python evaluate_scaling.py --evaluate --scenario-manifest scenes.json --worker-version v1 \
+  --repo-path ../baseline --training-seed 11 --checkpoint old.pt --output v1.json
+python evaluate_scaling.py --evaluate --scenario-manifest scenes.json \
+  --training-seed 11 --checkpoint new.pt --output v2.json
+python evaluate_scaling.py --compare v1.json v2.json --output report.json --markdown-out report.md
+```
+
+`scenario-manifest` 固定了图、pinned、领导者轨迹与初态，并带 `scenario_sha256`，因此两种版本跑的是同一批场景。
+
+#### 真实 MAPPO 性能剖析（`profile_bottleneck.py`）
+
+```bash
+python profile_bottleneck.py --algo mappo --num-followers 100 --num-envs 48 \
+  --steps 300 --scale-switch-cycles 10 --output mappo_profile.json
+```
+
+该命令走真实 MAPPO 整局（含 session/value 更新），`--scale-switch-cycles 10` 用于覆盖多规模切换。
+
+#### v1 旧权重说明
+
+- v2 入口（`ActorOnlyPolicy.from_checkpoint`、`evaluate_results_models.ipynb`）只接受带 `_obs_version=2` / `_top_k` 的 checkpoint；发现 `pos_embed` 或缺版本标记会明确提示。
+- 评测 v1 旧权重请走冻结场景 worker：`python evaluate_scaling.py --evaluate --scenario-manifest scenes.json --worker-version v1 --repo-path <v1-repo> --training-seed 11 --checkpoint old.pt --output v1.json`。
+- 两种指标口径不同：绘图中的 `avg_error` 是位置 MSE，`mean_tracking_error` 来自环境 `info`，不要直接混用。
+
+---
+
 ### 常见问题（Troubleshooting）
 
 - **训练很慢**：先运行 `python diagnose.py` 确认 CUDA 可用；再用 `python profile_bottleneck.py ...` 看是 env/actor/update 哪块占比高。
