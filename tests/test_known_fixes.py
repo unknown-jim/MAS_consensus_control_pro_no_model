@@ -439,9 +439,15 @@ class TestKnownFixes(unittest.TestCase):
         self.assertEqual(len(agent.buffer), 1)
         with self.assertRaisesRegex(ValueError, "actions"):
             agent.buffer.add(fs1, g1, a1[:, :, :-1], lp1, v1, r1, d1)
-        with self.assertRaisesRegex(ValueError, r"follower_states.*\(4, 20, 33\).*\(3, 20, 33\)"):
+        with self.assertRaisesRegex(
+            ValueError,
+            rf"follower_states.*\(4, {NUM_FOLLOWERS}, {STATE_DIM}\).*\(3, {NUM_FOLLOWERS}, {STATE_DIM}\)",
+        ):
             agent.buffer.add(fs1[:3], g1[:3], a1[:3], lp1[:3], v1[:3], r1[:3], d1[:3])
-        with self.assertRaisesRegex(ValueError, r"local_states.*\(4, 21, 33\).*\(3, 21, 33\)"):
+        with self.assertRaisesRegex(
+            ValueError,
+            rf"local_states.*\(4, {NUM_FOLLOWERS + 1}, {STATE_DIM}\).*\(3, {NUM_FOLLOWERS + 1}, {STATE_DIM}\)",
+        ):
             agent.store_rollout_step(s1[:3], g1[:3], a1[:3], lp1[:3], v1[:3], r1[:3], d1[:3])
         self.assertEqual(len(agent.buffer), 1)
         agent.buffer.clear()
