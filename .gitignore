@@ -3,6 +3,8 @@
 *.txt
 *.png
 *.pt
+!models/
+!models/best_*.pt
 __pycache__/
 .ipynb_checkpoints/
 .Trash-0/

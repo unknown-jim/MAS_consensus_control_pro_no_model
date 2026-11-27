@@ -199,6 +199,11 @@ python profile_bottleneck.py --algo mappo --num-followers 100 --num-envs 48 \
 
 该命令走真实 MAPPO 整局（含 session/value 更新），`--scale-switch-cycles 10` 用于覆盖多规模切换。
 
+#### 仓库内单算法最优权重（`models/best_<algo>.pt`）
+
+- 训练结束后会在固定可复现验证场景上对本次最优与末态 Actor 打分，并维护仓库内单算法唯一最优权重：`models/best_mappo.pt`（MAPPO）或 `models/best_masac.pt`（MASAC）。
+- 若算法与观测协议未变，仅当新权重在相同验证口径下分数严格更高时才会原子替换原文件，避免重复堆积 `.pt`；临时时间戳断点仍在被 `.gitignore` 忽略的 `results/` 目录中。
+
 #### v1 旧权重说明
 
 - v2 入口（`ActorOnlyPolicy.from_checkpoint`、`evaluate_results_models.ipynb`）只接受带 `_obs_version=2` / `_top_k` 的 checkpoint；发现 `pos_embed` 或缺版本标记会明确提示。

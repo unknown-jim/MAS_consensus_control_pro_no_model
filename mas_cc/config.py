@@ -84,6 +84,23 @@ if not RUN_DIR:
     RUN_DIR = _RUN_DIR_DEFAULT
 MODELS_DIR = os.path.join(RUN_DIR, "models")
 FIGS_DIR = os.path.join(RUN_DIR, "figs")
+CANONICAL_MODELS_DIR = os.getenv("CANONICAL_MODELS_DIR", "models").strip() or "models"
+
+
+def canonical_best_model_path(algo: str = ALGO, models_dir: str | None = None) -> str:
+    """返回仓库内单算法唯一最优权重路径（如 models/best_mappo.pt）。"""
+    tag = str(algo).lower().strip()
+    if tag in ("mappo", "ppo", "ctdemappo", "ctde_mappo"):
+        tag = "mappo"
+    elif tag in ("masac", "sac", "ctdesac", "ctde_sac"):
+        tag = "masac"
+    else:
+        raise ValueError(f"Unsupported algorithm for canonical checkpoint: {algo!r}")
+    root = CANONICAL_MODELS_DIR if models_dir is None else str(models_dir)
+    return os.path.join(root, f"best_{tag}.pt")
+
+
+CANONICAL_BEST_MODEL_PATH = canonical_best_model_path(ALGO)
 
 # ==================== 网络拓扑 ====================
 NUM_FOLLOWERS = 20

@@ -154,7 +154,7 @@ class DashboardWiringTest(unittest.TestCase):
             stack.enter_context(mock.patch.object(agents.CTDEMAPPOAgent, "start_episode", record_start))
             stack.enter_context(mock.patch.object(TrainingDashboard, "update_episode", record_update))
             _, _, dashboard = training.train(num_episodes=3, train_follower_scales=(10, 20, 30),
-                                              seed=11, vis_interval=1, show_dashboard=True)
+                                              seed=11, vis_interval=1, show_dashboard=True, canonical_model_path="")
         self.assertEqual(list(zip(training_scales, title_scales)), [(10, 10), (20, 20), (30, 30)])
         self.assertIn("30 followers", dashboard.title_html.value)
 

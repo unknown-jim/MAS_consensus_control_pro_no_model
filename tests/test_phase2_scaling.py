@@ -711,7 +711,7 @@ class TestTrainingAndTrajectory(unittest.TestCase):
             stack.enter_context(patch.object(training, 'collect_trajectory', record_trajectory))
             ui = stack.enter_context(patch('mas_cc.dashboard.TrainingDashboard'))
             agent, topology, dashboard = training.train(num_episodes=6, train_follower_scales=(10, 20, 30),
-                topology_mix=(0., 0., 1.), vis_interval=1, show_dashboard=True)
+                topology_mix=(0., 0., 1.), vis_interval=1, show_dashboard=True, canonical_model_path="")
             self.assertIs(dashboard, ui.return_value)
             dash_graph = ui.call_args.kwargs['topology']
             self.assertEqual(len(starts), 6)

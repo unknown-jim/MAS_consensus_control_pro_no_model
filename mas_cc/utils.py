@@ -19,8 +19,9 @@ import numpy as np
 import torch
 
 from .agent import ActorOnlyPolicy, CTDEMAPPOAgent, CTDESACAgent
-from .config import MAX_STEPS
+from .config import DEVICE, MAX_STEPS
 from .environment import ModelFreeEnv
+from .topology import CommunicationTopology
 
 
 @contextmanager
@@ -146,6 +147,67 @@ def evaluate_agent(agent, env, num_episodes: int = 5):
     }
 
     return out
+
+
+DEFAULT_CANONICAL_EVAL_CASES = (
+    (20, "normal", "shallow", 1000),
+    (50, "low", "deep", 1000),
+)
+
+
+@torch.no_grad()
+def evaluate_canonical_score(
+    agent,
+    *,
+    max_steps: int = MAX_STEPS,
+    cases: tuple[tuple[int, str, str, int], ...] = DEFAULT_CANONICAL_EVAL_CASES,
+) -> dict:
+    """在固定、可复现的验证场景上评估策略，用于比较同算法跨次训练的最优权重。
+
+    不污染全局 NumPy / PyTorch 随机流。
+    """
+    steps = int(max_steps)
+    if steps < 1:
+        raise ValueError(f"max_steps must be positive, got {max_steps}")
+    case_list = tuple((int(n), str(pin), str(depth), int(seed)) for n, pin, depth, seed in cases)
+    if not case_list:
+        raise ValueError("cases must not be empty")
+
+    rewards = []
+    errors = []
+    comms = []
+    devices = [torch.cuda.current_device()] if DEVICE.type == "cuda" else []
+
+    with torch.random.fork_rng(devices=devices), actor_only_inference(agent) as policy:
+        for n, pin_mode, depth_mode, seed in case_list:
+            topo = CommunicationTopology(n, seed=seed, pinned_mode=pin_mode, depth_mode=depth_mode)
+            env = ModelFreeEnv(topo, max_steps=steps, auto_reset=False, randomize_topology_on_reset=False)
+            torch.random.default_generator.manual_seed(seed)
+            if devices:
+                torch.cuda.manual_seed(seed)
+            state = env.reset()
+            ep_reward = 0.0
+            ep_err = 0.0
+            ep_comm = 0.0
+            for _ in range(steps):
+                action = policy.select_action(state, deterministic=True)
+                state, reward, _, info = env.step(action)
+                ep_reward += float(reward)
+                ep_err += float(info["tracking_error"])
+                ep_comm += float(info["comm_rate"])
+            rewards.append(ep_reward)
+            errors.append(ep_err / steps)
+            comms.append(ep_comm / steps)
+
+    sig_parts = [f"n{n}-{pin}-{dep}-s{s}" for n, pin, dep, s in case_list]
+    eval_signature = f"canonical_v1:steps={steps}:" + ",".join(sig_parts)
+    return {
+        "score": float(np.mean(rewards)),
+        "mean_reward": float(np.mean(rewards)),
+        "mean_tracking_error": float(np.mean(errors)),
+        "mean_comm_rate": float(np.mean(comms)),
+        "eval_signature": eval_signature,
+    }
 
 
 def plot_evaluation(agent, topology, num_tests: int = 3, save_path: str | None = None, max_plot_followers: int | None = 5):

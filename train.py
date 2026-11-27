@@ -15,7 +15,7 @@ import torch
 
 from mas_cc.config import (
     NUM_FOLLOWERS, TRAIN_FOLLOWER_SCALES, MAX_STEPS, BATCH_SIZE,
-    NUM_EPISODES, VIS_INTERVAL, SAVE_MODEL_PATH,
+    NUM_EPISODES, VIS_INTERVAL, SAVE_MODEL_PATH, canonical_best_model_path,
     print_config, set_seed, SEED,
     NUM_PARALLEL_ENVS, UPDATE_FREQUENCY, GRADIENT_STEPS,
     USE_AMP, DEVICE, COMM_PENALTY, THRESHOLD_MIN, THRESHOLD_MAX,
@@ -25,8 +25,9 @@ from mas_cc.config import (
 )
 from mas_cc.topology import CommunicationTopology
 from mas_cc.environment import BatchedModelFreeEnv, ModelFreeEnv
-from mas_cc.agent import CTDESACAgent, CTDEMAPPOAgent
-from mas_cc.utils import actor_only_inference, collect_trajectory, plot_evaluation
+from mas_cc.agent import ActorOnlyPolicy, CTDESACAgent, CTDEMAPPOAgent, save_canonical_best_actor
+from mas_cc.networks import DecentralizedActor
+from mas_cc.utils import actor_only_inference, collect_trajectory, evaluate_canonical_score, plot_evaluation
 
 
 torch.backends.cudnn.benchmark = True
@@ -45,6 +46,7 @@ def train(
     profile_timing: bool = False,
     train_follower_scales=TRAIN_FOLLOWER_SCALES,
     topology_mix=(0.50, 0.25, 0.25),
+    canonical_model_path: str | None = None,
 ):
     """运行 CTDE 训练。
 
@@ -114,6 +116,7 @@ def train(
         dashboard.display()
 
     best_reward = -float('inf')
+    best_actor_state = None
     global_step = 0
     
     start_time = time.time()
@@ -211,6 +214,7 @@ def train(
         improved = avg_reward > best_reward
         if improved:
             best_reward = avg_reward
+            best_actor_state = {k: v.detach().cpu().clone() for k, v in agent.actor.state_dict().items()}
             agent.save(SAVE_MODEL_PATH)
 
         trajectory_data = None
@@ -248,6 +252,52 @@ def train(
     
     agent.save_actor(os.path.join(os.path.dirname(SAVE_MODEL_PATH), "final_actor.pt"))
     final_topology = CommunicationTopology.from_frozen(topology.adj, topology.pinned_ids)
+
+    target_canonical = (
+        canonical_best_model_path(ALGO, models_dir=os.getenv("CANONICAL_MODELS_DIR") or None)
+        if canonical_model_path is None
+        else str(canonical_model_path).strip()
+    )
+    if target_canonical:
+        algo_name = "MAPPO" if is_mappo else "MASAC"
+        final_eval = evaluate_canonical_score(agent, max_steps=MAX_STEPS)
+        chosen_actor = agent.actor
+        chosen_eval = final_eval
+        chosen_source = "final"
+
+        if best_actor_state is not None:
+            width = int(agent.actor.local_encoder[0].out_features)
+            peak_actor = DecentralizedActor(hidden_dim=width).to(DEVICE)
+            peak_actor.load_state_dict(best_actor_state, strict=True)
+            peak_policy = ActorOnlyPolicy(peak_actor, use_amp=agent.use_amp)
+            peak_eval = evaluate_canonical_score(peak_policy, max_steps=MAX_STEPS)
+            if peak_eval["score"] > chosen_eval["score"]:
+                chosen_actor = peak_actor
+                chosen_eval = peak_eval
+                chosen_source = "best_episode"
+
+        canon_res = save_canonical_best_actor(
+            target_canonical,
+            chosen_actor,
+            algo_name,
+            score=chosen_eval["score"],
+            eval_signature=chosen_eval["eval_signature"],
+            metrics={
+                "mean_reward": chosen_eval["mean_reward"],
+                "mean_tracking_error": chosen_eval["mean_tracking_error"],
+                "mean_comm_rate": chosen_eval["mean_comm_rate"],
+                "source": chosen_source,
+                "num_episodes": int(num_episodes),
+                "seed": int(seed),
+            },
+        )
+        if canon_res["updated"]:
+            print(f"🏆 Canonical best {algo_name} saved to {canon_res['path']} "
+                  f"({canon_res['reason']}, score={canon_res['new_score']:.2f}, "
+                  f"err={chosen_eval['mean_tracking_error']:.4f}, source={chosen_source})")
+        else:
+            print(f"ℹ️  Canonical best {algo_name} kept at {canon_res['path']} "
+                  f"({canon_res['reason']}, existing={canon_res['previous_score']:.2f} >= new={canon_res['new_score']:.2f})")
 
     elapsed = time.time() - start_time
     print(f"\n{'='*60}")
