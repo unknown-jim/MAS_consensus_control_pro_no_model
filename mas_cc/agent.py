@@ -11,6 +11,7 @@ import math
 import os
 import pickle
 import stat
+import struct
 import tempfile
 import weakref
 import zipfile
@@ -118,6 +119,16 @@ def _to_builtin_primitive(value):
     return None
 
 
+_OOM_TYPES = tuple(
+    exc for exc in (
+        MemoryError,
+        getattr(torch, "OutOfMemoryError", None),
+        getattr(torch.cuda, "OutOfMemoryError", None),
+    )
+    if isinstance(exc, type) and issubclass(exc, BaseException)
+)
+
+
 def _atomic_save_checkpoint(path, actor, algorithm, **training_state):
     path_str = str(path)
     parent = os.path.dirname(path_str) or "."
@@ -137,13 +148,15 @@ def _atomic_save_checkpoint(path, actor, algorithm, **training_state):
         replaced = True
     finally:
         if tmp_file is not None:
-            if not tmp_file.closed:
-                tmp_file.close()
-            if not replaced:
-                try:
-                    os.remove(tmp_file.name)
-                except OSError:
-                    pass
+            try:
+                if not tmp_file.closed:
+                    tmp_file.close()
+            finally:
+                if not replaced:
+                    try:
+                        os.remove(tmp_file.name)
+                    except OSError:
+                        pass
 
 
 def _read_file_bytes_exact(path_str: str) -> bytes:
@@ -152,15 +165,12 @@ def _read_file_bytes_exact(path_str: str) -> bytes:
         expected_size = None
         try:
             fd = f.fileno()
-        except (AttributeError, OSError, io.UnsupportedOperation):
+        except (AttributeError, io.UnsupportedOperation):
             fd = None
         if isinstance(fd, int) and fd >= 0:
-            try:
-                st = os.fstat(fd)
-                if stat.S_ISREG(st.st_mode):
-                    expected_size = int(st.st_size)
-            except OSError:
-                expected_size = None
+            st = os.fstat(fd)
+            if stat.S_ISREG(st.st_mode):
+                expected_size = int(st.st_size)
         chunks = []
         while True:
             chunk = f.read(65536)
@@ -174,7 +184,12 @@ def _read_file_bytes_exact(path_str: str) -> bytes:
 
 
 def _is_corruption_load_error(exc: BaseException) -> bool:
-    if isinstance(exc, (ValueError, EOFError, IndexError, pickle.UnpicklingError, zipfile.BadZipFile, KeyError, TypeError)):
+    if isinstance(exc, _OOM_TYPES):
+        return False
+    if isinstance(
+        exc,
+        (ValueError, EOFError, IndexError, struct.error, pickle.UnpicklingError, zipfile.BadZipFile, KeyError, TypeError),
+    ):
         return True
     if isinstance(exc, RuntimeError):
         msg = str(exc).lower()
@@ -209,8 +224,11 @@ def _actor_weights_complete(weights: dict, actor) -> bool:
             return False
     width = int(actor.local_encoder[0].out_features)
     try:
-        probe = DecentralizedActor(hidden_dim=width)
+        with torch.random.fork_rng(devices=[]):
+            probe = DecentralizedActor(hidden_dim=width)
         probe.load_state_dict(weights, strict=True)
+    except _OOM_TYPES:
+        raise
     except RuntimeError as exc:
         if any(tok in str(exc).lower() for tok in ("memory", "alloc")):
             raise
@@ -360,8 +378,8 @@ def _read_checkpoint(path, *, algorithm=None, hidden_dim=None, map_location=None
         raise ValueError("Legacy pos_embed found; load v1 weights with the v1 evaluation worker")
     for key, expected in (("_obs_version", OBS_VERSION), ("_top_k", TOP_K)):
         value = weights.get(key)
-        if (not isinstance(value, torch.Tensor) or value.shape != () or value.dtype != torch.int64
-                or value.item() != expected):
+        if (not isinstance(value, torch.Tensor) or value.is_meta or value.layout != torch.strided
+                or value.shape != () or value.dtype != torch.int64 or value.item() != expected):
             raise ValueError(f"Expected v2 actor {key}={expected}; select matching weights and TOP_K")
 
     weight = weights.get("local_encoder.0.weight")

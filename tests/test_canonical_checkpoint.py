@@ -310,6 +310,58 @@ class CanonicalCheckpointTests(unittest.TestCase):
                 self.assertEqual(res_bad["reason"], "schema_changed_or_unreadable")
                 ActorOnlyPolicy.from_checkpoint(str(ckpt_path))
 
+    def test_r5_fstat_eio_oom_struct_meta_and_rng_isolation(self):
+        import errno
+        import struct
+
+        actor = DecentralizedActor(hidden_dim=16)
+        with TemporaryDirectory() as tmp:
+            ckpt_path = Path(tmp) / "best_mappo.pt"
+            save_canonical_best_actor(ckpt_path, actor, "MAPPO", score=100.0, eval_signature="sig_v1")
+            healthy_bytes = ckpt_path.read_bytes()
+
+            # 1) 复核时 fstat 报 EIO 必须上抛 OSError，不得降级跳过尺寸校验而覆盖高分原件
+            with patch.object(agents.torch, "load", side_effect=RuntimeError("failed finding central directory")), \
+                 patch.object(agents.os, "fstat", side_effect=OSError(errno.EIO, "I/O error")):
+                with self.assertRaises(OSError):
+                    save_canonical_best_actor(ckpt_path, actor, "MAPPO", score=1.0, eval_signature="sig_v1")
+            self.assertEqual(ckpt_path.read_bytes(), healthy_bytes)
+
+            # 2) Actor 校验阶段遇到 typed torch.OutOfMemoryError("OOM") 必须原样上抛，不覆盖原件
+            oom_cls = getattr(torch, "OutOfMemoryError", MemoryError)
+            with patch.object(agents, "DecentralizedActor", side_effect=oom_cls("OOM")):
+                with self.assertRaises(oom_cls):
+                    save_canonical_best_actor(ckpt_path, actor, "MAPPO", score=1.0, eval_signature="sig_v1")
+            self.assertEqual(ckpt_path.read_bytes(), healthy_bytes)
+
+            # 3) 拒绝低分候选时不污染全局 CPU Torch RNG 状态
+            torch.manual_seed(7101)
+            expected_next = torch.rand(1).item()
+            torch.manual_seed(7101)
+            res_keep = save_canonical_best_actor(ckpt_path, actor, "MAPPO", score=1.0, eval_signature="sig_v1")
+            actual_next = torch.rand(1).item()
+            self.assertFalse(res_keep["updated"])
+            self.assertEqual(actual_next, expected_next)
+
+            # 4) 协议标记为 meta 标量时走 ValueError 恢复，不因 .item() 崩溃
+            bad_meta = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+            bad_meta["actor"]["_obs_version"] = torch.empty((), dtype=torch.int64, device="meta")
+            with patch.object(agents.torch, "load", return_value=bad_meta):
+                res_meta = save_canonical_best_actor(ckpt_path, actor, "MAPPO", score=1.0, eval_signature="sig_v1")
+            self.assertTrue(res_meta["updated"])
+            self.assertEqual(res_meta["reason"], "schema_changed_or_unreadable")
+
+            # 5) 截断旧格式 pickle 抛 struct.error 时可恢复
+            legacy_path = Path(tmp) / "legacy.pt"
+            torch.save({"actor": actor.state_dict()}, legacy_path, _use_new_zipfile_serialization=False)
+            raw_legacy = legacy_path.read_bytes()
+            # 确认截断/struct.error 均可恢复
+            with patch.object(agents.torch, "load", side_effect=struct.error("unpack requires a buffer of 2 bytes")):
+                res_struct = save_canonical_best_actor(ckpt_path, actor, "MAPPO", score=2.0, eval_signature="sig_v1")
+            self.assertTrue(res_struct["updated"])
+            self.assertEqual(res_struct["reason"], "schema_changed_or_unreadable")
+            self.assertGreater(len(raw_legacy), 18)
+
 
 if __name__ == "__main__":
     unittest.main()
