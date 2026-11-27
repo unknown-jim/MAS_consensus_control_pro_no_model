@@ -16,7 +16,9 @@ from mas_cc.config import (
     GAMMA,
     NUM_FOLLOWERS,
     NUM_PINNED,
+    NEIGHBOR_FEAT_DIM,
     PPO_EPOCHS,
+    SELF_STATE_DIM,
     STATE_DIM,
     THRESHOLD_MAX,
     THRESHOLD_MIN,
@@ -53,6 +55,7 @@ class TestKnownFixes(unittest.TestCase):
         actor = DecentralizedActor().to(DEVICE)
         actor.eval()
         states = torch.randn(16, STATE_DIM, device=DEVICE) * 0.2
+        states[:, SELF_STATE_DIM + NEIGHBOR_FEAT_DIM - 1::NEIGHBOR_FEAT_DIM] = 1
         actions, logp_act = actor(states, deterministic=False)
 
         # 默认返回签名兼容
@@ -90,7 +93,8 @@ class TestKnownFixes(unittest.TestCase):
 
                 local_s = env.reset()
                 global_s = env.get_global_state()
-                self.assertGreater(float(local_s[:, 1:, 9:].abs().sum().item()), 0.0)
+                slots = local_s[:, 1:, SELF_STATE_DIM:].unflatten(-1, (-1, NEIGHBOR_FEAT_DIM))
+                self.assertGreater(float(slots[..., :-1].abs().sum().item()), 0.0)
 
                 actions, old_logp, values, pre_v = agent.act(
                     local_s, global_s, deterministic=False, return_pre_squash=True
@@ -755,7 +759,7 @@ class TestKnownFixes(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             ckpt_path = os.path.join(tmpdir, "test_mappo.pt")
-            torch.save({"actor": actor.state_dict()}, ckpt_path)
+            torch.save(actor.state_dict(), ckpt_path)
             reloaded = ActorOnlyPolicy.from_checkpoint(ckpt_path)
             self.assertIsNone(reloaded.value_net)
 

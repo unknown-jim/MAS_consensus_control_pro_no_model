@@ -7,7 +7,16 @@
 
 from __future__ import annotations
 
+import math
+from contextlib import contextmanager
+from functools import wraps
+from numbers import Integral
+from threading import RLock
+
+import numpy as np
 import torch
+
+from .topology import CommunicationTopology, _try_lock
 
 from .config import (
     ACTION_DIM,
@@ -22,7 +31,7 @@ from .config import (
     FOLLOWER_INIT_POS_STD_RANGE,
     FOLLOWER_INIT_VEL_STD,
     FOLLOWER_INIT_VEL_STD_RANGE,
-    GLOBAL_STATE_DIM,
+    global_state_dim_for,
     GLOBAL_STATE_INCLUDE_BROADCAST,
     GLOBAL_STATE_INCLUDE_LEADER_PARAMS,
     GLOBAL_STATE_INCLUDE_TIME,
@@ -37,11 +46,10 @@ from .config import (
     LEADER_PHASE,
     LEADER_PHASE_RANGE,
     LEADER_TRAJECTORY_TYPES,
-    LOCAL_OBS_DIM,
+    OBS_AGE_CAP,
     MAX_NEIGHBORS,
     MAX_STEPS,
     NEIGHBOR_FEAT_DIM,
-    NUM_AGENTS,
     POS_LIMIT,
     RANDOMIZE_FOLLOWER,
     RANDOMIZE_LEADER,
@@ -60,6 +68,14 @@ from .config import (
 )
 
 
+def _environment_write(method):
+    @wraps(method)
+    def guarded(self, *args, **kwargs):
+        with self._write_access():
+            return method(self, *args, **kwargs)
+    return guarded
+
+
 class BatchedModelFreeEnv:
     """无模型并行环境（CTDE 版本）。
 
@@ -74,9 +90,16 @@ class BatchedModelFreeEnv:
         - `get_global_state()` 返回全局状态（给 centralized critic/value 用）。
     """
 
-    def __init__(self, topology, num_envs: int = 64):
+    def __init__(self, topology, num_envs: int = 64, *, auto_reset=True,
+                 randomize_topology_on_reset=RANDOMIZE_TOPOLOGY, fixed_scenario=None,
+                 max_steps=MAX_STEPS):
         self.topology = topology
         self.num_envs = int(num_envs)
+        if self.num_envs < 1:
+            raise ValueError("num_envs must be positive")
+        if not isinstance(max_steps, Integral) or isinstance(max_steps, bool) or max_steps < 1:
+            raise ValueError("max_steps must be a positive integer")
+        self.max_steps = int(max_steps)
         self.num_agents = topology.num_agents
         self.num_followers = topology.num_followers
         self.leader_id = topology.leader_id
@@ -97,7 +120,12 @@ class BatchedModelFreeEnv:
 
         self.randomize_leader = RANDOMIZE_LEADER
         self.randomize_follower = RANDOMIZE_FOLLOWER
-        self.randomize_topology = RANDOMIZE_TOPOLOGY
+        self.randomize_topology = randomize_topology_on_reset
+        self.episode_gen = self._graph_rev = self.frame_rev = 0
+        self._episode_start_frame = None
+        self._mutation_lock = RLock()
+        self._operation_owner = None
+        self._fixed_scenario = None
 
         self.amplitude_range = LEADER_AMPLITUDE_RANGE
         self.omega_range = LEADER_OMEGA_RANGE
@@ -121,8 +149,6 @@ class BatchedModelFreeEnv:
         self.info_gain_scale = float(INFO_GAIN_SCALE)
 
         self.v_scale = float(V_SCALE)
-
-        self._precompute_neighbor_indices()
 
         self.positions = torch.zeros(self.num_envs, self.num_agents, device=DEVICE)
         self.velocities = torch.zeros(self.num_envs, self.num_agents, device=DEVICE)
@@ -158,14 +184,44 @@ class BatchedModelFreeEnv:
         self._threshold_min = float(THRESHOLD_MIN)
         self._threshold_max = float(THRESHOLD_MAX)
 
-        self._state_buffer = torch.zeros(self.num_envs, self.num_agents, STATE_DIM, device=DEVICE)
+        self.state_dim = STATE_DIM
 
         # 评估场景支持任意 `num_agents`：全局状态维度与 buffer 按 topology 动态分配
-        self.global_state_dim = int(self._compute_global_state_dim(self.num_agents))
+        self.global_state_dim = global_state_dim_for(self.num_followers)
         self._global_state_buffer = torch.zeros(self.num_envs, self.global_state_dim, device=DEVICE)
 
-        self.reset()
+        if fixed_scenario is None:
+            self._precompute_neighbor_indices()
+        else:
+            self.install_scenario(fixed_scenario)
+        if auto_reset:
+            self.reset()
 
+    @contextmanager
+    def _session_operation(self, owner):
+        """同时占用当前环境和图，防止采集/更新中途换图，包括 forward hook 重入。"""
+        with _try_lock(self._mutation_lock), _try_lock(self.topology._mutation_lock):
+            self._operation_owner = owner
+            try:
+                yield
+            finally:
+                self._operation_owner = None
+
+    @contextmanager
+    def _write_access(self, owner=None):
+        with _try_lock(self._mutation_lock):
+            if self._operation_owner is not owner:
+                raise RuntimeError("Active collection/update owns the environment")
+            yield
+
+    @property
+    def graph_rev(self):
+        # 调用方可直接 randomize 同一张图；即使邻居缓存尚未刷新也要暴露该变更。
+        if getattr(self, "_precomputed_topology", None) is self.topology:
+            return self._graph_rev + self.topology.revision - self._precomputed_revision
+        return self._graph_rev
+
+    @_environment_write
     def _precompute_neighbor_indices(self, verbose: bool = True):
         """预计算每个智能体的候选入邻居索引。
 
@@ -179,8 +235,9 @@ class BatchedModelFreeEnv:
         self._neighbor_indices_list = []
         self._neighbor_counts = torch.zeros(self.num_agents, dtype=torch.long, device=DEVICE)
 
+        adj = self.topology.adj_matrix.to(DEVICE)
         for i in range(self.num_agents):
-            can_receive_mask = self.topology.adj_matrix[i, :] > 0
+            can_receive_mask = adj[i, :] > 0
             indices = torch.where(can_receive_mask)[0]
 
             self._neighbor_indices_list.append(indices)
@@ -204,11 +261,15 @@ class BatchedModelFreeEnv:
 
         # 方案(2)：预计算每个智能体的出度（是否有下游节点能接收自己的广播）
         # out_degree[i] = 有多少 j 满足 adj_matrix[j, i] > 0（即 j 能接收 i 的广播）
-        self._out_degree = (self.topology.adj_matrix > 0).sum(dim=0).to(device=DEVICE)  # shape=(A,)
+        self._out_degree = (adj > 0).sum(dim=0).to(device=DEVICE)  # shape=(A,)
         # 叶子节点 mask（出度为 0 的 follower）：这些节点禁用 age 保底触发
         self._is_leaf_follower = self._out_degree[1:] == 0  # shape=(F,)
 
         self._precompute_role_info()
+        self._graph_rev = max(self._graph_rev + 1, self.graph_rev)
+        self._episode_start_frame = None
+        self._precomputed_topology = self.topology
+        self._precomputed_revision = self.topology.revision
 
         if verbose:
             print("📊 Precomputed neighbor indices:")
@@ -238,16 +299,16 @@ class BatchedModelFreeEnv:
             omega = self.leader_omega
             phase = self.leader_phase
             type_ids = self.trajectory_type_ids
-            num_envs = self.num_envs
         else:
             amplitude = self.leader_amplitude[env_ids]
             omega = self.leader_omega[env_ids]
             phase = self.leader_phase[env_ids]
             type_ids = self.trajectory_type_ids[env_ids]
-            num_envs = int(env_ids.numel()) if isinstance(env_ids, torch.Tensor) else int(len(env_ids))
+        return self._trajectory_state(t, amplitude, omega, phase, type_ids)
 
-        pos = torch.zeros(num_envs, device=DEVICE)
-        vel = torch.zeros(num_envs, device=DEVICE)
+    def _trajectory_state(self, t, amplitude, omega, phase, type_ids):
+        pos = torch.zeros_like(t)
+        vel = torch.zeros_like(t)
 
         sine_mask = type_ids == self.type_to_id.get("sine", 0)
         if sine_mask.any():
@@ -317,25 +378,6 @@ class BatchedModelFreeEnv:
         self.positions[env_ids, 1:] = leader_pos.unsqueeze(1) + pos_offset
         self.velocities[env_ids, 1:] = leader_vel.unsqueeze(1) + vel_offset
 
-    @staticmethod
-    def _compute_global_state_dim(num_agents: int) -> int:
-        """根据 `get_global_state()` 的拼接顺序动态计算全局状态维度。
-
-        目的：让评估时可以把 `num_agents` 设置得很大，而不会因为 `GLOBAL_STATE_DIM`
-        是训练时固定常量导致 buffer 越界。
-        """
-        n = int(num_agents)
-        dim = 2 * n
-        if bool(GLOBAL_STATE_INCLUDE_BROADCAST):
-            dim += 2 * n
-        if bool(GLOBAL_STATE_INCLUDE_LEADER_PARAMS):
-            dim += 3
-        if bool(GLOBAL_STATE_INCLUDE_TRAJ_TYPE):
-            dim += len(LEADER_TRAJECTORY_TYPES)
-        if bool(GLOBAL_STATE_INCLUDE_TIME):
-            dim += 1
-        return int(dim)
-
     def get_global_state(self):
         """构造 CTDE 的全局状态。
 
@@ -376,44 +418,107 @@ class BatchedModelFreeEnv:
             offset += k
 
         if GLOBAL_STATE_INCLUDE_TIME:
-            denom = float(MAX_STEPS) * float(DT) + 1e-8
+            denom = float(self.max_steps) * float(DT) + 1e-8
             self._global_state_buffer[:, offset] = (self.t / denom).clamp(0.0, 1.0)
             offset += 1
 
         return self._global_state_buffer.clone()
 
-    def reset(self, env_ids=None):
-        """重置环境并返回本地状态。
+    @_environment_write
+    def install_scenario(self, scenario):
+        """安装供后续 reset 复用的场景；reset(scenario=...) 同时返回其首帧。
 
-        Args:
-            env_ids: 需要重置的环境 id（Tensor 或 list）。若为 None 则重置全部环境。
-
-        Returns:
-            本地状态张量，shape=(E, num_agents, STATE_DIM)。
+        adj_matrix/pinned_ids 定义共享图。trajectory_type 为名称，leader_amplitude、
+        leader_omega、leader_phase 可为标量或 E 行。initial_positions/initial_velocities
+        为 follower 的 N 列或含 leader 的 N+1 列，可在 E 个环境间广播。
         """
+        if scenario.get("leader_id", 0) != 0:
+            raise ValueError("Frozen scenarios require leader_id=0")
+        graph = CommunicationTopology.from_frozen(scenario["adj_matrix"], scenario["pinned_ids"],
+                                                  device=DEVICE)
+        if graph.num_followers != self.num_followers:
+            raise ValueError("scenario topology must match environment follower count")
+
+        def rows(name):
+            value = torch.as_tensor(scenario[name], dtype=self.positions.dtype, device=DEVICE)
+            if value.ndim > 1 or value.numel() not in (1, self.num_envs) or not value.isfinite().all():
+                raise ValueError(f"{name} must be finite and broadcast to num_envs rows")
+            return value.expand(self.num_envs).clone()
+
+        types = scenario["trajectory_type"]
+        if isinstance(types, str):
+            types = [types] * self.num_envs
+        if len(types) != self.num_envs or any(name not in self.type_to_id for name in types):
+            raise ValueError("trajectory_type must specify a supported name for each environment")
+        fixed = {name: rows(name) for name in ("leader_amplitude", "leader_omega", "leader_phase")}
+        fixed["trajectory_type_ids"] = torch.tensor([self.type_to_id[t] for t in types], device=DEVICE)
+        leaders = self._trajectory_state(torch.zeros_like(self.t), fixed["leader_amplitude"],
+                                        fixed["leader_omega"], fixed["leader_phase"],
+                                        fixed["trajectory_type_ids"])
+        for name, leader in zip(("initial_positions", "initial_velocities"), leaders):
+            value = torch.as_tensor(scenario[name], dtype=self.positions.dtype, device=DEVICE)
+            if (value.ndim not in (1, 2) or value.shape[-1] not in (self.num_agents, self.num_followers)
+                    or (value.ndim == 2 and value.shape[0] not in (1, self.num_envs))
+                    or not value.isfinite().all()):
+                raise ValueError(f"{name} must contain finite N or N+1 columns")
+            value = value.expand(self.num_envs, -1)
+            if value.shape[-1] == self.num_agents:
+                if not torch.allclose(value[:, 0], leader):
+                    raise ValueError(f"{name} leader column disagrees with trajectory at t=0")
+                value = value[:, 1:]
+            fixed[name] = value.clone()
+        self._graph_rev = self.graph_rev
+        self.topology = graph
+        self._fixed_scenario = fixed
+        self._precompute_neighbor_indices(verbose=False)
+
+    def _reset_ids(self, env_ids):
         if env_ids is None:
-            env_ids = torch.arange(self.num_envs, device=DEVICE)
+            return torch.arange(self.num_envs, device=DEVICE)
+        if isinstance(env_ids, (list, tuple)) and any(
+            isinstance(i, (bool, np.bool_)) or not isinstance(i, Integral) for i in env_ids
+        ):
+            raise ValueError("env_ids must be a sequence of integer indices")
+        try:
+            ids = torch.as_tensor(env_ids, device=DEVICE)
+        except (TypeError, RuntimeError, ValueError) as exc:
+            raise ValueError("env_ids must be a sequence of integer indices") from exc
+        if ids.ndim != 1 or ids.dtype == torch.bool or ids.is_floating_point() or ids.is_complex():
+            raise ValueError("env_ids must be a 1D sequence of integer indices")
+        ids = ids.long()
+        if ((ids < 0) | (ids >= self.num_envs)).any() or ids.unique().numel() != ids.numel():
+            raise ValueError("env_ids must be unique and within [0, num_envs)")
+        return ids
 
-        if isinstance(env_ids, torch.Tensor):
-            num_reset = int(env_ids.numel())
-        else:
-            num_reset = int(len(env_ids))
+    @_environment_write
+    def reset(self, env_ids=None, *, scenario=None):
+        """完整或按行重置。整图只在完整且允许随机化的 reset 时重新采样。"""
+        env_ids = self._reset_ids(env_ids)
+        num_reset = env_ids.numel()
+        full_reset = num_reset == self.num_envs
+        if scenario is not None:
+            if not full_reset:
+                raise ValueError("Installing a scenario requires a full reset")
+            self.install_scenario(scenario)
 
-        self.t[env_ids] = 0.0
-
-        # 仅当重置全部环境时随机化拓扑
-        if self.randomize_topology and num_reset == self.num_envs:
+        if full_reset and self.randomize_topology and not self.topology.fixed:
             self._randomize_topology()
-
-        if self.randomize_leader:
+        fixed = self._fixed_scenario
+        if fixed is not None:
+            for name in ("leader_amplitude", "leader_omega", "leader_phase", "trajectory_type_ids"):
+                getattr(self, name)[env_ids] = fixed[name][env_ids]
+        elif self.randomize_leader:
             self._randomize_leader_dynamics(env_ids)
 
+        self.t[env_ids] = 0.
         leader_pos, leader_vel = self._leader_state_batch(self.t[env_ids], env_ids)
-
         self.positions[env_ids, 0] = leader_pos
         self.velocities[env_ids, 0] = leader_vel
 
-        if self.randomize_follower:
+        if fixed is not None:
+            self.positions[env_ids, 1:] = fixed["initial_positions"][env_ids]
+            self.velocities[env_ids, 1:] = fixed["initial_velocities"][env_ids]
+        elif self.randomize_follower:
             self._randomize_follower_init(env_ids, leader_pos, leader_vel)
         else:
             init_pos_std = float(FOLLOWER_INIT_POS_STD)
@@ -429,22 +534,10 @@ class BatchedModelFreeEnv:
 
         self.leader_seq[env_ids] = 0
 
-        can_receive_leader = self.topology.adj_matrix[:, self.leader_id] > 0
-        if isinstance(can_receive_leader, torch.Tensor):
-            can_receive_leader = can_receive_leader.to(device=DEVICE)
-        can_receive_leader[self.leader_id] = True
-
-        self.leader_est_pos[env_ids].zero_()
-        self.leader_est_vel[env_ids].zero_()
-        self.leader_est_seq[env_ids].fill_(-1)
-
-        mask = can_receive_leader.unsqueeze(0).expand(num_reset, -1)
-        leader_pos_full = leader_pos.unsqueeze(1).expand(num_reset, self.num_agents)
-        leader_vel_full = leader_vel.unsqueeze(1).expand(num_reset, self.num_agents)
-
-        self.leader_est_pos[env_ids] = torch.where(mask, leader_pos_full, self.leader_est_pos[env_ids])
-        self.leader_est_vel[env_ids] = torch.where(mask, leader_vel_full, self.leader_est_vel[env_ids])
-        self.leader_est_seq[env_ids] = torch.where(mask, torch.zeros_like(self.leader_est_seq[env_ids]), self.leader_est_seq[env_ids])
+        known = self._role_ids != 2
+        self.leader_est_pos[env_ids] = torch.where(known, self.positions[env_ids, :1], 0.)
+        self.leader_est_vel[env_ids] = torch.where(known, self.velocities[env_ids, :1], 0.)
+        self.leader_est_seq[env_ids] = torch.where(known, 0, -1)
 
         self.last_broadcast_leader_pos[env_ids] = self.leader_est_pos[env_ids]
         self.last_broadcast_leader_vel[env_ids] = self.leader_est_vel[env_ids]
@@ -458,116 +551,61 @@ class BatchedModelFreeEnv:
         # 重置 since_leader_update 计数器
         self._since_leader_update[env_ids] = 0
 
+        self.frame_rev += 1
+        if full_reset:
+            self.episode_gen += 1
+            self._episode_start_frame = self.frame_rev
         return self._get_state_optimized()
 
+    @_environment_write
     def _randomize_topology(self):
         self.topology.randomize()
         self._precompute_neighbor_indices(verbose=False)
 
     def _get_state_optimized(self):
-        self._state_buffer.zero_()
+        """v2 相对观测。并列排序键为 (-seq, -abs(dx), dx, dv, d_est_x, d_est_v)。"""
+        def encoded_age(seq, clock):
+            delta = (clock - seq).clamp(0, OBS_AGE_CAP)
+            age = torch.log1p(delta.float()) / math.log1p(OBS_AGE_CAP)
+            return torch.where(seq >= 0, age, 1.)
 
-        self._state_buffer[:, :, 0] = self.positions / self.pos_limit
-        self._state_buffer[:, :, 1] = self.velocities / self.vel_limit
+        x, v = self.positions, self.velocities
+        p_scale, v_scale = 2 * self.pos_limit, 2 * self.vel_limit
+        clock = self.leader_seq[:, None]
+        known = self.leader_est_seq >= 0
+        local = torch.stack((
+            v / self.vel_limit,
+            (x - self.last_broadcast_pos) / p_scale,
+            (v - self.last_broadcast_vel) / v_scale,
+            torch.where(known, (self.leader_est_pos - x) / p_scale, 0.),
+            torch.where(known, (self.leader_est_vel - v) / v_scale, 0.),
+            encoded_age(self.leader_est_seq, clock), known
+        ), dim=-1)
 
-        denom_steps = float(MAX_STEPS) if float(MAX_STEPS) > 0 else 1.0
+        idx = self._padded_neighbor_indices
+        valid = self._neighbor_valid_mask.expand(self.num_envs, -1, -1)
+        seq = self.last_broadcast_leader_seq[:, idx]
+        dx = (self.last_broadcast_pos[:, idx] - x.unsqueeze(-1)) / p_scale
+        dv = (self.last_broadcast_vel[:, idx] - v.unsqueeze(-1)) / v_scale
+        est_x = (self.last_broadcast_leader_pos[:, idx] - x.unsqueeze(-1)) / p_scale
+        est_v = (self.last_broadcast_leader_vel[:, idx] - v.unsqueeze(-1)) / v_scale
+        has_est = seq >= 0
+        est_x = torch.where(has_est, est_x, 0.)
+        est_v = torch.where(has_est, est_v, 0.)
+        features = torch.stack((dx, dv, est_x, est_v, encoded_age(seq, clock.unsqueeze(-1)),
+                                has_est, valid), dim=-1)
+        features = features.masked_fill(~valid.unsqueeze(-1), 0.)
 
-        leader_pos_norm = self.leader_est_pos / self.pos_limit
-        leader_vel_norm = self.leader_est_vel / self.vel_limit
-
-        seq = self.leader_est_seq
-        seq_norm = torch.clamp(seq.float() / denom_steps, 0.0, 1.0)
-
-        age = torch.where(
-            seq >= 0,
-            (self.leader_seq.unsqueeze(1) - seq).clamp(min=0).float(),
-            torch.full_like(seq_norm, denom_steps),
-        )
-        age_norm = torch.clamp(age / denom_steps, 0.0, 1.0)
-
-        self._state_buffer[:, :, 2] = leader_pos_norm
-        self._state_buffer[:, :, 3] = leader_vel_norm
-        self._state_buffer[:, :, 4] = seq_norm
-        self._state_buffer[:, :, 5] = age_norm
-
-        self._state_buffer[:, :, LOCAL_OBS_DIM:LOCAL_OBS_DIM + SELF_ROLE_DIM] = self._role_onehot.unsqueeze(0)
-
-        neighbor_start = LOCAL_OBS_DIM + SELF_ROLE_DIM
-
-        broadcast_pos_norm = self.last_broadcast_pos / self.pos_limit
-        broadcast_vel_norm = self.last_broadcast_vel / self.vel_limit
-
-        b_leader_pos_norm = self.last_broadcast_leader_pos / self.pos_limit
-        b_leader_vel_norm = self.last_broadcast_leader_vel / self.vel_limit
-
-        b_seq = self.last_broadcast_leader_seq
-        b_seq_safe = torch.where(b_seq >= 0, b_seq.float(), torch.zeros_like(b_seq.float()))
-        b_seq_norm = torch.clamp(b_seq_safe / denom_steps, 0.0, 1.0)
-
-        b_age = torch.where(
-            b_seq >= 0,
-            (self.leader_seq.unsqueeze(1) - b_seq).clamp(min=0).float(),
-            torch.full_like(b_seq_norm, denom_steps),
-        )
-        b_age_norm = torch.clamp(b_age / denom_steps, 0.0, 1.0)
-
-        # 候选邻居集合（全量入邻居），以及有效 mask
-        padded_idx = self._padded_neighbor_indices
-        valid_mask = self._neighbor_valid_mask
-
-        idx = padded_idx.unsqueeze(0).expand(self.num_envs, -1, -1)   # (E, A, Kcand)
-        valid = valid_mask.unsqueeze(0).expand(self.num_envs, -1, -1) # (E, A, Kcand)
-
-        candidate_k = int(padded_idx.shape[1])
-        idx_flat = idx.reshape(self.num_envs, -1)  # (E, A*kcand)
-
-        # 先抽取“候选邻居”的特征（不直接写入观测；后面按 age 选 Top-K）
-        cand_pos = broadcast_pos_norm.gather(1, idx_flat).view(self.num_envs, self.num_agents, candidate_k)
-        cand_vel = broadcast_vel_norm.gather(1, idx_flat).view(self.num_envs, self.num_agents, candidate_k)
-
-        cand_leader_pos = b_leader_pos_norm.gather(1, idx_flat).view(self.num_envs, self.num_agents, candidate_k)
-        cand_leader_vel = b_leader_vel_norm.gather(1, idx_flat).view(self.num_envs, self.num_agents, candidate_k)
-        cand_leader_seq = b_seq_norm.gather(1, idx_flat).view(self.num_envs, self.num_agents, candidate_k)
-        cand_leader_age = b_age_norm.gather(1, idx_flat).view(self.num_envs, self.num_agents, candidate_k)
-
-        # 按 “leader_age 越小越新鲜” 选 Top-K（K = MAX_NEIGHBORS），无效槽位置为极大避免被选中
-        age_for_sort = cand_leader_age.clone()
-        age_for_sort = torch.where(valid, age_for_sort, torch.full_like(age_for_sort, 1e9))
-
-        # torch.topk 支持 largest=False 取最小的 K 个
-        _, topk_idx = torch.topk(age_for_sort, k=int(MAX_NEIGHBORS), dim=2, largest=False)
-
-        # 把 Top-K 特征按新鲜度顺序 gather 出来
-        neighbor_pos = cand_pos.gather(2, topk_idx)
-        neighbor_vel = cand_vel.gather(2, topk_idx)
-
-        neighbor_leader_pos = cand_leader_pos.gather(2, topk_idx)
-        neighbor_leader_vel = cand_leader_vel.gather(2, topk_idx)
-        neighbor_leader_seq = cand_leader_seq.gather(2, topk_idx)
-        neighbor_leader_age = cand_leader_age.gather(2, topk_idx)
-
-        # 把对应的有效位也 gather 过来，确保“没有足够邻居”时其余槽位为 0
-        selected_valid = valid.gather(2, topk_idx)
-        valid_f = selected_valid.to(dtype=neighbor_pos.dtype)
-
-        neighbor_pos = neighbor_pos * valid_f
-        neighbor_vel = neighbor_vel * valid_f
-        neighbor_leader_pos = neighbor_leader_pos * valid_f
-        neighbor_leader_vel = neighbor_leader_vel * valid_f
-        neighbor_leader_seq = neighbor_leader_seq * valid_f
-        neighbor_leader_age = neighbor_leader_age * valid_f
-
-        neighbor_feat = self._state_buffer[:, :, neighbor_start:].view(
-            self.num_envs, self.num_agents, int(MAX_NEIGHBORS), int(NEIGHBOR_FEAT_DIM)
-        )
-        neighbor_feat[:, :, :, 0] = neighbor_pos
-        neighbor_feat[:, :, :, 1] = neighbor_vel
-        neighbor_feat[:, :, :, 2] = neighbor_leader_pos
-        neighbor_feat[:, :, :, 3] = neighbor_leader_vel
-        neighbor_feat[:, :, :, 4] = neighbor_leader_seq
-        neighbor_feat[:, :, :, 5] = neighbor_leader_age
-
-        return self._state_buffer.clone()
+        # 稳定的多键排序，从最低优先级开始；完全相同的消息可互换。
+        seq = torch.where(valid, seq, -2)
+        order = est_v.argsort(dim=-1, stable=True)
+        for key, descending in ((est_x, False), (dv, False), (dx, False),
+                                (dx.abs(), True), (seq, True)):
+            rank = key.gather(-1, order).argsort(dim=-1, stable=True, descending=descending)
+            order = order.gather(-1, rank)
+        selected = order[..., :MAX_NEIGHBORS, None].expand(-1, -1, -1, NEIGHBOR_FEAT_DIM)
+        neighbors = features.gather(2, selected).flatten(2)
+        return torch.cat((local, self._role_onehot.expand(self.num_envs, -1, -1), neighbors), dim=-1)
 
     def _scale_reward_batch(self, reward: torch.Tensor):
         if self.use_soft_scaling:
@@ -577,7 +615,7 @@ class BatchedModelFreeEnv:
             return mid + scale * torch.tanh(normalized)
         return torch.clamp(reward, self.reward_min, self.reward_max)
 
-    def step(self, action: torch.Tensor):
+    def step(self, action: torch.Tensor, *, _session=None):
         """推进一步环境动力学与通信触发。
 
         Args:
@@ -593,6 +631,11 @@ class BatchedModelFreeEnv:
             dones: shape=(E,)（当前实现不提前终止，主要由训练端做时间截断）
             infos: 诊断信息字典（tracking_error/comm_rate 等）
         """
+        with self._write_access(_session):
+            return self._step(action)
+
+    def _step(self, action):
+        self.frame_rev += 1
         self.t += DT
 
         leader_pos, leader_vel = self._leader_state_batch(self.t)
@@ -782,11 +825,14 @@ class ModelFreeEnv:
     - `step()` -> reward/done 返回标量
     """
 
-    def __init__(self, topology):
-        self.batched_env = BatchedModelFreeEnv(topology, num_envs=1)
-        self.topology = topology
+    def __init__(self, topology, **env_options):
+        self.batched_env = BatchedModelFreeEnv(topology, num_envs=1, **env_options)
         self.num_agents = topology.num_agents
         self.num_followers = topology.num_followers
+
+    @property
+    def topology(self):
+        return self.batched_env.topology
 
     @property
     def positions(self):
@@ -811,8 +857,8 @@ class ModelFreeEnv:
     def get_global_state(self):
         return self.batched_env.get_global_state()[0]
 
-    def reset(self):
-        state = self.batched_env.reset()
+    def reset(self, *, scenario=None):
+        state = self.batched_env.reset(scenario=scenario)
         return state[0]
 
     def step(self, action: torch.Tensor):

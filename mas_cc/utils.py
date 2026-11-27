@@ -10,39 +10,32 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from copy import deepcopy
 import os
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from .config import DEVICE, MAX_STEPS
+from .agent import ActorOnlyPolicy, CTDEMAPPOAgent, CTDESACAgent
+from .config import MAX_STEPS
 from .environment import ModelFreeEnv
 
 
-def _set_eval_for_inference(agent):
-    """在评估/可视化阶段临时切换到 eval 模式。
-
-    Args:
-        agent: 智能体实例，需至少包含 `actor`；若包含 `value_net` 也会一并处理。
-
-    Returns:
-        一个无参函数，调用后会把模块的 train/eval 状态恢复到进入本函数之前的状态。
-    """
-
-    modules = [(agent.actor, bool(agent.actor.training))]
-    value_net = getattr(agent, "value_net", None)
-    if value_net is not None:
-        modules.append((value_net, bool(value_net.training)))
-
-    for m, _ in modules:
-        m.eval()
-
-    def _restore():
-        for m, was_training in modules:
-            m.train(was_training)
-
-    return _restore
+@contextmanager
+def actor_only_inference(agent):
+    """暂时共享 actor 权重，并保留 MAPPO 逐层关闭 dropout 的训练状态。"""
+    modes = [(module, module.training) for module in agent.actor.modules()]
+    try:
+        if isinstance(agent, (CTDEMAPPOAgent, CTDESACAgent)):
+            yield ActorOnlyPolicy(agent.actor, use_amp=agent.use_amp)
+        else:
+            agent.actor.eval()
+            yield agent
+    finally:
+        for module, training in modes:
+            module.training = training
 
 
 @torch.no_grad()
@@ -56,6 +49,7 @@ def collect_trajectory(agent, env, max_steps: int = MAX_STEPS):
 
     Returns:
         轨迹字典，包含：
+        - `num_followers/pinned_ids/topology_stats`: 本轨迹的拓扑快照
         - `times`: shape=(T+1,)
         - `leader_pos/leader_vel`: shape=(T+1,)
         - `follower_pos/follower_vel`: shape=(T+1, num_followers)
@@ -63,38 +57,41 @@ def collect_trajectory(agent, env, max_steps: int = MAX_STEPS):
         - `theta_norms`: shape=(T, num_followers)（智能体输出的阈值归一化值）
     """
 
-    restore = _set_eval_for_inference(agent)
     state = env.reset()
 
     times = [0]
     leader_pos = [env.positions[0].item()]
     leader_vel = [env.velocities[0].item()]
-    follower_pos = [env.positions[1:].cpu().numpy()]
-    follower_vel = [env.velocities[1:].cpu().numpy()]
+    follower_pos = [env.positions[1:].cpu().numpy().copy()]
+    follower_vel = [env.velocities[1:].cpu().numpy().copy()]
 
     comm_rates = []
     theta_norms = []
 
-    for _ in range(int(max_steps)):
-        if state.dim() == 1:
-            state = state.unsqueeze(0)
+    with actor_only_inference(agent) as policy:
+        for _ in range(int(max_steps)):
+            if state.dim() == 1:
+                state = state.unsqueeze(0)
 
-        action = agent.select_action(state, deterministic=True)
-        state, _, _, info = env.step(action)
+            action = policy.select_action(state, deterministic=True)
+            state, _, _, info = env.step(action)
 
-        times.append(env.t)
-        leader_pos.append(env.positions[0].item())
-        leader_vel.append(env.velocities[0].item())
-        follower_pos.append(env.positions[1:].cpu().numpy())
-        follower_vel.append(env.velocities[1:].cpu().numpy())
+            times.append(env.t)
+            leader_pos.append(env.positions[0].item())
+            leader_vel.append(env.velocities[0].item())
+            follower_pos.append(env.positions[1:].cpu().numpy().copy())
+            follower_vel.append(env.velocities[1:].cpu().numpy().copy())
 
-        comm_rates.append(info["comm_rate"])
+            comm_rates.append(info["comm_rate"])
 
-        # 阈值归一化值直接从 action 获取
-        theta_norm = action[:, 1].clamp(0.0, 1.0)
-        theta_norms.append(theta_norm.cpu().numpy())
+            # 阈值归一化值直接从 action 获取
+            theta_norm = action[:, 1].clamp(0.0, 1.0)
+            theta_norms.append(theta_norm.cpu().numpy().copy())
 
     out = {
+        "num_followers": env.num_followers,
+        "pinned_ids": list(env.topology.pinned_ids),
+        "topology_stats": deepcopy(env.topology.stats),
         "times": np.array(times),
         "leader_pos": np.array(leader_pos),
         "leader_vel": np.array(leader_vel),
@@ -104,7 +101,6 @@ def collect_trajectory(agent, env, max_steps: int = MAX_STEPS):
         "theta_norms": np.array(theta_norms),
     }
 
-    restore()
     return out
 
 
@@ -121,26 +117,26 @@ def evaluate_agent(agent, env, num_episodes: int = 5):
         指标字典：`mean_reward/std_reward/mean_tracking_error/mean_comm_rate`。
     """
 
-    restore = _set_eval_for_inference(agent)
     results = {"rewards": [], "tracking_errors": [], "comm_rates": []}
 
-    for _ in range(int(num_episodes)):
-        state = env.reset()
-        episode_reward = 0
-        episode_tracking_err = 0
-        episode_comm = 0
+    with actor_only_inference(agent) as policy:
+        for _ in range(int(num_episodes)):
+            state = env.reset()
+            episode_reward = 0
+            episode_tracking_err = 0
+            episode_comm = 0
 
-        for _ in range(int(MAX_STEPS)):
-            action = agent.select_action(state, deterministic=True)
-            state, reward, _, info = env.step(action)
+            for _ in range(int(MAX_STEPS)):
+                action = policy.select_action(state, deterministic=True)
+                state, reward, _, info = env.step(action)
 
-            episode_reward += reward
-            episode_tracking_err += info["tracking_error"]
-            episode_comm += info["comm_rate"]
+                episode_reward += reward
+                episode_tracking_err += info["tracking_error"]
+                episode_comm += info["comm_rate"]
 
-        results["rewards"].append(episode_reward)
-        results["tracking_errors"].append(episode_tracking_err / MAX_STEPS)
-        results["comm_rates"].append(episode_comm / MAX_STEPS)
+            results["rewards"].append(episode_reward)
+            results["tracking_errors"].append(episode_tracking_err / MAX_STEPS)
+            results["comm_rates"].append(episode_comm / MAX_STEPS)
 
     out = {
         "mean_reward": float(np.mean(results["rewards"])) ,
@@ -149,7 +145,6 @@ def evaluate_agent(agent, env, num_episodes: int = 5):
         "mean_comm_rate": float(np.mean(results["comm_rates"])) ,
     }
 
-    restore()
     return out
 
 

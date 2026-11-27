@@ -91,11 +91,12 @@ NUM_PINNED = 5
 NUM_AGENTS = NUM_FOLLOWERS + 1
 
 # ==================== 无模型状态空间 ====================
-SELF_STATE_DIM = 2
-SELF_LEADER_DIM = 4
-LOCAL_OBS_DIM = SELF_STATE_DIM + SELF_LEADER_DIM  # 6
-
+OBS_VERSION = 2
+OBS_LAYOUT = "v2_rel_10_7k"
+OBS_AGE_CAP = 300
+SELF_STATE_DIM = 10
 SELF_ROLE_DIM = 3
+LOCAL_OBS_DIM = SELF_STATE_DIM - SELF_ROLE_DIM
 
 NEIGHBOR_STATE_DIM = 2
 NEIGHBOR_LEADER_DIM = 4
@@ -113,9 +114,11 @@ MAX_NEIGHBORS = int(_max_neighbors_env) if _max_neighbors_env else int(_MAX_NEIG
 if MAX_NEIGHBORS <= 0:
     raise ValueError(f"MAX_NEIGHBORS must be positive, got {MAX_NEIGHBORS}")
 
-NEIGHBOR_FEAT_DIM = NEIGHBOR_OBS_DIM + NEIGHBOR_ROLE_DIM  # 6
-
-STATE_DIM = LOCAL_OBS_DIM + SELF_ROLE_DIM + MAX_NEIGHBORS * NEIGHBOR_FEAT_DIM
+TOP_K = MAX_NEIGHBORS
+NEIGHBOR_FEAT_DIM = 7  # six visible features and the explicit valid bit
+STATE_DIM = SELF_STATE_DIM + TOP_K * NEIGHBOR_FEAT_DIM
+TRAIN_FOLLOWER_SCALES = (10, 20, 30)
+ACTOR_MICROBATCH_MAX_FOLLOWER_ROWS = 4096
 
 # ==================== CTDE 全局状态维度 ====================
 GLOBAL_STATE_INCLUDE_BROADCAST = True
@@ -124,7 +127,6 @@ GLOBAL_STATE_INCLUDE_TRAJ_TYPE = True
 GLOBAL_STATE_INCLUDE_TIME = True
 
 GLOBAL_STATE_DIM_BASE = NUM_AGENTS * 2
-GLOBAL_STATE_DIM = GLOBAL_STATE_DIM_BASE
 
 # ==================== 动作空间 ====================
 ACTION_DIM = 2
@@ -152,15 +154,16 @@ LEADER_PHASE_RANGE = (0.0, 2 * 3.14159)
 
 LEADER_TRAJECTORY_TYPES = ["sine", "cosine"]
 
-# finalize global state dim
-if GLOBAL_STATE_INCLUDE_BROADCAST:
-    GLOBAL_STATE_DIM += NUM_AGENTS * 2
-if GLOBAL_STATE_INCLUDE_LEADER_PARAMS:
-    GLOBAL_STATE_DIM += 3
-if GLOBAL_STATE_INCLUDE_TRAJ_TYPE:
-    GLOBAL_STATE_DIM += len(LEADER_TRAJECTORY_TYPES)
-if GLOBAL_STATE_INCLUDE_TIME:
-    GLOBAL_STATE_DIM += 1
+def global_state_dim_for(num_followers: int) -> int:
+    """全局状态按节点、轨迹参数、轨迹类型和时间拼接。"""
+    nodes = int(num_followers) + 1
+    return (2 * nodes * (1 + GLOBAL_STATE_INCLUDE_BROADCAST)
+            + 3 * GLOBAL_STATE_INCLUDE_LEADER_PARAMS
+            + len(LEADER_TRAJECTORY_TYPES) * GLOBAL_STATE_INCLUDE_TRAJ_TYPE
+            + int(GLOBAL_STATE_INCLUDE_TIME))
+
+
+GLOBAL_STATE_DIM = global_state_dim_for(NUM_FOLLOWERS)
 
 FOLLOWER_INIT_POS_STD_RANGE = (0.4, 1.2)
 FOLLOWER_INIT_VEL_STD_RANGE = (0.15, 0.5)
@@ -334,9 +337,9 @@ def print_config() -> None:
     print(f"  🌐 Large-Scale MAS: {NUM_AGENTS} Agents (1 Leader + {NUM_FOLLOWERS} Followers)")
     print(f"  Episodes: {NUM_EPISODES}, Max Steps: {MAX_STEPS}")
     print(f"  📡 CTDE Settings:")
-    print(f"     Local Obs Dim: {LOCAL_OBS_DIM} (self pos/vel + leader_est pos/vel + leader_seq/age)")
+    print(f"     Local Obs Dim: {LOCAL_OBS_DIM} (velocity, relative broadcast/estimate, age, has_est)")
     print(f"     Self Role Dim: {SELF_ROLE_DIM} (one-hot: leader/pinned/normal)")
-    print(f"     Neighbor Feat Dim: {NEIGHBOR_FEAT_DIM} (neighbor pos/vel + carried leader_est + leader_seq/age)")
+    print(f"     Neighbor Feat Dim: {NEIGHBOR_FEAT_DIM} (relative broadcasts/estimates, age, has_est, valid)")
     print(f"     Global State Dim: {GLOBAL_STATE_DIM}")
     print(f"       - include_broadcast: {GLOBAL_STATE_INCLUDE_BROADCAST}")
     print(f"       - include_leader_params: {GLOBAL_STATE_INCLUDE_LEADER_PARAMS}")
@@ -361,8 +364,8 @@ def print_config() -> None:
         print(f"       Vel Std: {FOLLOWER_INIT_VEL_STD_RANGE}")
     print(f"     Randomize Topology: {RANDOMIZE_TOPOLOGY}")
     if RANDOMIZE_TOPOLOGY:
-        print(f"       Pinned Range: {NUM_PINNED_RANGE}")
-        print(f"       Extra Edge Prob: {EXTRA_EDGE_PROB}")
+        print("       Pinned ratios: normal 15–30%, low 2–6%")
+        print("       Extra edge probability: min(1, 2 / eligible senders)")
     print(f"  🧠 Network Settings ({mode_str} - Scaled for {NUM_FOLLOWERS} followers):")
     print(f"     Hidden Dim: {HIDDEN_DIM}")
     print(f"     Attention Heads: {NUM_ATTENTION_HEADS}")

@@ -6,23 +6,27 @@
 
 注意：`show_dashboard=True` 时会在运行期导入 `mas_cc.dashboard`，需要在 Jupyter 环境下使用。
 """
-import torch
+import os
 import time
+from numbers import Integral
+
+import numpy as np
+import torch
 
 from mas_cc.config import (
-    NUM_FOLLOWERS, NUM_PINNED, MAX_STEPS, BATCH_SIZE,
+    NUM_FOLLOWERS, TRAIN_FOLLOWER_SCALES, MAX_STEPS, BATCH_SIZE,
     NUM_EPISODES, VIS_INTERVAL, SAVE_MODEL_PATH,
     print_config, set_seed, SEED,
     NUM_PARALLEL_ENVS, UPDATE_FREQUENCY, GRADIENT_STEPS,
     USE_AMP, DEVICE, COMM_PENALTY, THRESHOLD_MIN, THRESHOLD_MAX,
     WARMUP_STEPS,
 
-    ALGO, PPO_ROLLOUT_STEPS,
+    ALGO,
 )
 from mas_cc.topology import CommunicationTopology
 from mas_cc.environment import BatchedModelFreeEnv, ModelFreeEnv
 from mas_cc.agent import CTDESACAgent, CTDEMAPPOAgent
-from mas_cc.utils import collect_trajectory, plot_evaluation
+from mas_cc.utils import actor_only_inference, collect_trajectory, plot_evaluation
 
 
 torch.backends.cudnn.benchmark = True
@@ -39,6 +43,8 @@ def train(
     show_dashboard: bool = False,
     seed=SEED,
     profile_timing: bool = False,
+    train_follower_scales=TRAIN_FOLLOWER_SCALES,
+    topology_mix=(0.50, 0.25, 0.25),
 ):
     """运行 CTDE 训练。
 
@@ -48,13 +54,31 @@ def train(
         show_dashboard: 是否启用 Jupyter 仪表盘；启用会额外依赖 `ipywidgets` 等。
         seed: 随机种子。
         profile_timing: 是否统计粗粒度耗时（step/update 的累计均值）。
+        train_follower_scales: 每块各出现一次的规模，单元素表示固定规模。
+        topology_mix: 普通随机、低 pinned 随机、低 pinned 深图的三项概率。
 
     Returns:
         (agent, topology, dashboard)：
         - agent: 训练得到的智能体实例（`CTDESACAgent` 或 `CTDEMAPPOAgent`）。
-        - topology: 本次训练使用的 `CommunicationTopology` 实例。
+        - topology: 最后一局的冻结通信拓扑。
         - dashboard: 若启用仪表盘返回 `TrainingDashboard`，否则为 `None`。
     """
+    scales = tuple(train_follower_scales)
+    if not scales or any(isinstance(n, bool) or not isinstance(n, Integral) or n < 1 for n in scales):
+        raise ValueError("train_follower_scales must contain positive integers")
+    if len(set(scales)) != len(scales):
+        raise ValueError("train_follower_scales must contain distinct scales")
+    mix = np.asarray(topology_mix, dtype=float)
+    if mix.shape != (3,) or not np.isfinite(mix).all() or (mix < 0).any() or not np.isclose(mix.sum(), 1):
+        raise ValueError("topology_mix must contain three nonnegative probabilities summing to one")
+    mix = mix / mix.sum()
+    if num_episodes < 1:
+        raise ValueError("num_episodes must be positive")
+
+    is_mappo = str(ALGO).upper().strip() == "MAPPO"
+    if not is_mappo and len(scales) > 1:
+        raise ValueError("MASAC replay requires a single fixed follower scale")
+
     set_seed(seed)
     print_config()
     
@@ -71,31 +95,25 @@ def train(
     print(f"   Threshold Range: [{THRESHOLD_MIN}, {THRESHOLD_MAX}]")
     print()
     
-    # 初始化
-    topology = CommunicationTopology(NUM_FOLLOWERS, num_pinned=NUM_PINNED)
-    batched_env = BatchedModelFreeEnv(topology, num_envs=NUM_PARALLEL_ENVS)
-    eval_env = ModelFreeEnv(topology)
-    
-    algo = str(ALGO).upper().strip()
-    is_mappo = (algo == 'MAPPO')
+    # 独立的验证图与初态随机流使每次预览可重复，不消耗训练抽样。
+    schedule_seed, graph_seed, eval_seed = np.random.SeedSequence(seed).spawn(3)
+    rng = np.random.default_rng(schedule_seed)
+    eval_n = scales[0] if len(scales) == 1 else NUM_FOLLOWERS
+    eval_topology = CommunicationTopology(eval_n, seed=eval_seed)
+    eval_env = ModelFreeEnv(eval_topology, auto_reset=False, randomize_topology_on_reset=False)
+    eval_state_seed = int(eval_seed.generate_state(1)[0])
 
-    if is_mappo:
-        agent = CTDEMAPPOAgent(topology, use_amp=False)
-        print(f"   • MAPPO Rollout Steps: {PPO_ROLLOUT_STEPS}")
-    else:
-        # 默认 MASAC（CTDE-SAC）
-        agent = CTDESACAgent(topology, use_amp=USE_AMP)
-    
+    env_by_n = {}
+    agent = None
     dashboard = None
     if show_dashboard:
-        # 仅在需要可视化时导入（依赖 Jupyter + ipywidgets）
         from mas_cc.dashboard import TrainingDashboard
 
-        dashboard = TrainingDashboard(num_episodes, vis_interval, topology=topology)
+        dashboard_graph = CommunicationTopology.from_frozen(eval_topology.adj, eval_topology.pinned_ids)
+        dashboard = TrainingDashboard(num_episodes, vis_interval, topology=dashboard_graph)
         dashboard.display()
-    
+
     best_reward = -float('inf')
-    best_model_state = None  # 记录最优模型状态（内存中）
     global_step = 0
     
     start_time = time.time()
@@ -106,11 +124,37 @@ def train(
     update_time_s = 0.0
     update_calls = 0
 
+    graph_modes = (("normal", "random"), ("low", "random"), ("low", "deep"))
     for episode in range(1, num_episodes + 1):
-        
+        offset = (episode - 1) % len(scales)
+        if offset == 0:
+            block = rng.permutation(scales)
+        n = int(block[offset])
+        pinned_mode, depth_mode = graph_modes[rng.choice(len(graph_modes), p=mix)]
+        if n not in env_by_n:
+            # 构造拓扑已经抽取首图，第一次 reset 只初始化物理状态。
+            topology = CommunicationTopology(
+                n, seed=graph_seed.spawn(1)[0], pinned_mode=pinned_mode, depth_mode=depth_mode,
+            )
+            env_by_n[n] = BatchedModelFreeEnv(
+                topology, num_envs=NUM_PARALLEL_ENVS, max_steps=MAX_STEPS,
+                auto_reset=False, randomize_topology_on_reset=False,
+            )
+        batched_env = env_by_n[n]
+        topology = batched_env.topology
+        topology.pinned_mode, topology.depth_mode = pinned_mode, depth_mode
         local_states = batched_env.reset()
-        # CTDE：critic/value 的输入（与 actor 的本地输入区分开）
-        global_states = batched_env.get_global_state()
+        batched_env.randomize_topology = True
+
+        if agent is None:
+            if is_mappo:
+                agent = CTDEMAPPOAgent(topology, use_amp=False)
+            else:
+                agent = CTDESACAgent(topology, use_amp=USE_AMP, train_follower_scales=scales)
+        if is_mappo:
+            session = agent.start_episode(batched_env)
+        else:
+            global_states = batched_env.get_global_state()
 
         episode_rewards = torch.zeros(NUM_PARALLEL_ENVS, device=DEVICE)
         episode_tracking_err = torch.zeros(NUM_PARALLEL_ENVS, device=DEVICE)
@@ -122,89 +166,62 @@ def train(
             if dashboard and step % 10 == 0:
                 dashboard.update_step(step, MAX_STEPS)
 
-            # 执行阶段：actor 只使用本地状态；训练阶段：MAPPO 还会用 global_state 估计 value
-            if is_mappo:
-                actions, logp, values, pre_squash_v = agent.act(
-                    local_states, global_states, deterministic=False, return_pre_squash=True
-                )
-            else:
-                actions = agent.select_action(local_states, deterministic=False)
-
             if profile_timing:
                 t0 = time.perf_counter()
-            next_local_states, rewards, dones, infos = batched_env.step(actions)
-            next_global_states = batched_env.get_global_state()
-            if profile_timing:
-                step_time_s += (time.perf_counter() - t0)
-
-            # 区分真实终止 (dones) 与时间截断 (time_limit_done)：
-            # 时间截断保留末步 value bootstrap，避免人为制造末步价值悬崖
-            time_limit_done = torch.zeros_like(dones, dtype=torch.bool)
-            if step == MAX_STEPS - 1:
-                time_limit_done[:] = True
-
             if is_mappo:
-                # MAPPO：on-policy rollout（显式传入 pre_squash_v 与截断步重置前 next_global_states）
-                agent.store_rollout_step(
-                    local_states, global_states, actions, logp, values,
-                    rewards, dones, truncated=time_limit_done,
-                    next_global_states=next_global_states if time_limit_done.any() else None,
-                    pre_squash_v=pre_squash_v,
-                )
-
-                do_update = agent.buffer.is_full() or (step == MAX_STEPS - 1)
-                if do_update:
-                    if profile_timing:
-                        t1 = time.perf_counter()
-                    agent.update(next_global_states=next_global_states, next_dones=dones)
-                    if profile_timing:
-                        update_time_s += (time.perf_counter() - t1)
-                        update_calls += 1
+                rewards, dones, infos = session.step_collect()
             else:
-                # MASAC（CTDE-SAC）：off-policy replay（仅真实终止置 done，时间截断保留 bootstrap）
+                actions = agent.select_action(local_states, deterministic=False)
+                next_local_states, rewards, dones, infos = batched_env.step(actions)
+                next_global_states = batched_env.get_global_state()
                 agent.store_transitions_batch(
-                    local_states, global_states, actions, rewards,
-                    next_local_states, next_global_states, dones
+                    local_states, global_states, actions, rewards, next_local_states, next_global_states, dones,
                 )
+                local_states, global_states = next_local_states, next_global_states
+            if profile_timing:
+                step_time_s += time.perf_counter() - t0
 
-                if step % UPDATE_FREQUENCY == 0 and step > 0 and global_step > WARMUP_STEPS:
-                    if profile_timing:
-                        t1 = time.perf_counter()
+            is_episode_end = step == MAX_STEPS - 1
+            if is_mappo:
+                do_update = session.buffer.is_full() or is_episode_end
+            else:
+                do_update = step > 0 and step % UPDATE_FREQUENCY == 0 and global_step > WARMUP_STEPS
+            if do_update:
+                if profile_timing:
+                    t1 = time.perf_counter()
+                if is_mappo:
+                    session.flush_update(is_episode_end=is_episode_end)
+                else:
                     agent.update(BATCH_SIZE, GRADIENT_STEPS)
-                    if profile_timing:
-                        update_time_s += (time.perf_counter() - t1)
-                        update_calls += 1
-            
+                if profile_timing:
+                    update_time_s += time.perf_counter() - t1
+                    update_calls += 1
+
             episode_rewards += rewards
             episode_tracking_err += infos['tracking_error']
             episode_comm += infos['comm_rate']
             
-            local_states = next_local_states
-            global_states = next_global_states
+        if is_mappo:
+            session.close()
         
         avg_reward = episode_rewards.mean().item()
         avg_tracking_err = (episode_tracking_err / MAX_STEPS).mean().item()
         avg_comm = (episode_comm / MAX_STEPS).mean().item()
         
-        trajectory_data = None
-        if episode % vis_interval == 0 or episode == 1:
-            trajectory_data = collect_trajectory(agent, eval_env, MAX_STEPS)
-        
-        if avg_reward > best_reward:
+        improved = avg_reward > best_reward
+        if improved:
             best_reward = avg_reward
-            # 记录最优模型状态（内存中），训练结束后再落盘
-            best_model_state = {
-                'actor': {k: v.clone() for k, v in agent.actor.state_dict().items()},
-            }
-            if is_mappo:
-                best_model_state['value'] = {k: v.clone() for k, v in agent.value_net.state_dict().items()}
-            else:
-                best_model_state['q1'] = {k: v.clone() for k, v in agent.q1.state_dict().items()}
-                best_model_state['q2'] = {k: v.clone() for k, v in agent.q2.state_dict().items()}
-                best_model_state['q1_target'] = {k: v.clone() for k, v in agent.q1_target.state_dict().items()}
-                best_model_state['q2_target'] = {k: v.clone() for k, v in agent.q2_target.state_dict().items()}
-            trajectory_data = collect_trajectory(agent, eval_env, MAX_STEPS)
-        
+            agent.save(SAVE_MODEL_PATH)
+
+        trajectory_data = None
+        if improved or episode % vis_interval == 0 or episode == 1:
+            devices = [torch.cuda.current_device()] if DEVICE.type == "cuda" else []
+            with torch.random.fork_rng(devices=devices), actor_only_inference(agent) as preview:
+                torch.random.default_generator.manual_seed(eval_state_seed)
+                if devices:
+                    torch.cuda.manual_seed(eval_state_seed)
+                trajectory_data = collect_trajectory(preview, eval_env, MAX_STEPS)
+
         if dashboard:
             dashboard.update_episode(
                 episode, avg_reward, avg_tracking_err, avg_comm,
@@ -229,28 +246,9 @@ def train(
     if dashboard:
         dashboard.finish()
     
-    # 训练完成后，保存最优模型到磁盘
-    if best_model_state is not None:
-        import os
-        parent = os.path.dirname(SAVE_MODEL_PATH)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        
-        if is_mappo:
-            torch.save({
-                'actor': best_model_state['actor'],
-                'value': best_model_state['value'],
-            }, SAVE_MODEL_PATH)
-        else:
-            torch.save({
-                'actor': best_model_state['actor'],
-                'q1': best_model_state['q1'],
-                'q2': best_model_state['q2'],
-                'q1_target': best_model_state['q1_target'],
-                'q2_target': best_model_state['q2_target'],
-            }, SAVE_MODEL_PATH)
-        print(f"✅ Best model saved to {SAVE_MODEL_PATH}")
-    
+    agent.save_actor(os.path.join(os.path.dirname(SAVE_MODEL_PATH), "final_actor.pt"))
+    final_topology = CommunicationTopology.from_frozen(topology.adj, topology.pinned_ids)
+
     elapsed = time.time() - start_time
     print(f"\n{'='*60}")
     print(f"✅ CTDE Training Complete!")
@@ -260,11 +258,12 @@ def train(
     print(f"   Best reward: {best_reward:.2f}")
     print(f"{'='*60}")
     
-    return agent, topology, dashboard
+    return agent, final_topology, dashboard
 
 
 if __name__ == '__main__':
     agent, topology, _ = train(show_dashboard=False)
     # 统一从 config 读取评估保存路径（自动落到 results/.../figs/）
     from mas_cc.config import EVAL_NUM_TESTS, EVAL_SAVE_PATH
-    plot_evaluation(agent, topology, num_tests=EVAL_NUM_TESTS, save_path=EVAL_SAVE_PATH)
+    with actor_only_inference(agent) as policy:
+        plot_evaluation(policy, topology, num_tests=EVAL_NUM_TESTS, save_path=EVAL_SAVE_PATH)

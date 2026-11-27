@@ -36,6 +36,7 @@ from .config import (
     NUM_ATTENTION_HEADS,
     NUM_FOLLOWERS,
     NUM_TRANSFORMER_LAYERS,
+    OBS_VERSION,
     SELF_ROLE_DIM,
     STATE_DIM,
     V_SCALE,
@@ -51,7 +52,7 @@ def _parse_flat_state(state: torch.Tensor):
     Returns:
         local_obs: shape=(B, LOCAL_OBS_DIM)
         self_role: shape=(B, SELF_ROLE_DIM)
-        neighbor_data: shape=(B, MAX_NEIGHBORS, NEIGHBOR_FEAT_DIM)
+        neighbor_data: shape=(B, MAX_NEIGHBORS, NEIGHBOR_OBS_DIM)
         neighbor_mask: shape=(B, MAX_NEIGHBORS)；True 表示该邻居槽位为空（需要 mask）。
 
     Raises:
@@ -67,9 +68,9 @@ def _parse_flat_state(state: torch.Tensor):
     self_role = state[:, LOCAL_OBS_DIM:LOCAL_OBS_DIM + SELF_ROLE_DIM]
     neighbor_start = LOCAL_OBS_DIM + SELF_ROLE_DIM
 
-    neighbor_data = state[:, neighbor_start:].view(-1, MAX_NEIGHBORS, NEIGHBOR_FEAT_DIM)
-    neighbor_mask = (neighbor_data.abs().sum(dim=-1) == 0)
-    return local_obs, self_role, neighbor_data, neighbor_mask
+    slots = state[:, neighbor_start:].reshape(-1, MAX_NEIGHBORS, NEIGHBOR_FEAT_DIM)
+    valid = slots[..., 6] > 0.5
+    return local_obs, self_role, slots[..., :6], ~valid
 
 
 def _atanh(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -152,11 +153,11 @@ class LightweightAttention(nn.Module):
         attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
 
         if mask is not None:
-            mask_expanded = mask.unsqueeze(1).unsqueeze(2)
-            attn = attn.masked_fill(mask_expanded, float("-inf"))
+            # 全空行保留有限 logits；编码器在最终投影后将该行归零。
+            safe_mask = mask & ~mask.all(dim=-1, keepdim=True)
+            attn = attn.masked_fill(safe_mask[:, None, None, :], float("-inf"))
 
         attn = F.softmax(attn, dim=-1)
-        attn = torch.nan_to_num(attn, nan=0.0)
         attn = self.dropout(attn)
 
         out = torch.matmul(attn, v)
@@ -174,7 +175,7 @@ class LightweightAttentionEncoder(nn.Module):
     用一组轻量自注意力层对邻居序列特征进行编码，并输出一个固定维度的聚合表示。
 
     Args:
-        neighbor_dim: 单个邻居的输入特征维度（`NEIGHBOR_FEAT_DIM`）。
+        neighbor_dim: 单个邻居除 valid 位外的特征维度。
         hidden_dim: 隐层维度。
         num_heads: 注意力 head 数。
         num_layers: 注意力层数。
@@ -190,8 +191,6 @@ class LightweightAttentionEncoder(nn.Module):
             nn.LayerNorm(hidden_dim),
         )
 
-        self.pos_embed = nn.Parameter(torch.randn(1, MAX_NEIGHBORS, hidden_dim) * 0.02)
-
         self.attention_layers = nn.ModuleList(
             [LightweightAttention(hidden_dim, num_heads, dropout) for _ in range(int(num_layers))]
         )
@@ -204,19 +203,16 @@ class LightweightAttentionEncoder(nn.Module):
 
     def forward(self, neighbor_data: torch.Tensor, neighbor_mask: torch.Tensor | None = None):
         h = self.neighbor_embed(neighbor_data)
-        h = h + self.pos_embed
 
         for layer in self.attention_layers:
             h = layer(h, neighbor_mask)
 
         if neighbor_mask is not None:
             valid_mask = ~neighbor_mask
-            valid_count = valid_mask.sum(dim=1, keepdim=True).clamp(min=1).unsqueeze(-1)
-            h = (h * valid_mask.unsqueeze(-1)).sum(dim=1) / valid_count.squeeze(-1)
-        else:
-            h = h.mean(dim=1)
-
-        return self.output_proj(h)
+            valid_count = valid_mask.sum(dim=1, keepdim=True)
+            h = (h * valid_mask.unsqueeze(-1)).sum(dim=1) / valid_count.clamp(min=1)
+            return self.output_proj(h) * (valid_count > 0)
+        return self.output_proj(h.mean(dim=1))
 
 
 # ============================================================
@@ -291,6 +287,8 @@ class DecentralizedActor(nn.Module):
         self._beta_min = 1.0  # Beta 分布参数下界，保持 >= 1 避免 U 形分布和熵崩溃
 
         self.register_buffer("_log_v_scale", torch.log(torch.tensor(self.v_scale)), persistent=False)
+        self.register_buffer("_obs_version", torch.tensor(OBS_VERSION, dtype=torch.int64))
+        self.register_buffer("_top_k", torch.tensor(MAX_NEIGHBORS, dtype=torch.int64))
 
         self._init_weights()
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import weakref
+from threading import Lock
 
 import numpy as np
 import torch
@@ -13,17 +14,20 @@ import torch.optim as optim
 from .buffer import CTDEReplayBuffer
 from .config import (
     ACTION_DIM,
+    ACTOR_MICROBATCH_MAX_FOLLOWER_ROWS,
     ALPHA_LR,
     BATCH_SIZE,
     DEVICE,
     GAMMA,
-    GLOBAL_STATE_DIM,
     GRADIENT_STEPS,
     HIDDEN_DIM,
     INIT_ALPHA,
     LEARNING_RATE,
-    NUM_AGENTS,
-    NUM_FOLLOWERS,
+    NUM_ATTENTION_HEADS,
+    global_state_dim_for,
+    NUM_TRANSFORMER_LAYERS,
+    OBS_VERSION,
+    TOP_K,
     POLICY_DELAY,
     PPO_CLIP_EPS,
     PPO_ENTROPY_COEF,
@@ -41,6 +45,77 @@ from .config import (
     TAU,
 )
 from .networks import CentralizedCritic, CentralizedValue, DecentralizedActor
+from .topology import _try_lock
+
+
+def _actor_schema(hidden_dim, algorithm):
+    return {
+        "obs_version": OBS_VERSION, "top_k": TOP_K, "state_dim": STATE_DIM,
+        "hidden_dim": hidden_dim, "num_heads": NUM_ATTENTION_HEADS,
+        "num_layers": NUM_TRANSFORMER_LAYERS, "algorithm": algorithm,
+    }
+
+
+def _save_checkpoint(path, actor, algorithm, **training_state):
+    parent = os.path.dirname(str(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    schema = _actor_schema(actor.local_encoder[0].out_features, algorithm)
+    torch.save({**schema, "actor": actor.state_dict(), **training_state}, path)
+
+
+def _read_checkpoint(path, *, algorithm=None, hidden_dim=None):
+    """先校验 v2 输入契约；只有推理入口接受带持久版本标记的裸权重。"""
+    checkpoint = torch.load(path, map_location=DEVICE, weights_only=True)
+    if not isinstance(checkpoint, dict):
+        raise ValueError("Expected a v2 checkpoint dictionary")
+    wrapped = "actor" in checkpoint
+    if not wrapped and algorithm is not None:
+        raise ValueError(f"Expected a full {algorithm} checkpoint for training")
+    weights = checkpoint["actor"] if wrapped else checkpoint
+    if not isinstance(weights, dict):
+        raise ValueError("Expected an actor state_dict in this checkpoint")
+    if any("pos_embed" in key for key in weights):
+        raise ValueError("Legacy pos_embed found; load v1 weights with the v1 evaluation worker")
+    for key, expected in (("_obs_version", OBS_VERSION), ("_top_k", TOP_K)):
+        value = weights.get(key)
+        if (not isinstance(value, torch.Tensor) or value.shape != () or value.dtype != torch.int64
+                or value.item() != expected):
+            raise ValueError(f"Expected v2 actor {key}={expected}; select matching weights and TOP_K")
+
+    weight = weights.get("local_encoder.0.weight")
+    if not isinstance(weight, torch.Tensor) or weight.ndim != 2:
+        raise ValueError("Cannot determine actor hidden_dim from local_encoder weights")
+    width = weight.shape[0]
+    if hidden_dim is not None and width != hidden_dim:
+        raise ValueError(f"Expected hidden_dim={hidden_dim}, got weights with width {width}")
+    if wrapped:
+        saved_algo = checkpoint.get("algorithm")
+        if saved_algo not in ("MAPPO", "MASAC"):
+            raise ValueError(f"Unknown checkpoint algorithm {saved_algo!r}; expected MAPPO or MASAC")
+        if ((saved_algo == "MASAC" and "value" in checkpoint)
+                or (saved_algo == "MAPPO" and "q1" in checkpoint)):
+            raise ValueError(f"Checkpoint algorithm={saved_algo!r} conflicts with its training networks")
+        schema = _actor_schema(width, algorithm or saved_algo)
+        for key, expected in schema.items():
+            actual = checkpoint.get(key)
+            if type(actual) is not type(expected) or actual != expected:
+                raise ValueError(f"Incompatible checkpoint {key}: expected {expected!r}, got {actual!r}")
+    return checkpoint if wrapped else {"actor": weights}, width
+
+
+def _restore_modules(checkpoint, **modules):
+    # 一次检完所有网络，再写入参数。损坏或只含 Actor 的文件不能部分覆盖训练模型。
+    for name, module in modules.items():
+        weights = checkpoint.get(name)
+        expected = module.state_dict()
+        if not isinstance(weights, dict) or weights.keys() != expected.keys():
+            raise ValueError(f"Missing or incompatible {name} state_dict; select a matching v2 checkpoint")
+        for key, parameter in expected.items():
+            if not isinstance(weights[key], torch.Tensor) or weights[key].shape != parameter.shape:
+                raise ValueError(f"Incompatible {name}.{key} in checkpoint; expected shape {parameter.shape}")
+    for name, module in modules.items():
+        module.load_state_dict(checkpoint[name], strict=True)
 
 
 class ActorOnlyPolicy:
@@ -67,23 +142,13 @@ class ActorOnlyPolicy:
 
             self._autocast = lambda: autocast("cuda")
 
-    @staticmethod
-    def _extract_actor_state_dict(checkpoint) -> dict:
-        # 兼容两种保存形式：
-        # 1) {'actor': actor_state_dict, ...}
-        # 2) 直接保存 actor_state_dict
-        if isinstance(checkpoint, dict) and ("actor" in checkpoint) and isinstance(checkpoint["actor"], dict):
-            return checkpoint["actor"]
-        if isinstance(checkpoint, dict) and any(k.startswith("local_encoder") or k.startswith("neighbor_encoder") for k in checkpoint.keys()):
-            return checkpoint
-        raise ValueError("Unrecognized checkpoint format: cannot find actor state_dict")
-
     @classmethod
-    def from_checkpoint(cls, path: str, hidden_dim: int = HIDDEN_DIM, strict: bool = True, use_amp: bool = False):
-        ckpt = torch.load(path, map_location=DEVICE)
-        actor = DecentralizedActor(hidden_dim=hidden_dim).to(DEVICE)
-        actor_sd = cls._extract_actor_state_dict(ckpt)
-        actor.load_state_dict(actor_sd, strict=bool(strict))
+    def from_checkpoint(cls, path: str, hidden_dim: int | None = None, strict: bool = True, use_amp: bool = False):
+        if not strict:
+            raise ValueError("v2 checkpoint loading requires strict=True")
+        checkpoint, width = _read_checkpoint(path, hidden_dim=hidden_dim)
+        actor = DecentralizedActor(hidden_dim=width).to(DEVICE)
+        _restore_modules(checkpoint, actor=actor)
         return cls(actor=actor, use_amp=use_amp)
 
     @torch.inference_mode()
@@ -146,7 +211,9 @@ class CTDESACAgent:
         value_net: 为了评估工具统一保留（SAC 不使用，恒为 None）。
     """
 
-    def __init__(self, topology, auto_entropy: bool = True, use_amp: bool = True):
+    def __init__(self, topology, auto_entropy: bool = True, use_amp: bool = True, *, train_follower_scales=None):
+        if train_follower_scales is not None and tuple(train_follower_scales) != (topology.num_followers,):
+            raise ValueError("MASAC requires one fixed follower scale matching its topology")
         self.topology = topology
         self.num_followers = topology.num_followers
         self.num_agents = topology.num_agents
@@ -168,10 +235,12 @@ class CTDESACAgent:
 
         self.actor = DecentralizedActor(hidden_dim=HIDDEN_DIM).to(DEVICE)
 
-        self.q1 = CentralizedCritic(global_state_dim=GLOBAL_STATE_DIM, hidden_dim=HIDDEN_DIM).to(DEVICE)
-        self.q2 = CentralizedCritic(global_state_dim=GLOBAL_STATE_DIM, hidden_dim=HIDDEN_DIM).to(DEVICE)
-        self.q1_target = CentralizedCritic(global_state_dim=GLOBAL_STATE_DIM, hidden_dim=HIDDEN_DIM).to(DEVICE)
-        self.q2_target = CentralizedCritic(global_state_dim=GLOBAL_STATE_DIM, hidden_dim=HIDDEN_DIM).to(DEVICE)
+        critic_args = dict(global_state_dim=global_state_dim_for(self.num_followers),
+                           num_followers=self.num_followers, hidden_dim=HIDDEN_DIM)
+        self.q1 = CentralizedCritic(**critic_args).to(DEVICE)
+        self.q2 = CentralizedCritic(**critic_args).to(DEVICE)
+        self.q1_target = CentralizedCritic(**critic_args).to(DEVICE)
+        self.q2_target = CentralizedCritic(**critic_args).to(DEVICE)
 
         self.q1_target.load_state_dict(self.q1.state_dict())
         self.q2_target.load_state_dict(self.q2.state_dict())
@@ -190,14 +259,14 @@ class CTDESACAgent:
         self.q2_optimizer = optim.Adam(self.q2.parameters(), lr=LEARNING_RATE)
         self.alpha_optimizer = optim.Adam([self.log_alpha], lr=ALPHA_LR)
 
-        self.buffer = CTDEReplayBuffer(num_agents=NUM_AGENTS)
+        self.buffer = CTDEReplayBuffer(num_agents=self.num_agents, global_state_dim=self.q1.global_state_dim)
 
         self.last_losses = {"q1": 0, "q2": 0, "actor": 0, "alpha": INIT_ALPHA}
         self.update_count = 0
 
         print("📊 CTDE SAC Agent initialized:")
         print(f"   Actor input: Local state ({STATE_DIM})")
-        print(f"   Critic input: Global state ({GLOBAL_STATE_DIM}) + Joint action ({NUM_FOLLOWERS * ACTION_DIM})")
+        print(f"   Critic input: Global state ({self.q1.global_state_dim}) + Joint action ({self.num_followers * ACTION_DIM})")
 
     @torch.inference_mode()
     def select_action(self, local_states: torch.Tensor, deterministic: bool = False):
@@ -445,23 +514,15 @@ class CTDESACAgent:
         Args:
             path: 保存路径。
         """
-        parent = os.path.dirname(str(path))
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-
-        torch.save(
-            {
-                "actor": self.actor.state_dict(),
-                "q1": self.q1.state_dict(),
-                "q2": self.q2.state_dict(),
-                "q1_target": self.q1_target.state_dict(),
-                "q2_target": self.q2_target.state_dict(),
-                "log_alpha": self.log_alpha,
-                "update_count": self.update_count,
-            },
-            path,
+        _save_checkpoint(
+            path, self.actor, "MASAC", q1=self.q1.state_dict(), q2=self.q2.state_dict(),
+            q1_target=self.q1_target.state_dict(), q2_target=self.q2_target.state_dict(),
+            log_alpha=self.log_alpha, update_count=self.update_count,
         )
         print(f"✅ CTDE Model saved to {path}")
+
+    def save_actor(self, path: str):
+        _save_checkpoint(path, self.actor, "MASAC")
 
     def load(self, path: str):
         """从文件加载模型参数。
@@ -469,12 +530,9 @@ class CTDESACAgent:
         Args:
             path: checkpoint 路径。
         """
-        checkpoint = torch.load(path, map_location=DEVICE)
-        self.actor.load_state_dict(checkpoint["actor"])
-        self.q1.load_state_dict(checkpoint["q1"])
-        self.q2.load_state_dict(checkpoint["q2"])
-        self.q1_target.load_state_dict(checkpoint["q1_target"])
-        self.q2_target.load_state_dict(checkpoint["q2_target"])
+        checkpoint, _ = _read_checkpoint(path, algorithm="MASAC", hidden_dim=self.actor.local_encoder[0].out_features)
+        _restore_modules(checkpoint, actor=self.actor, q1=self.q1, q2=self.q2,
+                         q1_target=self.q1_target, q2_target=self.q2_target)
 
         if "log_alpha" in checkpoint:
             ckpt_log_alpha = checkpoint["log_alpha"]
@@ -665,21 +723,27 @@ class CTDEMAPPOAgent:
         再调用 `update()` 进行多轮 PPO 优化。
     """
 
-    def __init__(self, topology, use_amp: bool = False):
+    def __init__(self, topology, use_amp: bool = False, *,
+                 actor_microbatch_max_rows: int | None = ACTOR_MICROBATCH_MAX_FOLLOWER_ROWS):
+        if actor_microbatch_max_rows is not None and actor_microbatch_max_rows < 1:
+            raise ValueError("actor_microbatch_max_rows must be positive or None")
+        self.actor_microbatch_max_rows = actor_microbatch_max_rows
+        self._session = None
+        self._session_lock = Lock()
         self.topology = topology
         self.num_followers = topology.num_followers
         self.num_agents = topology.num_agents
         self.use_amp = False
 
         self.actor = DecentralizedActor(hidden_dim=HIDDEN_DIM).to(DEVICE)
-        self.value_net = CentralizedValue(global_state_dim=GLOBAL_STATE_DIM, hidden_dim=HIDDEN_DIM).to(DEVICE)
+        self.value_net = CentralizedValue(global_state_dim=global_state_dim_for(self.num_followers), hidden_dim=HIDDEN_DIM).to(DEVICE)
         self._disable_actor_dropout()
 
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=PPO_LR)
         self.value_optimizer = optim.Adam(self.value_net.parameters(), lr=PPO_LR)
 
         self.expected_global_state_dim = int(self.value_net.ctx_dim + self.num_agents * self.value_net.agent_feat_dim)
-        self.buffer = _PPOBuffer(
+        self._fixed_buffer = _PPOBuffer(
             rollout_steps=PPO_ROLLOUT_STEPS,
             num_followers=self.num_followers,
             state_dim=STATE_DIM,
@@ -693,8 +757,15 @@ class CTDEMAPPOAgent:
 
         print("📊 CTDE MAPPO Agent initialized:")
         print(f"   Actor input: Local state ({STATE_DIM})")
-        print(f"   Value input: Global state ({GLOBAL_STATE_DIM})")
+        print(f"   Value input: Global state ({self.expected_global_state_dim})")
         print(f"   Rollout steps: {PPO_ROLLOUT_STEPS} | Epochs: {PPO_EPOCHS} | Minibatch: {PPO_MINIBATCH_SIZE}")
+
+    @property
+    def buffer(self):
+        return self._fixed_buffer if self._session is None else self._session.buffer
+
+    def start_episode(self, env):
+        return MultiScaleEpisodeSession(self, env)
 
     def _disable_actor_dropout(self) -> None:
         """在 MAPPO 采样与更新阶段一致关闭 Actor 内部 Dropout。
@@ -709,11 +780,10 @@ class CTDEMAPPOAgent:
 
     @torch.inference_mode()
     def select_action(self, local_states: torch.Tensor, deterministic: bool = False):
-        if local_states.dim() == 2:
-            actions, _, _ = self.act(local_states.unsqueeze(0), None, deterministic=deterministic)
-            return actions[0]
-        actions, _, _ = self.act(local_states, None, deterministic=deterministic)
-        return actions
+        self._disable_actor_dropout()
+        follower_states = local_states[..., 1:, :]
+        action, _ = self.actor(follower_states.reshape(-1, STATE_DIM), deterministic=deterministic)
+        return action.reshape(*follower_states.shape[:-1], ACTION_DIM).float()
 
     @torch.inference_mode()
     def act(
@@ -736,16 +806,24 @@ class CTDEMAPPOAgent:
             - return_pre_squash=False: (actions, logp, values)
             - return_pre_squash=True:  (actions, logp, values, pre_squash_v)
         """
+        return self._act_for_buffer(local_states, global_states, self._fixed_buffer,
+                                    deterministic, return_pre_squash, bind_sample=True)
+
+    @torch.inference_mode()
+    def _act_for_buffer(self, local_states, global_states, buffer, deterministic,
+                        return_pre_squash, *, bind_sample):
+        num_followers = buffer.num_followers
+        num_agents = num_followers + 1
         assert local_states.dim() == 3, "MAPPO 训练需要 batched local_states"
-        if tuple(local_states.shape[1:]) != (self.num_agents, STATE_DIM) or int(local_states.shape[0]) < 1:
+        if tuple(local_states.shape[1:]) != (num_agents, STATE_DIM) or int(local_states.shape[0]) < 1:
             raise ValueError(
-                f"local_states: expected shape (>=1, {self.num_agents}, {STATE_DIM}), got {tuple(local_states.shape)}"
+                f"local_states: expected shape (>=1, {num_agents}, {STATE_DIM}), got {tuple(local_states.shape)}"
             )
         E = int(local_states.shape[0])
         if global_states is not None:
-            if global_states.dim() != 2 or tuple(global_states.shape) != (E, self.expected_global_state_dim):
+            if global_states.dim() != 2 or tuple(global_states.shape) != (E, buffer.global_state_dim):
                 raise ValueError(
-                    f"global_states: expected shape {(E, self.expected_global_state_dim)}, "
+                    f"global_states: expected shape {(E, buffer.global_state_dim)}, "
                     f"got {tuple(global_states.shape)}"
                 )
         self._disable_actor_dropout()
@@ -754,19 +832,19 @@ class CTDEMAPPOAgent:
         act_flat, logp_flat, v_pre_flat = self.actor(
             follower_states, deterministic=deterministic, return_pre_squash=True
         )
-        actions = act_flat.view(E, self.num_followers, ACTION_DIM).float()
-        v_pre = v_pre_flat.view(E, self.num_followers, 1).float().detach().clone()
+        actions = act_flat.view(E, num_followers, ACTION_DIM).float()
+        v_pre = v_pre_flat.view(E, num_followers, 1).float().detach().clone()
 
-        if not deterministic:
+        if bind_sample and not deterministic:
             # 绑定表独占一份独立快照，避免调用方复用 return_pre_squash 返回张量时改写绑定值
             act_id = id(actions)
             self._sampled_pre_squash_by_id[act_id] = (weakref.ref(actions), v_pre.clone())
             weakref.finalize(actions, self._sampled_pre_squash_by_id.pop, act_id, None)
 
         if logp_flat is None:
-            logp = torch.zeros((E, self.num_followers, 1), device=DEVICE)
+            logp = torch.zeros((E, num_followers, 1), device=DEVICE)
         else:
-            logp = logp_flat.view(E, self.num_followers, 1).float()
+            logp = logp_flat.view(E, num_followers, 1).float()
 
         if global_states is None:
             values = torch.full((E, 1), float("nan"), device=DEVICE)
@@ -793,6 +871,8 @@ class CTDEMAPPOAgent:
         *,
         logp_joint=None,
     ):
+        if self._session is not None:
+            raise RuntimeError("Active episode owns collection; call session.step_collect()")
         # 兼容旧关键字参数 `logp_joint=` 别名，并统一校验必需参数与 per-agent 形状
         if logp is not None and logp_joint is not None:
             raise TypeError("Specify only one of 'logp' or legacy alias 'logp_joint', not both.")
@@ -950,21 +1030,26 @@ class CTDEMAPPOAgent:
         return advantages, returns
 
     def update(self, next_global_states=None, next_dones=None):
-        if len(self.buffer) == 0:
+        if self._session is not None:
+            raise RuntimeError("Active episode owns bootstrap; call session.flush_update()")
+        return self._update_buffer(self._fixed_buffer, next_global_states, next_dones)
+
+    def _update_buffer(self, buffer, next_global_states, next_dones, *, episode_end=False):
+        if len(buffer) == 0:
             return {}
 
         self._disable_actor_dropout()
 
-        follower_states = torch.stack(self.buffer.follower_states, dim=0)  # (T,E,F,S)
-        global_states = torch.stack(self.buffer.global_states, dim=0)  # (T,E,G)
-        actions = torch.stack(self.buffer.actions, dim=0)  # (T,E,F,A)
-        old_logp = torch.stack(self.buffer.logp, dim=0)  # (T,E,F,1)
-        values = torch.stack(self.buffer.values, dim=0)  # (T,E,1)
-        rewards = torch.stack(self.buffer.rewards, dim=0)  # (T,E)
-        dones = torch.stack(self.buffer.dones, dim=0)  # (T,E)
-        truncated = torch.stack(self.buffer.truncated, dim=0)  # (T,E)
-        truncated_next_values = torch.stack(self.buffer.truncated_next_values, dim=0)  # (T,E)
-        has_truncated_next_values = torch.stack(self.buffer.has_truncated_next_values, dim=0)  # (T,E)
+        follower_states = torch.stack(buffer.follower_states, dim=0)  # (T,E,F,S)
+        global_states = torch.stack(buffer.global_states, dim=0)  # (T,E,G)
+        actions = torch.stack(buffer.actions, dim=0)  # (T,E,F,A)
+        old_logp = torch.stack(buffer.logp, dim=0)  # (T,E,F,1)
+        values = torch.stack(buffer.values, dim=0)  # (T,E,1)
+        rewards = torch.stack(buffer.rewards, dim=0)  # (T,E)
+        dones = torch.stack(buffer.dones, dim=0)  # (T,E)
+        truncated = torch.stack(buffer.truncated, dim=0)  # (T,E)
+        truncated_next_values = torch.stack(buffer.truncated_next_values, dim=0)  # (T,E)
+        has_truncated_next_values = torch.stack(buffer.has_truncated_next_values, dim=0)  # (T,E)
 
         T, E = rewards.shape
 
@@ -981,10 +1066,10 @@ class CTDEMAPPOAgent:
             else:
                 if next_global_states.dim() != 2 or tuple(next_global_states.shape) != (
                     E,
-                    self.expected_global_state_dim,
+                    buffer.global_state_dim,
                 ):
                     raise ValueError(
-                        f"next_global_states: expected shape {(E, self.expected_global_state_dim)}, "
+                        f"next_global_states: expected shape {(E, buffer.global_state_dim)}, "
                         f"got {tuple(next_global_states.shape)}"
                     )
                 if next_dones is not None and tuple(next_dones.shape) != (E,):
@@ -993,6 +1078,12 @@ class CTDEMAPPOAgent:
                 if next_dones is not None:
                     lv = lv * (~next_dones.bool()).float()
                 last_value = lv
+
+            if episode_end:
+                # 时间边界由本局采集器声明，复用真实后继的这一次 Value 前向（含 Dropout）。
+                truncated[-1] = True
+                truncated_next_values[-1] = last_value
+                has_truncated_next_values[-1] = True
 
             adv, ret = self._compute_gae(
                 rewards=rewards,
@@ -1008,13 +1099,13 @@ class CTDEMAPPOAgent:
             adv = (adv - adv_flat.mean()) / (adv_flat.std(unbiased=False) + 1e-8)
 
         N = T * E
-        follower_states_env = follower_states.reshape(N, self.num_followers, STATE_DIM)
+        follower_states_env = follower_states.reshape(N, buffer.num_followers, STATE_DIM)
         global_states_env = global_states.reshape(N, -1)
-        actions_env = actions.reshape(N, self.num_followers, ACTION_DIM)
-        pre_squash_v_env = torch.stack(self.buffer.pre_squash_v, dim=0).reshape(N, self.num_followers, 1)
-        has_pre_squash_v_env = torch.stack(self.buffer.has_pre_squash_v, dim=0).reshape(N, self.num_followers, 1)
+        actions_env = actions.reshape(N, buffer.num_followers, ACTION_DIM)
+        pre_squash_v_env = torch.stack(buffer.pre_squash_v, dim=0).reshape(N, buffer.num_followers, 1)
+        has_pre_squash_v_env = torch.stack(buffer.has_pre_squash_v, dim=0).reshape(N, buffer.num_followers, 1)
         any_pre_squash = bool(has_pre_squash_v_env.any().item())
-        old_logp_env = old_logp.reshape(N, self.num_followers, 1)
+        old_logp_env = old_logp.reshape(N, buffer.num_followers, 1)
         adv_env = adv.reshape(N, 1)
         ret_env = ret.reshape(N, 1)
 
@@ -1034,47 +1125,33 @@ class CTDEMAPPOAgent:
                 idx = perm[start : start + mb_size]
 
                 mb_gs = global_states_env[idx]
-                mb_fs = follower_states_env[idx]
-                mb_act = actions_env[idx]
-                mb_pre_v = pre_squash_v_env[idx] if any_pre_squash else None
-                mb_has_pre_v = has_pre_squash_v_env[idx] if any_pre_squash else None
-                mb_old_logp = old_logp_env[idx]  # (mb, F, 1)
-                mb_adv = adv_env[idx]  # (mb, 1)
-                mb_ret = ret_env[idx]  # (mb, 1)
-
-                fs_flat = mb_fs.reshape(-1, STATE_DIM)
-                act_flat = mb_act.reshape(-1, ACTION_DIM)
-                pre_v_flat = mb_pre_v.reshape(-1, 1) if mb_pre_v is not None else None
-                has_pre_v_flat = mb_has_pre_v.reshape(-1, 1) if mb_has_pre_v is not None else None
-
-                # 标准 MAPPO：逐智能体 (per-agent) 计算重要度比率与解析分布熵，按记录选择原始 pre-squash 速度
-                new_logp_flat, entropy_flat = self.actor.evaluate_actions(
-                    fs_flat,
-                    act_flat,
-                    return_entropy=True,
-                    pre_squash_v=pre_v_flat,
-                    has_pre_squash_v=has_pre_v_flat,
-                )
-                new_logp = new_logp_flat.view(-1, self.num_followers, 1)
-                entropy = entropy_flat.view(-1, self.num_followers, 1)
-
-                log_ratio = new_logp - mb_old_logp
-                ratio = torch.exp(log_ratio)
-                mb_adv_expanded = mb_adv.unsqueeze(1)  # (mb, 1, 1) -> broadcast 到 (mb, F, 1)
-
-                surr1 = ratio * mb_adv_expanded
-                surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * mb_adv_expanded
-                policy_loss = -(torch.min(surr1, surr2)).mean()
-
-                entropy_mean = entropy.mean()
-                # Schulman k3 无偏非负 KL 近似（per-agent 均值）
-                approx_kl = ((ratio - 1.0) - log_ratio).mean()
-                clipfrac = (torch.abs(ratio - 1.0) > clip_eps).float().mean()
-
-                actor_loss = policy_loss - float(PPO_ENTROPY_COEF) * entropy_mean
-
+                mb_ret = ret_env[idx]
+                chunk_size = (len(idx) if self.actor_microbatch_max_rows is None else
+                              max(1, self.actor_microbatch_max_rows // buffer.num_followers))
                 self.actor_optimizer.zero_grad(set_to_none=True)
-                actor_loss.backward()
+                stats = torch.zeros(4, device=DEVICE)
+                for chunk in idx.split(chunk_size):
+                    pre_v = pre_squash_v_env[chunk].reshape(-1, 1) if any_pre_squash else None
+                    has_pre_v = has_pre_squash_v_env[chunk].reshape(-1, 1) if any_pre_squash else None
+                    new_logp, entropy = self.actor.evaluate_actions(
+                        follower_states_env[chunk].reshape(-1, STATE_DIM),
+                        actions_env[chunk].reshape(-1, ACTION_DIM),
+                        return_entropy=True, pre_squash_v=pre_v, has_pre_squash_v=has_pre_v,
+                    )
+                    log_ratio = new_logp.reshape(-1, buffer.num_followers, 1) - old_logp_env[chunk]
+                    ratio = log_ratio.exp()
+                    advantage = adv_env[chunk].unsqueeze(1)
+                    policy_loss = -torch.minimum(
+                        ratio * advantage, ratio.clamp(1.0 - clip_eps, 1.0 + clip_eps) * advantage
+                    ).mean()
+                    entropy_mean = entropy.mean()
+                    # 完整环境记录含相同数量的 follower；尾块按实际行数计权。
+                    weight = len(chunk) / len(idx)
+                    ((policy_loss - float(PPO_ENTROPY_COEF) * entropy_mean) * weight).backward()
+                    with torch.no_grad():
+                        kl = ((ratio - 1.0) - log_ratio).mean()
+                        clipfrac = ((ratio - 1.0).abs() > clip_eps).float().mean()
+                        stats += weight * torch.stack((policy_loss, entropy_mean, kl, clipfrac))
                 torch.nn.utils.clip_grad_norm_(self.actor.parameters(), float(PPO_MAX_GRAD_NORM))
                 self.actor_optimizer.step()
 
@@ -1086,12 +1163,12 @@ class CTDEMAPPOAgent:
                 torch.nn.utils.clip_grad_norm_(self.value_net.parameters(), float(PPO_MAX_GRAD_NORM))
                 self.value_optimizer.step()
 
-                pol_losses.append(float(policy_loss.detach().item()))
+                policy_mean, entropy_mean, kl_val, clipfrac_mean = stats.tolist()
+                pol_losses.append(policy_mean)
                 v_losses.append(float(value_loss.detach().item()))
-                entropies.append(float(entropy_mean.detach().item()))
-                kl_val = float(approx_kl.detach().item())
+                entropies.append(entropy_mean)
                 kls.append(kl_val)
-                clipfracs.append(float(clipfrac.detach().item()))
+                clipfracs.append(clipfrac_mean)
 
                 if float(PPO_TARGET_KL) > 0 and kl_val > 1.5 * float(PPO_TARGET_KL):
                     early_stop = True
@@ -1100,14 +1177,14 @@ class CTDEMAPPOAgent:
             if early_stop:
                 break
 
-        self.buffer.clear()
+        buffer.clear()
 
         mean_entropy = float(np.mean(entropies)) if entropies else float("nan")
         self.last_losses = {
             "policy": float(np.mean(pol_losses)) if pol_losses else float("nan"),
             "value": float(np.mean(v_losses)) if v_losses else float("nan"),
             "entropy": mean_entropy,
-            "entropy_joint": mean_entropy * float(self.num_followers) if entropies else float("nan"),
+            "entropy_joint": mean_entropy * float(buffer.num_followers) if entropies else float("nan"),
             "kl": float(np.mean(kls)) if kls else float("nan"),
             "clipfrac": float(np.mean(clipfracs)) if clipfracs else float("nan"),
             "early_stopped": early_stop,
@@ -1121,12 +1198,11 @@ class CTDEMAPPOAgent:
         Args:
             path: 保存路径。
         """
-        parent = os.path.dirname(str(path))
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-
-        torch.save({"actor": self.actor.state_dict(), "value": self.value_net.state_dict()}, path)
+        _save_checkpoint(path, self.actor, "MAPPO", value=self.value_net.state_dict())
         print(f"✅ CTDE MAPPO Model saved to {path}")
+
+    def save_actor(self, path: str):
+        _save_checkpoint(path, self.actor, "MAPPO")
 
     def load(self, path: str):
         """从文件加载模型参数。
@@ -1134,7 +1210,119 @@ class CTDEMAPPOAgent:
         Args:
             path: checkpoint 路径。
         """
-        checkpoint = torch.load(path, map_location=DEVICE)
-        self.actor.load_state_dict(checkpoint["actor"])
-        self.value_net.load_state_dict(checkpoint["value"])
+        checkpoint, _ = _read_checkpoint(path, algorithm="MAPPO", hidden_dim=self.actor.local_encoder[0].out_features)
+        _restore_modules(checkpoint, actor=self.actor, value=self.value_net)
         print(f"✅ CTDE MAPPO Model loaded from {path}")
+
+
+class _RolloutProgress:
+    """只读采集进度；批次内容及写口由 session 独占。"""
+
+    def __init__(self, buffer):
+        self._buffer = buffer
+
+    def __len__(self):
+        return len(self._buffer)
+
+    def is_full(self):
+        return self._buffer.is_full()
+
+    def add(self, *args, **kwargs):
+        raise RuntimeError("Active episode owns rollout records; call session.step_collect()")
+
+
+class MultiScaleEpisodeSession:
+    """在一次完整 reset 与末帧更新之间持有环境、当前帧以及专用 rollout。"""
+
+    def __init__(self, agent, env):
+        with _try_lock(agent._session_lock), env._session_operation(self):
+            if agent._session is not None or len(agent._fixed_buffer):
+                raise RuntimeError("Close the active session and flush pending rollout records first")
+            if getattr(env, "_episode_session", None) is not None:
+                raise RuntimeError("Environment already belongs to an active session")
+            self._bind(agent, env)
+            agent._session = env._episode_session = self
+
+    def _bind(self, agent, env):
+        topology = env.topology
+        if (env.frame_rev != env._episode_start_frame or
+                env._precomputed_topology is not topology or env._precomputed_revision != topology.revision):
+            raise ValueError("Start the episode after a full reset with an up-to-date graph")
+        self._agent = agent
+        self._env = env
+        self._topology = topology
+        self._topology_revision = topology.revision
+        self._adjacency = None if topology.fixed else topology.adj_matrix
+        self._adjacency_version = None if self._adjacency is None else self._adjacency._version
+        self._episode_gen = env.episode_gen
+        self._graph_rev = env.graph_rev
+        self._frame_rev = env.frame_rev
+        self._last_frame = env.frame_rev + env.max_steps
+        self._local = env._get_state_optimized()
+        self._global = env.get_global_state()
+        self._num_envs = env.num_envs
+        n = env.num_followers
+        expected_g = agent.value_net.ctx_dim + (n + 1) * agent.value_net.agent_feat_dim
+        if (env.global_state_dim != expected_g or env.state_dim != STATE_DIM or
+                self._global.shape != (env.num_envs, expected_g) or
+                self._local.shape != (env.num_envs, n + 1, STATE_DIM)):
+            raise ValueError("Episode local/global state dimensions are incompatible with actor/value network")
+        self._buffer = _PPOBuffer(num_followers=n, state_dim=STATE_DIM,
+                                  global_state_dim=expected_g, action_dim=ACTION_DIM)
+        self.buffer = _RolloutProgress(self._buffer)
+        self._ended = False
+
+    def _check_frame(self, expected_frame):
+        env = self._env
+        if self._agent._session is not self or env._episode_session is not self or self._ended:
+            raise RuntimeError("Episode session is closed or has already reached its final update")
+        if (env.frame_rev != expected_frame or env.episode_gen != self._episode_gen or
+                env.graph_rev != self._graph_rev or env.topology is not self._topology or
+                env.topology.revision != self._topology_revision or
+                env.num_envs != self._num_envs or env.num_followers != self._buffer.num_followers or
+                env.state_dim != self._buffer.state_dim or env.global_state_dim != self._buffer.global_state_dim):
+            raise RuntimeError("Environment frame, graph or episode changed outside the active session")
+        if self._adjacency is not None and (env.topology.adj_matrix is not self._adjacency or
+                                             self._adjacency._version != self._adjacency_version):
+            raise RuntimeError("Adjacency matrix changed outside the active session")
+
+    def step_collect(self):
+        with self._env._session_operation(self):
+            self._check_frame(self._frame_rev)
+            if self._frame_rev == self._last_frame:
+                raise RuntimeError("Time limit reached; flush the final rollout before closing")
+            if self._buffer.is_full():
+                raise RuntimeError("Rollout is full; call flush_update() before collecting another step")
+            actions, logp, values, pre = self._agent._act_for_buffer(
+                self._local, self._global, self._buffer, False, True, bind_sample=False
+            )
+            self._check_frame(self._frame_rev)
+            next_local, rewards, dones, infos = self._env.step(actions, _session=self)
+            next_global = self._env.get_global_state()
+            self._check_frame(self._frame_rev + 1)
+            self._buffer.add(self._local[:, 1:], self._global, actions, logp, values,
+                             rewards, dones, pre_squash_v=pre)
+            self._local, self._global = next_local, next_global
+            self._frame_rev += 1
+            return rewards, dones, infos
+
+    def flush_update(self, is_episode_end=False):
+        with self._env._session_operation(self):
+            self._check_frame(self._frame_rev)
+            if bool(is_episode_end) != (self._frame_rev == self._last_frame):
+                raise ValueError("is_episode_end must match the environment time limit")
+            if not len(self._buffer):
+                raise RuntimeError("Cannot update an empty episode rollout")
+            losses = self._agent._update_buffer(
+                self._buffer, self._global, self._buffer.dones[-1], episode_end=is_episode_end
+            )
+            self._ended = bool(is_episode_end)
+            return losses
+
+    def close(self):
+        with _try_lock(self._agent._session_lock), self._env._session_operation(self):
+            if not self._ended or len(self._buffer):
+                raise RuntimeError("Flush the final rollout with is_episode_end=True before close()")
+            if self._agent._session is self:
+                self._agent._session = None
+                self._env._episode_session = None
