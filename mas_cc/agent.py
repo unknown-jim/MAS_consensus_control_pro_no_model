@@ -122,22 +122,17 @@ def _atomic_save_checkpoint(path, actor, algorithm, **training_state):
     os.makedirs(parent, exist_ok=True)
     schema = _actor_schema(actor.local_encoder[0].out_features, algorithm)
     payload = {**schema, "actor": {k: v.detach().cpu() for k, v in actor.state_dict().items()}, **training_state}
-    fd, tmp_path = tempfile.mkstemp(prefix=".tmp_ckpt_", suffix=".pt", dir=parent)
+    tmp_path = None
     replaced = False
-    fd_closed = False
     try:
-        os.close(fd)
-        fd_closed = True
-        torch.save(payload, tmp_path)
+        with tempfile.NamedTemporaryFile(prefix=".tmp_ckpt_", suffix=".pt", dir=parent, delete=False) as tmp_file:
+            tmp_path = tmp_file.name
+            torch.save(payload, tmp_file)
+            tmp_file.flush()
         os.replace(tmp_path, path_str)
         replaced = True
     finally:
-        if not fd_closed:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-        if not replaced and os.path.exists(tmp_path):
+        if not replaced and tmp_path and os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
             except OSError:
@@ -238,7 +233,18 @@ def save_canonical_best_actor(
             except (ValueError, EOFError, IndexError, pickle.UnpicklingError, zipfile.BadZipFile, KeyError, TypeError):
                 reason = "schema_changed_or_unreadable"
             except RuntimeError as exc:
-                if "out of memory" in str(exc).lower():
+                msg = str(exc).lower()
+                format_markers = (
+                    "pytorchstreamreader",
+                    "failed finding central directory",
+                    "invalid load key",
+                    "unexpected eof",
+                    "zip archive",
+                    "magic number",
+                    "corrupt",
+                    "inline_container",
+                )
+                if any(tok in msg for tok in ("memory", "alloc")) or not any(m in msg for m in format_markers):
                     raise
                 reason = "schema_changed_or_unreadable"
 

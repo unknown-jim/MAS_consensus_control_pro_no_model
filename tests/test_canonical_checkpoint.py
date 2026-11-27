@@ -84,7 +84,12 @@ class CanonicalCheckpointTests(unittest.TestCase):
             self.assertTrue(r_recover["updated"])
             self.assertEqual(r_recover["reason"], "schema_changed_or_unreadable")
             good_bytes = mappo_path.read_bytes()
-            for transient_exc in (PermissionError("denied"), MemoryError("oom"), RuntimeError("CUDA out of memory")):
+            for transient_exc in (
+                PermissionError("denied"),
+                MemoryError("oom"),
+                RuntimeError("CUDA out of memory"),
+                RuntimeError("DefaultCPUAllocator: can't allocate memory"),
+            ):
                 with patch.object(agents, "_read_checkpoint", side_effect=transient_exc):
                     with self.assertRaises(type(transient_exc)):
                         save_canonical_best_actor(mappo_path, a1, "MAPPO", score=1.0, eval_signature="prod")
@@ -94,19 +99,8 @@ class CanonicalCheckpointTests(unittest.TestCase):
             self.assertTrue(r_trunc["updated"])
             self.assertEqual(r_trunc["reason"], "schema_changed_or_unreadable")
 
-            # 4) KeyboardInterrupt 在 os.close(fd) 或 torch.save 时中断均不得遗留临时文件
+            # 4) KeyboardInterrupt 在 torch.save 中断不得遗留临时文件（NamedTemporaryFile 托管无重复关闭）
             with patch.object(torch, "save", side_effect=KeyboardInterrupt):
-                with self.assertRaises(KeyboardInterrupt):
-                    save_canonical_best_actor(mappo_path, a2, "MAPPO", score=999.0, eval_signature="prod")
-            self.assertEqual(list(Path(tmp).glob(".tmp_ckpt_*.pt")), [])
-            real_close = os.close
-            closed_once = {"hit": False}
-            def close_interrupt(fd):
-                real_close(fd)
-                if not closed_once["hit"]:
-                    closed_once["hit"] = True
-                    raise KeyboardInterrupt
-            with patch.object(os, "close", side_effect=close_interrupt):
                 with self.assertRaises(KeyboardInterrupt):
                     save_canonical_best_actor(mappo_path, a2, "MAPPO", score=999.0, eval_signature="prod")
             self.assertEqual(list(Path(tmp).glob(".tmp_ckpt_*.pt")), [])
@@ -127,10 +121,17 @@ class CanonicalCheckpointTests(unittest.TestCase):
             final_ckpt = torch.load(conc_path, map_location="cpu", weights_only=True)
             self.assertEqual(final_ckpt["canonical_score"], 30.0)
 
-            # 6) 奖励与边界配置（POS_LIMIT/VEL_LIMIT/微小浮点差）必须体现在 eval_signature 中
+            # 6) 奖励、边界与随机初态范围配置（含 LEADER_AMPLITUDE_RANGE / FOLLOWER_INIT_POS_STD_RANGE）必须体现在 eval_signature 中
             policy = ActorOnlyPolicy(a1)
             sig1 = evaluate_canonical_score(policy, max_steps=2, cases=((5, "normal", "shallow", 1000),))["eval_signature"]
-            for attr, val in (("TRACKING_PENALTY_MAX", 0.0), ("POS_LIMIT", 5.0), ("VEL_LIMIT", 5.0), ("COMM_PENALTY", 0.15000001)):
+            for attr, val in (
+                ("TRACKING_PENALTY_MAX", 0.0),
+                ("POS_LIMIT", 5.0),
+                ("VEL_LIMIT", 5.0),
+                ("COMM_PENALTY", 0.15000001),
+                ("LEADER_AMPLITUDE_RANGE", (0.5, 1.0)),
+                ("FOLLOWER_INIT_POS_STD_RANGE", (2.0, 3.0)),
+            ):
                 with patch.object(env_mod, attr, val):
                     sig_alt = evaluate_canonical_score(policy, max_steps=2, cases=((5, "normal", "shallow", 1000),))["eval_signature"]
                 self.assertNotEqual(sig1, sig_alt, f"{attr} change must alter eval_signature")

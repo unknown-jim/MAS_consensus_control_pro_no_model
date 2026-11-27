@@ -180,13 +180,13 @@ def evaluate_canonical_score(
     comms = []
     devices = [torch.cuda.current_device()] if DEVICE.type == "cuda" else []
 
-    reward_cfg = None
+    sig_hasher = hashlib.sha256()
     with torch.random.fork_rng(devices=devices), actor_only_inference(agent) as policy:
-        for n, pin_mode, depth_mode, seed in case_list:
+        for idx, (n, pin_mode, depth_mode, seed) in enumerate(case_list):
             topo = CommunicationTopology(n, seed=seed, pinned_mode=pin_mode, depth_mode=depth_mode)
             env = ModelFreeEnv(topo, max_steps=steps, auto_reset=False, randomize_topology_on_reset=False)
-            if reward_cfg is None:
-                benv = env.batched_env
+            benv = env.batched_env
+            if idx == 0:
                 sig_payload = {
                     "dt": repr(float(DT)),
                     "pos_limit": repr(float(benv.pos_limit)),
@@ -209,13 +209,24 @@ def evaluate_canonical_score(
                     "threshold_max": repr(float(benv._threshold_max)),
                     "obs_layout": str(OBS_LAYOUT),
                 }
-                reward_cfg = hashlib.sha256(
-                    json.dumps(sig_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-                ).hexdigest()[:16]
+                sig_hasher.update(json.dumps(sig_payload, sort_keys=True, separators=(",", ":")).encode("utf-8"))
             torch.random.default_generator.manual_seed(seed)
             if devices:
                 torch.cuda.manual_seed(seed)
             state = env.reset()
+            # 将每个评估场景 reset 后的真实拓扑、轨迹参数与初态纳入签名，覆盖任意随机化区间变化
+            case_fp = {
+                "case": [n, pin_mode, depth_mode, seed],
+                "pinned": [int(x) for x in topo.pinned_ids],
+                "adj": topo.adj.detach().cpu().to(torch.int8).numpy().tobytes().hex(),
+                "pos": benv.positions.detach().cpu().to(torch.float32).numpy().tobytes().hex(),
+                "vel": benv.velocities.detach().cpu().to(torch.float32).numpy().tobytes().hex(),
+                "amp": benv.leader_amplitude.detach().cpu().to(torch.float32).numpy().tobytes().hex(),
+                "omega": benv.leader_omega.detach().cpu().to(torch.float32).numpy().tobytes().hex(),
+                "phase": benv.leader_phase.detach().cpu().to(torch.float32).numpy().tobytes().hex(),
+                "traj_id": benv.trajectory_type_ids.detach().cpu().to(torch.int64).numpy().tobytes().hex(),
+            }
+            sig_hasher.update(json.dumps(case_fp, sort_keys=True, separators=(",", ":")).encode("utf-8"))
             ep_reward = 0.0
             ep_err = 0.0
             ep_comm = 0.0
@@ -230,7 +241,7 @@ def evaluate_canonical_score(
             comms.append(ep_comm / steps)
 
     sig_parts = [f"n{n}-{pin}-{dep}-s{s}" for n, pin, dep, s in case_list]
-    eval_signature = f"canonical_v2:steps={steps}:{reward_cfg}:" + ",".join(sig_parts)
+    eval_signature = f"canonical_v3:steps={steps}:{sig_hasher.hexdigest()[:16]}:" + ",".join(sig_parts)
     return {
         "score": float(np.mean(rewards)),
         "mean_reward": float(np.mean(rewards)),
