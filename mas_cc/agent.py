@@ -497,16 +497,22 @@ class _PPOBuffer:
     def __init__(
         self,
         rollout_steps: int = PPO_ROLLOUT_STEPS,
-        num_followers: int | None = None,
-        state_dim: int | None = None,
-        global_state_dim: int | None = None,
-        action_dim: int | None = None,
+        *,
+        num_followers: int,
+        state_dim: int,
+        global_state_dim: int,
+        action_dim: int,
     ):
         self.rollout_steps = int(rollout_steps)
-        self.num_followers = int(num_followers) if num_followers is not None else None
-        self.state_dim = int(state_dim) if state_dim is not None else None
-        self.global_state_dim = int(global_state_dim) if global_state_dim is not None else None
-        self.action_dim = int(action_dim) if action_dim is not None else None
+        self.num_followers = int(num_followers)
+        self.state_dim = int(state_dim)
+        self.global_state_dim = int(global_state_dim)
+        self.action_dim = int(action_dim)
+        if min(self.num_followers, self.state_dim, self.global_state_dim, self.action_dim) < 1:
+            raise ValueError(
+                "num_followers, state_dim, global_state_dim, action_dim must all be >= 1, got "
+                f"({self.num_followers}, {self.state_dim}, {self.global_state_dim}, {self.action_dim})"
+            )
         self.clear()
 
     def clear(self):
@@ -538,26 +544,16 @@ class _PPOBuffer:
         pre_squash_v=None,
     ):
         # 先完成全部形状校验与独立快照准备，全部成功后才原子追加各列，防止异常留下半写入脏状态
-        if follower_states.dim() != 3:
-            raise ValueError(f"follower_states: expected 3D tensor (E, F, S), got shape {tuple(follower_states.shape)}")
-        E, F_dim, S_dim = (int(x) for x in follower_states.shape)
+        expected_F = self.num_followers
+        expected_S = self.state_dim
+        expected_G = self.global_state_dim
+        expected_A = self.action_dim
 
-        expected_F = self.num_followers if self.num_followers is not None else (
-            int(self.follower_states[0].shape[1]) if len(self.follower_states) > 0 else F_dim
-        )
-        expected_S = self.state_dim if self.state_dim is not None else (
-            int(self.follower_states[0].shape[2]) if len(self.follower_states) > 0 else S_dim
-        )
-        expected_G = self.global_state_dim if self.global_state_dim is not None else (
-            int(self.global_states[0].shape[1]) if len(self.global_states) > 0 else (
-                int(global_states.shape[1]) if global_states.dim() == 2 else -1
+        if follower_states.dim() != 3:
+            raise ValueError(
+                f"follower_states: expected shape (>=1, {expected_F}, {expected_S}), got {tuple(follower_states.shape)}"
             )
-        )
-        expected_A = self.action_dim if self.action_dim is not None else (
-            int(self.actions[0].shape[2]) if len(self.actions) > 0 else (
-                int(actions.shape[2]) if actions.dim() == 3 else -1
-            )
-        )
+        E, F_dim, S_dim = (int(x) for x in follower_states.shape)
 
         if E < 1:
             raise ValueError(
@@ -682,12 +678,12 @@ class CTDEMAPPOAgent:
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=PPO_LR)
         self.value_optimizer = optim.Adam(self.value_net.parameters(), lr=PPO_LR)
 
-        expected_gs_dim = int(self.value_net.ctx_dim + self.num_agents * self.value_net.agent_feat_dim)
+        self.expected_global_state_dim = int(self.value_net.ctx_dim + self.num_agents * self.value_net.agent_feat_dim)
         self.buffer = _PPOBuffer(
             rollout_steps=PPO_ROLLOUT_STEPS,
             num_followers=self.num_followers,
             state_dim=STATE_DIM,
-            global_state_dim=expected_gs_dim,
+            global_state_dim=self.expected_global_state_dim,
             action_dim=ACTION_DIM,
         )
         self.last_losses = {}
@@ -741,7 +737,17 @@ class CTDEMAPPOAgent:
             - return_pre_squash=True:  (actions, logp, values, pre_squash_v)
         """
         assert local_states.dim() == 3, "MAPPO 训练需要 batched local_states"
+        if tuple(local_states.shape[1:]) != (self.num_agents, STATE_DIM) or int(local_states.shape[0]) < 1:
+            raise ValueError(
+                f"local_states: expected shape (>=1, {self.num_agents}, {STATE_DIM}), got {tuple(local_states.shape)}"
+            )
         E = int(local_states.shape[0])
+        if global_states is not None:
+            if global_states.dim() != 2 or tuple(global_states.shape) != (E, self.expected_global_state_dim):
+                raise ValueError(
+                    f"global_states: expected shape {(E, self.expected_global_state_dim)}, "
+                    f"got {tuple(global_states.shape)}"
+                )
         self._disable_actor_dropout()
 
         follower_states = local_states[:, 1:, :].reshape(-1, STATE_DIM)
@@ -812,7 +818,7 @@ class CTDEMAPPOAgent:
                     f"got {tuple(local_states.shape)}"
                 )
 
-        expected_gs_dim = int(self.value_net.ctx_dim + self.num_agents * self.value_net.agent_feat_dim)
+        expected_gs_dim = self.expected_global_state_dim
         if tuple(global_states.shape) != (E, expected_gs_dim):
             raise ValueError(
                 f"global_states: expected shape {(E, expected_gs_dim)}, got {tuple(global_states.shape)}"
@@ -973,6 +979,16 @@ class CTDEMAPPOAgent:
                     )
                 last_value = torch.zeros(E, device=DEVICE)
             else:
+                if next_global_states.dim() != 2 or tuple(next_global_states.shape) != (
+                    E,
+                    self.expected_global_state_dim,
+                ):
+                    raise ValueError(
+                        f"next_global_states: expected shape {(E, self.expected_global_state_dim)}, "
+                        f"got {tuple(next_global_states.shape)}"
+                    )
+                if next_dones is not None and tuple(next_dones.shape) != (E,):
+                    raise ValueError(f"next_dones: expected shape {(E,)}, got {tuple(next_dones.shape)}")
                 lv = self.value_net(next_global_states).squeeze(-1)
                 if next_dones is not None:
                     lv = lv * (~next_dones.bool()).float()

@@ -469,6 +469,57 @@ class TestKnownFixes(unittest.TestCase):
         self.assertLess(abs(losses_iso["kl"]), 1e-6)
         self.assertEqual(losses_iso["clipfrac"], 0.0)
 
+    def test_buffer_constructor_requires_dims_and_mappo_rejects_mismatched_topology(self):
+        """验证：(1) _PPOBuffer 缺维度参数构造报错；(2) act() 和 update() 拒绝混用其他拓扑的 global_states 且 update 拒绝后保留 buffer 可重试。"""
+        from mas_cc.agent import _PPOBuffer
+
+        # (1) 缺维度参数构造必须立即报错
+        with self.assertRaises(TypeError):
+            _PPOBuffer()
+        with self.assertRaises(TypeError):
+            _PPOBuffer(num_followers=20)
+        with self.assertRaises(ValueError):
+            _PPOBuffer(num_followers=0, state_dim=STATE_DIM, global_state_dim=90, action_dim=ACTION_DIM)
+
+        # (2) 20-follower MAPPO agent 拒绝 6-follower 环境生成的 (4, 34) global_states
+        set_seed(42)
+        topo20 = CommunicationTopology(NUM_FOLLOWERS, num_pinned=NUM_PINNED)
+        env20 = BatchedModelFreeEnv(topo20, num_envs=4)
+        agent20 = CTDEMAPPOAgent(topo20)
+
+        topo6 = CommunicationTopology(6, num_pinned=2)
+        env6 = BatchedModelFreeEnv(topo6, num_envs=4)
+        env6.reset()
+        gs_wrong_topo = env6.get_global_state()  # (4, 34)
+
+        s20 = env20.reset()
+        g20 = env20.get_global_state()  # (4, 90)
+        self.assertNotEqual(gs_wrong_topo.shape[1], g20.shape[1])
+
+        # act() 拒绝混用拓扑
+        with self.assertRaisesRegex(ValueError, "global_states"):
+            agent20.act(s20, gs_wrong_topo, deterministic=False)
+
+        # 正常采集并入库 1 条记录，update() 传入错拓扑后继状态必须拒绝且保留记录
+        a20, lp20, v20, pre20 = agent20.act(s20, g20, deterministic=False, return_pre_squash=True)
+        ns20, r20, d20, _ = env20.step(a20)
+        ng20 = env20.get_global_state()
+        agent20.store_rollout_step(s20, g20, a20, lp20, v20, r20, d20, pre_squash_v=pre20)
+        self.assertEqual(len(agent20.buffer), 1)
+
+        with self.assertRaisesRegex(ValueError, "next_global_states"):
+            agent20.update(next_global_states=gs_wrong_topo, next_dones=d20)
+        self.assertEqual(len(agent20.buffer), 1)
+
+        # 传回正确 (4, 90) 后继状态直接重试成功并清空 buffer
+        losses = agent20.update(next_global_states=ng20, next_dones=d20)
+        self.assertEqual(len(agent20.buffer), 0)
+        self.assertTrue(math.isfinite(losses["policy"]))
+
+        # 同时验证 CentralizedValue 独立实例依然支持动态规模 N=6 和 N=20
+        self.assertEqual(tuple(agent20.value_net(gs_wrong_topo).shape), (4, 1))
+        self.assertEqual(tuple(agent20.value_net(g20).shape), (4, 1))
+
     def test_mappo_per_agent_logp_and_update(self):
         topo = CommunicationTopology(NUM_FOLLOWERS, num_pinned=NUM_PINNED)
         env = BatchedModelFreeEnv(topo, num_envs=4)
