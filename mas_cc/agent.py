@@ -494,8 +494,19 @@ class CTDESACAgent:
 class _PPOBuffer:
     """On-policy rollout buffer（按时间步存储，支持并行环境与 per-agent logp）。"""
 
-    def __init__(self, rollout_steps: int = PPO_ROLLOUT_STEPS):
+    def __init__(
+        self,
+        rollout_steps: int = PPO_ROLLOUT_STEPS,
+        num_followers: int | None = None,
+        state_dim: int | None = None,
+        global_state_dim: int | None = None,
+        action_dim: int | None = None,
+    ):
         self.rollout_steps = int(rollout_steps)
+        self.num_followers = int(num_followers) if num_followers is not None else None
+        self.state_dim = int(state_dim) if state_dim is not None else None
+        self.global_state_dim = int(global_state_dim) if global_state_dim is not None else None
+        self.action_dim = int(action_dim) if action_dim is not None else None
         self.clear()
 
     def clear(self):
@@ -529,29 +540,49 @@ class _PPOBuffer:
         # 先完成全部形状校验与独立快照准备，全部成功后才原子追加各列，防止异常留下半写入脏状态
         if follower_states.dim() != 3:
             raise ValueError(f"follower_states: expected 3D tensor (E, F, S), got shape {tuple(follower_states.shape)}")
-        E, F_dim, S_dim = follower_states.shape
+        E, F_dim, S_dim = (int(x) for x in follower_states.shape)
 
+        expected_F = self.num_followers if self.num_followers is not None else (
+            int(self.follower_states[0].shape[1]) if len(self.follower_states) > 0 else F_dim
+        )
+        expected_S = self.state_dim if self.state_dim is not None else (
+            int(self.follower_states[0].shape[2]) if len(self.follower_states) > 0 else S_dim
+        )
+        expected_G = self.global_state_dim if self.global_state_dim is not None else (
+            int(self.global_states[0].shape[1]) if len(self.global_states) > 0 else (
+                int(global_states.shape[1]) if global_states.dim() == 2 else -1
+            )
+        )
+        expected_A = self.action_dim if self.action_dim is not None else (
+            int(self.actions[0].shape[2]) if len(self.actions) > 0 else (
+                int(actions.shape[2]) if actions.dim() == 3 else -1
+            )
+        )
+
+        if E < 1:
+            raise ValueError(
+                f"follower_states: expected shape (>=1, {expected_F}, {expected_S}), got {tuple(follower_states.shape)}"
+            )
         if len(self.rewards) > 0:
             prev_E = int(self.rewards[0].shape[0])
             if E != prev_E:
-                raise ValueError(f"env batch size mismatch: expected E={prev_E}, got E={E}")
-            prev_F, prev_S = int(self.follower_states[0].shape[1]), int(self.follower_states[0].shape[2])
-            if (F_dim, S_dim) != (prev_F, prev_S):
                 raise ValueError(
-                    f"follower_states: expected shape ({prev_E}, {prev_F}, {prev_S}), got {tuple(follower_states.shape)}"
+                    f"follower_states: expected shape ({prev_E}, {expected_F}, {expected_S}), got {tuple(follower_states.shape)}"
                 )
-            prev_G = int(self.global_states[0].shape[1])
-            if tuple(global_states.shape) != (prev_E, prev_G):
-                raise ValueError(
-                    f"global_states: expected shape ({prev_E}, {prev_G}), got {tuple(global_states.shape)}"
-                )
-        elif global_states.dim() != 2 or int(global_states.shape[0]) != E:
-            raise ValueError(f"global_states: expected shape ({E}, G), got {tuple(global_states.shape)}")
-
-        if actions.dim() != 3 or int(actions.shape[0]) != E or int(actions.shape[1]) != F_dim:
-            raise ValueError(f"actions: expected shape ({E}, {F_dim}, A), got {tuple(actions.shape)}")
-        if tuple(logp.shape) != (E, F_dim, 1):
-            raise ValueError(f"logp: expected shape ({E}, {F_dim}, 1), got {tuple(logp.shape)}")
+        if (F_dim, S_dim) != (expected_F, expected_S):
+            raise ValueError(
+                f"follower_states: expected shape ({E}, {expected_F}, {expected_S}), got {tuple(follower_states.shape)}"
+            )
+        if global_states.dim() != 2 or tuple(global_states.shape) != (E, expected_G):
+            raise ValueError(
+                f"global_states: expected shape ({E}, {expected_G}), got {tuple(global_states.shape)}"
+            )
+        if actions.dim() != 3 or tuple(actions.shape) != (E, expected_F, expected_A):
+            raise ValueError(
+                f"actions: expected shape ({E}, {expected_F}, {expected_A}), got {tuple(actions.shape)}"
+            )
+        if tuple(logp.shape) != (E, expected_F, 1):
+            raise ValueError(f"logp: expected shape ({E}, {expected_F}, 1), got {tuple(logp.shape)}")
         if tuple(values.shape) != (E, 1):
             raise ValueError(f"values: expected shape ({E}, 1), got {tuple(values.shape)}")
         if tuple(rewards.shape) != (E,):
@@ -569,9 +600,10 @@ class _PPOBuffer:
             raise ValueError(
                 f"has_truncated_next_values: expected shape ({E},), got {tuple(has_truncated_next_values.shape)}"
             )
-        if pre_squash_v is not None and tuple(pre_squash_v.shape) not in ((E, F_dim, 1), (E, F_dim)):
+        if pre_squash_v is not None and tuple(pre_squash_v.shape) not in ((E, expected_F, 1), (E, expected_F)):
             raise ValueError(
-                f"pre_squash_v: expected shape ({E}, {F_dim}, 1) or ({E}, {F_dim}), got {tuple(pre_squash_v.shape)}"
+                f"pre_squash_v: expected shape ({E}, {expected_F}, 1) or ({E}, {expected_F}), "
+                f"got {tuple(pre_squash_v.shape)}"
             )
 
         fs_c = follower_states.detach().float().clone()
@@ -650,7 +682,14 @@ class CTDEMAPPOAgent:
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=PPO_LR)
         self.value_optimizer = optim.Adam(self.value_net.parameters(), lr=PPO_LR)
 
-        self.buffer = _PPOBuffer(rollout_steps=PPO_ROLLOUT_STEPS)
+        expected_gs_dim = int(self.value_net.ctx_dim + self.num_agents * self.value_net.agent_feat_dim)
+        self.buffer = _PPOBuffer(
+            rollout_steps=PPO_ROLLOUT_STEPS,
+            num_followers=self.num_followers,
+            state_dim=STATE_DIM,
+            global_state_dim=expected_gs_dim,
+            action_dim=ACTION_DIM,
+        )
         self.last_losses = {}
         # 按返回动作 Tensor 的对象身份 (id + weakref) 精确绑定随机采样时的原始 pre-squash 速度，
         # 避免按值匹配串用不同采样，并由 weakref.finalize 自动清理防止内存泄漏。
@@ -713,9 +752,9 @@ class CTDEMAPPOAgent:
         v_pre = v_pre_flat.view(E, self.num_followers, 1).float().detach().clone()
 
         if not deterministic:
-            # 仅为随机训练采样按对象身份绑定 pre_squash_v，确定性推理不污染映射表
+            # 绑定表独占一份独立快照，避免调用方复用 return_pre_squash 返回张量时改写绑定值
             act_id = id(actions)
-            self._sampled_pre_squash_by_id[act_id] = (weakref.ref(actions), v_pre)
+            self._sampled_pre_squash_by_id[act_id] = (weakref.ref(actions), v_pre.clone())
             weakref.finalize(actions, self._sampled_pre_squash_by_id.pop, act_id, None)
 
         if logp_flat is None:
@@ -729,7 +768,7 @@ class CTDEMAPPOAgent:
             values = self.value_net(global_states).float()
 
         if return_pre_squash:
-            return actions, logp, values, v_pre
+            return actions, logp, values, v_pre.clone()
         return actions, logp, values
 
     def store_rollout_step(
@@ -758,13 +797,20 @@ class CTDEMAPPOAgent:
 
         if local_states.dim() != 3 or tuple(local_states.shape[1:]) != (self.num_agents, STATE_DIM):
             raise ValueError(
-                f"local_states: expected shape (E, {self.num_agents}, {STATE_DIM}), got {tuple(local_states.shape)}"
+                f"local_states: expected shape (>=1, {self.num_agents}, {STATE_DIM}), got {tuple(local_states.shape)}"
             )
         E = int(local_states.shape[0])
+        if E < 1:
+            raise ValueError(
+                f"local_states: expected shape (>=1, {self.num_agents}, {STATE_DIM}), got {tuple(local_states.shape)}"
+            )
         if len(self.buffer) > 0:
             expected_E = int(self.buffer.rewards[0].shape[0])
             if E != expected_E:
-                raise ValueError(f"local_states: expected rollout batch E={expected_E}, got E={E}")
+                raise ValueError(
+                    f"local_states: expected shape {(expected_E, self.num_agents, STATE_DIM)}, "
+                    f"got {tuple(local_states.shape)}"
+                )
 
         expected_gs_dim = int(self.value_net.ctx_dim + self.num_agents * self.value_net.agent_feat_dim)
         if tuple(global_states.shape) != (E, expected_gs_dim):

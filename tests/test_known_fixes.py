@@ -399,6 +399,76 @@ class TestKnownFixes(unittest.TestCase):
         losses_leg = agent.update(next_global_states=ng_leg, next_dones=d_leg)
         self.assertTrue(math.isfinite(losses_leg["policy"]))
 
+    def test_buffer_direct_width_zero_batch_and_act_return_isolation(self):
+        """验证：(1) _PPOBuffer.add() 空库与已有记录均拒绝错误宽度；(2) E=0 被拒绝且跨步错误含字段名与完整形状；(3) 改写 act() 第4返回值不污染绑定表。"""
+        set_seed(42)
+        topo = CommunicationTopology(NUM_FOLLOWERS, num_pinned=NUM_PINNED)
+        env = BatchedModelFreeEnv(topo, num_envs=4)
+        agent = CTDEMAPPOAgent(topo)
+        with torch.no_grad():
+            agent.actor.v_log_std.bias.fill_(1.5)
+        agent.actor.train()
+
+        s1 = env.reset()
+        g1 = env.get_global_state()
+        a1, lp1, v1, pre1 = agent.act(s1, g1, deterministic=False, return_pre_squash=True)
+        ns1, r1, d1, _ = env.step(a1)
+        ng1 = env.get_global_state()
+        fs1 = s1[:, 1:, :]
+
+        # --- (1) 空库：E=0 拒绝并可立即用合法 E=4 恢复 ---
+        with self.assertRaisesRegex(ValueError, "local_states"):
+            agent.store_rollout_step(s1[:0], g1[:0], a1[:0], lp1[:0], v1[:0], r1[:0], d1[:0])
+        self.assertEqual(len(agent.buffer), 0)
+
+        with self.assertRaisesRegex(ValueError, "follower_states"):
+            agent.buffer.add(fs1[:0], g1[:0], a1[:0], lp1[:0], v1[:0], r1[:0], d1[:0])
+        self.assertEqual(len(agent.buffer), 0)
+
+        # 空库下直接调 _PPOBuffer.add() 校验特征/全局/动作宽度
+        with self.assertRaisesRegex(ValueError, "follower_states"):
+            agent.buffer.add(fs1[:, :, :-1], g1, a1, lp1, v1, r1, d1)
+        with self.assertRaisesRegex(ValueError, "global_states"):
+            agent.buffer.add(fs1, g1[:, :-1], a1, lp1, v1, r1, d1)
+        with self.assertRaisesRegex(ValueError, "actions"):
+            agent.buffer.add(fs1, g1, a1[:, :, :-1], lp1, v1, r1, d1)
+        self.assertEqual(len(agent.buffer), 0)
+
+        # --- (2) 已有记录：拒绝错误动作宽度 & 跨步 E=4->3 错误信息包含字段名与完整形状 ---
+        agent.buffer.add(fs1, g1, a1, lp1, v1, r1, d1, pre_squash_v=pre1)
+        self.assertEqual(len(agent.buffer), 1)
+        with self.assertRaisesRegex(ValueError, "actions"):
+            agent.buffer.add(fs1, g1, a1[:, :, :-1], lp1, v1, r1, d1)
+        with self.assertRaisesRegex(ValueError, r"follower_states.*\(4, 20, 33\).*\(3, 20, 33\)"):
+            agent.buffer.add(fs1[:3], g1[:3], a1[:3], lp1[:3], v1[:3], r1[:3], d1[:3])
+        with self.assertRaisesRegex(ValueError, r"local_states.*\(4, 21, 33\).*\(3, 21, 33\)"):
+            agent.store_rollout_step(s1[:3], g1[:3], a1[:3], lp1[:3], v1[:3], r1[:3], d1[:3])
+        self.assertEqual(len(agent.buffer), 1)
+        agent.buffer.clear()
+
+        # --- (3) 改写 act(return_pre_squash=True) 返回的第 4 个张量不污染绑定表 ---
+        a_iso, lp_iso, v_iso, pre_iso = agent.act(s1, g1, deterministic=False, return_pre_squash=True)
+        expected_pre = pre_iso.clone()
+        ns_iso, r_iso, d_iso, _ = env.step(a_iso)
+        ng_iso = env.get_global_state()
+
+        # 模拟调用方在 inference_mode 下就地复写返回的 pre_iso 张量
+        with torch.inference_mode():
+            pre_iso.add_(50.0)
+        self.assertFalse(torch.equal(pre_iso, expected_pre))
+        # 仍依赖隐式绑定入库，验证绑定表独占的快照未受影响
+        agent.store_rollout_step(s1, g1, a_iso, lp_iso, v_iso, r_iso, d_iso)
+        self.assertTrue(torch.equal(agent.buffer.pre_squash_v[0], expected_pre))
+
+        orig_lr = agent.actor_optimizer.param_groups[0]["lr"]
+        agent.actor_optimizer.param_groups[0]["lr"] = 0.0
+        try:
+            losses_iso = agent.update(next_global_states=ng_iso, next_dones=d_iso)
+        finally:
+            agent.actor_optimizer.param_groups[0]["lr"] = orig_lr
+        self.assertLess(abs(losses_iso["kl"]), 1e-6)
+        self.assertEqual(losses_iso["clipfrac"], 0.0)
+
     def test_mappo_per_agent_logp_and_update(self):
         topo = CommunicationTopology(NUM_FOLLOWERS, num_pinned=NUM_PINNED)
         env = BatchedModelFreeEnv(topo, num_envs=4)
