@@ -8,6 +8,8 @@ CTDE = Centralized Training, Decentralized Execution（集中训练、分散执�
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -293,14 +295,22 @@ class DecentralizedActor(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
+        # 隐藏层采用标准正交初始化（sqrt(2) 适配 GELU/ReLU 特征层），避免特征表示与早期梯度坍缩
+        hidden_gain = math.sqrt(2.0)
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                nn.init.orthogonal_(m.weight, gain=0.01)
+                nn.init.orthogonal_(m.weight, gain=hidden_gain)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
+        # 仅速度输出头使用小增益 0.01，保持初始控制幅度接近 0
+        for head in (self.v_mean, self.v_log_std):
+            nn.init.orthogonal_(head.weight, gain=0.01)
+            if head.bias is not None:
+                nn.init.zeros_(head.bias)
+
         # 特殊初始化：Beta 分布阈值归一化头（theta_norm）
-        # 目标：初始 theta_norm ≈ 0.80（对应 theta 较小 → 高通信率）
+        # 目标：初始 theta_norm ≈ 0.70（对应 theta 较小 → 高通信率）
         # 这让智能体一开始就能获得好的跟踪效果，然后通过通信惩罚学会提高阈值
         # softplus(2.0) + 1.0 ≈ 3.1, softplus(-1.0) + 1.0 ≈ 1.3 → mean ≈ 0.70
         nn.init.zeros_(self.comm_alpha.weight)
@@ -329,22 +339,23 @@ class DecentralizedActor(nn.Module):
 
         return v_mean, v_log_std, comm_alpha, comm_beta
 
-    def forward(self, state: torch.Tensor, deterministic: bool = False):
+    def forward(self, state: torch.Tensor, deterministic: bool = False, return_pre_squash: bool = False):
         v_mean, v_log_std, comm_alpha, comm_beta = self.compute_action_params(state)
 
         v_std = torch.exp(v_log_std)
 
         if deterministic:
             # 速度：tanh squash
-            v = torch.tanh(v_mean) * self.v_scale
+            v_pre = v_mean
+            v = torch.tanh(v_pre) * self.v_scale
             # 阈值归一化：Beta 分布的均值
             theta_norm = comm_alpha / (comm_alpha + comm_beta)
             log_prob = None
         else:
             # 速度采样
             v_dist = Normal(v_mean, v_std)
-            v_sample = v_dist.rsample()
-            v_tanh = torch.tanh(v_sample)
+            v_pre = v_dist.rsample()
+            v_tanh = torch.tanh(v_pre)
             v = v_tanh * self.v_scale
 
             # 阈值归一化采样：Beta 分布
@@ -353,39 +364,72 @@ class DecentralizedActor(nn.Module):
             theta_norm = comm_dist.rsample().clamp(self._eps, 1.0 - self._eps)
 
             # log_prob 计算
-            log_prob_v = v_dist.log_prob(v_sample) - torch.log(
+            log_prob_v = v_dist.log_prob(v_pre) - torch.log(
                 torch.clamp(1.0 - v_tanh.pow(2), min=self._eps, max=1.0)
-            ) - self._log_v_scale.to(v_sample.device)
+            ) - self._log_v_scale.to(v_pre.device)
 
             log_prob_comm = comm_dist.log_prob(theta_norm)
 
             log_prob = (log_prob_v + log_prob_comm).sum(dim=-1, keepdim=True)
 
         action = torch.cat([v, theta_norm], dim=-1)
+        if return_pre_squash:
+            return action, log_prob, v_pre
         return action, log_prob
 
-    def evaluate_actions(self, state: torch.Tensor, action: torch.Tensor):
-        """给定动作计算 log_prob（用于 PPO/MAPPO）。
+    def evaluate_actions(
+        self,
+        state: torch.Tensor,
+        action: torch.Tensor,
+        return_entropy: bool = False,
+        pre_squash_v: torch.Tensor | None = None,
+        has_pre_squash_v: torch.Tensor | None = None,
+    ):
+        """给定动作计算 log_prob，以及（可选）解析分布熵（用于 PPO/MAPPO）。
 
         Args:
             state: shape=(B, STATE_DIM)。
             action: shape=(B, ACTION_DIM)，为 post-squash 空间动作（与环境交互的动作）。
                 - action[:, 0]: delta_v
                 - action[:, 1]: theta_norm
+            return_entropy: 若为 True，额外返回 per-agent 解析熵 shape=(B, 1)。
+            pre_squash_v: 可选的采集时原始 pre-squash 速度样本，shape=(B, 1)。
+                提供时直接复用该样本与 `tanh(pre_squash_v)` 计算精确对数概率，避免
+                饱和区 `clamp + atanh` 反演带来的数值失真。
+            has_pre_squash_v: 可选的逐条布尔掩码，shape=(B, 1)。提供时按记录选择：
+                True 的条目使用 `pre_squash_v`，False 的条目回退到从 `action[:, 0:1]` 反演。
 
         Returns:
-            log_prob: shape=(B, 1)
+            - return_entropy=False: log_prob，shape=(B, 1)
+            - return_entropy=True: (log_prob, entropy)，形状均为 (B, 1)
         """
 
         v_mean, v_log_std, comm_alpha, comm_beta = self.compute_action_params(state)
         v_std = torch.exp(v_log_std)
 
-        v = action[:, 0:1]
         theta_norm = action[:, 1:2].clamp(self._eps, 1.0 - self._eps)
 
-        # 反向计算 pre-squash 值（仅速度需要）
-        v_tanh = (v / self.v_scale).clamp(-1.0 + self._eps, 1.0 - self._eps)
-        v_pre = _atanh(v_tanh, eps=self._eps)
+        if pre_squash_v is not None:
+            v_pre_stored = pre_squash_v.view(-1, 1).to(device=v_mean.device, dtype=v_mean.dtype)
+            if has_pre_squash_v is None:
+                v_pre = v_pre_stored
+                v_tanh = torch.tanh(v_pre)
+            else:
+                mask = has_pre_squash_v.view(-1, 1).to(device=v_mean.device, dtype=torch.bool)
+                if bool(mask.all().item()):
+                    v_pre = v_pre_stored
+                    v_tanh = torch.tanh(v_pre)
+                else:
+                    v = action[:, 0:1]
+                    v_tanh_inv = (v / self.v_scale).clamp(-1.0 + self._eps, 1.0 - self._eps)
+                    v_pre_inv = _atanh(v_tanh_inv, eps=self._eps)
+                    v_pre = torch.where(mask, v_pre_stored, v_pre_inv)
+                    v_tanh = torch.where(mask, torch.tanh(v_pre_stored), v_tanh_inv)
+        else:
+            # 兼容未提供 pre_squash_v 的调用方：从 post-squash 动作反演
+            v = action[:, 0:1]
+            v_tanh = (v / self.v_scale).clamp(-1.0 + self._eps, 1.0 - self._eps)
+            v_pre = _atanh(v_tanh, eps=self._eps)
 
         v_dist = Normal(v_mean, v_std)
         comm_dist = Beta(comm_alpha, comm_beta)
@@ -398,12 +442,29 @@ class DecentralizedActor(nn.Module):
         log_prob_comm = comm_dist.log_prob(theta_norm)
 
         log_prob = (log_prob_v + log_prob_comm).sum(dim=-1, keepdim=True)
+        if return_entropy:
+            # 速度维采用 pre-squash Normal 解析熵（低方差标准实现），通信维采用 Beta 精确解析熵
+            entropy = (v_dist.entropy() + comm_dist.entropy()).sum(dim=-1, keepdim=True)
+            return log_prob, entropy
         return log_prob
 
 
 # ============================================================
 # Critic / Value（分离 Leader/Follower 编码，适配规模扩展）
 # ============================================================
+
+
+def _infer_num_agents_from_global_state(global_state_dim: int, agent_feat_dim: int, ctx_dim: int) -> int:
+    """根据 global_state 特征宽度动态推导智能体总数（支持任意 follower 规模）。"""
+    rem = int(global_state_dim) - int(ctx_dim)
+    if rem <= 0 or (rem % int(agent_feat_dim) != 0):
+        raise ValueError(
+            f"Invalid global_state_dim={global_state_dim} for agent_feat_dim={agent_feat_dim}, ctx_dim={ctx_dim}"
+        )
+    num_agents = rem // int(agent_feat_dim)
+    if num_agents < 2:
+        raise ValueError(f"Expected at least 2 agents (1 leader + >=1 follower), got {num_agents}")
+    return int(num_agents)
 
 
 def _split_global_state(global_state: torch.Tensor, num_agents: int):
@@ -596,23 +657,27 @@ class CentralizedCritic(nn.Module):
         if joint_action.is_inference():
             joint_action = joint_action.clone()
 
-        if global_state.shape[1] != int(self.global_state_dim):
-            raise ValueError(f"Expected global_state_dim={self.global_state_dim}, got {global_state.shape[1]}")
-
+        if global_state.dim() != 2:
+            raise ValueError(f"Expected global_state dim=2, got shape={tuple(global_state.shape)}")
         if joint_action.dim() != 2:
             raise ValueError(f"Expected joint_action dim=2, got shape={tuple(joint_action.shape)}")
-        expected_joint = int(self.num_followers * self.action_dim)
+
+        num_agents = _infer_num_agents_from_global_state(
+            global_state.shape[1], self.agent_feat_dim, self.ctx_dim
+        )
+        num_followers = num_agents - 1
+        expected_joint = int(num_followers * self.action_dim)
         if joint_action.shape[1] != expected_joint:
             raise ValueError(f"Expected joint_action_dim={expected_joint}, got {joint_action.shape[1]}")
 
         # 分离 Leader 和 Follower
-        leader_feat, follower_feats, global_ctx = _split_global_state(global_state, self.num_agents)
+        leader_feat, follower_feats, global_ctx = _split_global_state(global_state, num_agents)
 
         # 编码
         z_leader = self.leader_encoder(leader_feat)  # (B, hidden_dim)
         z_followers = self.follower_set_encoder(follower_feats)  # (B, hidden_dim)
 
-        act_seq = joint_action.view(-1, self.num_followers, self.action_dim)
+        act_seq = joint_action.view(-1, num_followers, self.action_dim)
         z_action = self.action_set_encoder(act_seq)  # (B, hidden_dim)
 
         # 融合
@@ -698,11 +763,15 @@ class CentralizedValue(nn.Module):
         if global_state.is_inference():
             global_state = global_state.clone()
 
-        if global_state.shape[1] != int(self.global_state_dim):
-            raise ValueError(f"Expected global_state_dim={self.global_state_dim}, got {global_state.shape[1]}")
+        if global_state.dim() != 2:
+            raise ValueError(f"Expected global_state dim=2, got shape={tuple(global_state.shape)}")
+
+        num_agents = _infer_num_agents_from_global_state(
+            global_state.shape[1], self.agent_feat_dim, self.ctx_dim
+        )
 
         # 分离 Leader 和 Follower
-        leader_feat, follower_feats, global_ctx = _split_global_state(global_state, self.num_agents)
+        leader_feat, follower_feats, global_ctx = _split_global_state(global_state, num_agents)
 
         # 编码
         z_leader = self.leader_encoder(leader_feat)  # (B, hidden_dim)

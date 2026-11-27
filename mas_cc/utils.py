@@ -31,8 +31,9 @@ def _set_eval_for_inference(agent):
     """
 
     modules = [(agent.actor, bool(agent.actor.training))]
-    if agent.value_net is not None:
-        modules.append((agent.value_net, bool(agent.value_net.training)))
+    value_net = getattr(agent, "value_net", None)
+    if value_net is not None:
+        modules.append((value_net, bool(value_net.training)))
 
     for m, _ in modules:
         m.eval()

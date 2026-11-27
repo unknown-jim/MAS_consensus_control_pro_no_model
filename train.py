@@ -124,7 +124,9 @@ def train(
 
             # 执行阶段：actor 只使用本地状态；训练阶段：MAPPO 还会用 global_state 估计 value
             if is_mappo:
-                actions, logp_joint, values = agent.act(local_states, global_states, deterministic=False)
+                actions, logp, values, pre_squash_v = agent.act(
+                    local_states, global_states, deterministic=False, return_pre_squash=True
+                )
             else:
                 actions = agent.select_action(local_states, deterministic=False)
 
@@ -135,32 +137,34 @@ def train(
             if profile_timing:
                 step_time_s += (time.perf_counter() - t0)
 
-            # 处理时间截断：最后一步视为终止，避免跨 episode 的 bootstrapping 偏差
-            time_limit_done = torch.zeros_like(dones)
+            # 区分真实终止 (dones) 与时间截断 (time_limit_done)：
+            # 时间截断保留末步 value bootstrap，避免人为制造末步价值悬崖
+            time_limit_done = torch.zeros_like(dones, dtype=torch.bool)
             if step == MAX_STEPS - 1:
                 time_limit_done[:] = True
-            store_dones = dones | time_limit_done
 
             if is_mappo:
-                # MAPPO：on-policy rollout
+                # MAPPO：on-policy rollout（显式传入 pre_squash_v 与截断步重置前 next_global_states）
                 agent.store_rollout_step(
-                    local_states, global_states, actions, logp_joint, values,
-                    rewards, store_dones
+                    local_states, global_states, actions, logp, values,
+                    rewards, dones, truncated=time_limit_done,
+                    next_global_states=next_global_states if time_limit_done.any() else None,
+                    pre_squash_v=pre_squash_v,
                 )
 
                 do_update = agent.buffer.is_full() or (step == MAX_STEPS - 1)
                 if do_update:
                     if profile_timing:
                         t1 = time.perf_counter()
-                    agent.update(next_global_states=next_global_states, next_dones=store_dones)
+                    agent.update(next_global_states=next_global_states, next_dones=dones)
                     if profile_timing:
                         update_time_s += (time.perf_counter() - t1)
                         update_calls += 1
             else:
-                # MASAC（CTDE-SAC）：off-policy replay
+                # MASAC（CTDE-SAC）：off-policy replay（仅真实终止置 done，时间截断保留 bootstrap）
                 agent.store_transitions_batch(
                     local_states, global_states, actions, rewards,
-                    next_local_states, next_global_states, store_dones
+                    next_local_states, next_global_states, dones
                 )
 
                 if step % UPDATE_FREQUENCY == 0 and step > 0 and global_step > WARMUP_STEPS:

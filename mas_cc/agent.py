@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import weakref
 
 import numpy as np
 import torch
@@ -58,6 +59,7 @@ class ActorOnlyPolicy:
     def __init__(self, actor: DecentralizedActor, use_amp: bool = False):
         self.actor = actor.to(DEVICE)
         self.actor.eval()
+        self.value_net = None  # 与 CTDESACAgent / CTDEMAPPOAgent 接口对齐，兼容评估工具
         self.use_amp = bool(use_amp and DEVICE.type == "cuda")
         self._autocast = None
         if self.use_amp:
@@ -490,29 +492,156 @@ class CTDESACAgent:
 
 
 class _PPOBuffer:
-    """On-policy rollout buffer（按时间步存储，支持并行环境）。"""
+    """On-policy rollout buffer（按时间步存储，支持并行环境与 per-agent logp）。"""
 
-    def __init__(self, rollout_steps: int = PPO_ROLLOUT_STEPS):
+    def __init__(
+        self,
+        rollout_steps: int = PPO_ROLLOUT_STEPS,
+        *,
+        num_followers: int,
+        state_dim: int,
+        global_state_dim: int,
+        action_dim: int,
+    ):
         self.rollout_steps = int(rollout_steps)
+        self.num_followers = int(num_followers)
+        self.state_dim = int(state_dim)
+        self.global_state_dim = int(global_state_dim)
+        self.action_dim = int(action_dim)
+        if min(self.num_followers, self.state_dim, self.global_state_dim, self.action_dim) < 1:
+            raise ValueError(
+                "num_followers, state_dim, global_state_dim, action_dim must all be >= 1, got "
+                f"({self.num_followers}, {self.state_dim}, {self.global_state_dim}, {self.action_dim})"
+            )
         self.clear()
 
     def clear(self):
         self.follower_states = []
         self.global_states = []
         self.actions = []
-        self.logp_joint = []
+        self.pre_squash_v = []
+        self.has_pre_squash_v = []
+        self.logp = []
         self.values = []
         self.rewards = []
         self.dones = []
+        self.truncated = []
+        self.truncated_next_values = []
+        self.has_truncated_next_values = []
 
-    def add(self, follower_states, global_states, actions, logp_joint, values, rewards, dones):
-        self.follower_states.append(follower_states)
-        self.global_states.append(global_states)
-        self.actions.append(actions)
-        self.logp_joint.append(logp_joint)
-        self.values.append(values)
-        self.rewards.append(rewards)
-        self.dones.append(dones)
+    def add(
+        self,
+        follower_states,
+        global_states,
+        actions,
+        logp,
+        values,
+        rewards,
+        dones,
+        truncated=None,
+        truncated_next_values=None,
+        has_truncated_next_values=None,
+        pre_squash_v=None,
+    ):
+        # 先完成全部形状校验与独立快照准备，全部成功后才原子追加各列，防止异常留下半写入脏状态
+        expected_F = self.num_followers
+        expected_S = self.state_dim
+        expected_G = self.global_state_dim
+        expected_A = self.action_dim
+
+        if follower_states.dim() != 3:
+            raise ValueError(
+                f"follower_states: expected shape (>=1, {expected_F}, {expected_S}), got {tuple(follower_states.shape)}"
+            )
+        E, F_dim, S_dim = (int(x) for x in follower_states.shape)
+
+        if E < 1:
+            raise ValueError(
+                f"follower_states: expected shape (>=1, {expected_F}, {expected_S}), got {tuple(follower_states.shape)}"
+            )
+        if len(self.rewards) > 0:
+            prev_E = int(self.rewards[0].shape[0])
+            if E != prev_E:
+                raise ValueError(
+                    f"follower_states: expected shape ({prev_E}, {expected_F}, {expected_S}), got {tuple(follower_states.shape)}"
+                )
+        if (F_dim, S_dim) != (expected_F, expected_S):
+            raise ValueError(
+                f"follower_states: expected shape ({E}, {expected_F}, {expected_S}), got {tuple(follower_states.shape)}"
+            )
+        if global_states.dim() != 2 or tuple(global_states.shape) != (E, expected_G):
+            raise ValueError(
+                f"global_states: expected shape ({E}, {expected_G}), got {tuple(global_states.shape)}"
+            )
+        if actions.dim() != 3 or tuple(actions.shape) != (E, expected_F, expected_A):
+            raise ValueError(
+                f"actions: expected shape ({E}, {expected_F}, {expected_A}), got {tuple(actions.shape)}"
+            )
+        if tuple(logp.shape) != (E, expected_F, 1):
+            raise ValueError(f"logp: expected shape ({E}, {expected_F}, 1), got {tuple(logp.shape)}")
+        if tuple(values.shape) != (E, 1):
+            raise ValueError(f"values: expected shape ({E}, 1), got {tuple(values.shape)}")
+        if tuple(rewards.shape) != (E,):
+            raise ValueError(f"rewards: expected shape ({E},), got {tuple(rewards.shape)}")
+        if tuple(dones.shape) != (E,):
+            raise ValueError(f"dones: expected shape ({E},), got {tuple(dones.shape)}")
+
+        if truncated is not None and tuple(truncated.shape) != (E,):
+            raise ValueError(f"truncated: expected shape ({E},), got {tuple(truncated.shape)}")
+        if truncated_next_values is not None and tuple(truncated_next_values.shape) != (E,):
+            raise ValueError(
+                f"truncated_next_values: expected shape ({E},), got {tuple(truncated_next_values.shape)}"
+            )
+        if has_truncated_next_values is not None and tuple(has_truncated_next_values.shape) != (E,):
+            raise ValueError(
+                f"has_truncated_next_values: expected shape ({E},), got {tuple(has_truncated_next_values.shape)}"
+            )
+        if pre_squash_v is not None and tuple(pre_squash_v.shape) not in ((E, expected_F, 1), (E, expected_F)):
+            raise ValueError(
+                f"pre_squash_v: expected shape ({E}, {expected_F}, 1) or ({E}, {expected_F}), "
+                f"got {tuple(pre_squash_v.shape)}"
+            )
+
+        fs_c = follower_states.detach().float().clone()
+        gs_c = global_states.detach().float().clone()
+        act_c = actions.detach().float().clone()
+        logp_c = logp.detach().float().clone()
+        val_c = values.detach().float().clone()
+        rew_c = rewards.detach().float().clone()
+        done_c = dones.detach().bool().clone()
+
+        trunc_c = torch.zeros_like(done_c, dtype=torch.bool) if truncated is None else truncated.detach().bool().clone()
+        trunc_nv_c = (
+            torch.zeros_like(rew_c, dtype=torch.float32)
+            if truncated_next_values is None
+            else truncated_next_values.detach().float().clone()
+        )
+        has_trunc_nv_c = (
+            torch.zeros_like(done_c, dtype=torch.bool)
+            if has_truncated_next_values is None
+            else has_truncated_next_values.detach().bool().clone()
+        )
+
+        if pre_squash_v is None:
+            pre_v_c = torch.zeros_like(logp_c, dtype=torch.float32)
+            has_pre_v_c = torch.zeros_like(logp_c, dtype=torch.bool)
+        else:
+            pre_v_c = pre_squash_v.detach().float().reshape_as(logp_c).clone()
+            has_pre_v_c = torch.ones_like(logp_c, dtype=torch.bool)
+
+        # 所有准备就绪后一次性追加
+        self.follower_states.append(fs_c)
+        self.global_states.append(gs_c)
+        self.actions.append(act_c)
+        self.pre_squash_v.append(pre_v_c)
+        self.has_pre_squash_v.append(has_pre_v_c)
+        self.logp.append(logp_c)
+        self.values.append(val_c)
+        self.rewards.append(rew_c)
+        self.dones.append(done_c)
+        self.truncated.append(trunc_c)
+        self.truncated_next_values.append(trunc_nv_c)
+        self.has_truncated_next_values.append(has_trunc_nv_c)
 
     def __len__(self):
         return len(self.rewards)
@@ -544,17 +673,39 @@ class CTDEMAPPOAgent:
 
         self.actor = DecentralizedActor(hidden_dim=HIDDEN_DIM).to(DEVICE)
         self.value_net = CentralizedValue(global_state_dim=GLOBAL_STATE_DIM, hidden_dim=HIDDEN_DIM).to(DEVICE)
+        self._disable_actor_dropout()
 
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=PPO_LR)
         self.value_optimizer = optim.Adam(self.value_net.parameters(), lr=PPO_LR)
 
-        self.buffer = _PPOBuffer(rollout_steps=PPO_ROLLOUT_STEPS)
+        self.expected_global_state_dim = int(self.value_net.ctx_dim + self.num_agents * self.value_net.agent_feat_dim)
+        self.buffer = _PPOBuffer(
+            rollout_steps=PPO_ROLLOUT_STEPS,
+            num_followers=self.num_followers,
+            state_dim=STATE_DIM,
+            global_state_dim=self.expected_global_state_dim,
+            action_dim=ACTION_DIM,
+        )
         self.last_losses = {}
+        # 按返回动作 Tensor 的对象身份 (id + weakref) 精确绑定随机采样时的原始 pre-squash 速度，
+        # 避免按值匹配串用不同采样，并由 weakref.finalize 自动清理防止内存泄漏。
+        self._sampled_pre_squash_by_id: dict[int, tuple[weakref.ref, torch.Tensor]] = {}
 
         print("📊 CTDE MAPPO Agent initialized:")
         print(f"   Actor input: Local state ({STATE_DIM})")
         print(f"   Value input: Global state ({GLOBAL_STATE_DIM})")
         print(f"   Rollout steps: {PPO_ROLLOUT_STEPS} | Epochs: {PPO_EPOCHS} | Minibatch: {PPO_MINIBATCH_SIZE}")
+
+    def _disable_actor_dropout(self) -> None:
+        """在 MAPPO 采样与更新阶段一致关闭 Actor 内部 Dropout。
+
+        原因：PPO 重要度采样比率 ratio = exp(new_logp - old_logp) 与 k3 KL 近似要求
+        采样与重评估对应同一个确定性策略分布；若训练期启用随机 Dropout，即使参数未更新
+        也会产生随机 mask 偏差，破坏 ratio=1 / KL=0 契约。关闭 Dropout 同时保留全部参数梯度。
+        """
+        for module in self.actor.modules():
+            if isinstance(module, torch.nn.Dropout):
+                module.eval()
 
     @torch.inference_mode()
     def select_action(self, local_states: torch.Tensor, deterministic: bool = False):
@@ -565,60 +716,234 @@ class CTDEMAPPOAgent:
         return actions
 
     @torch.inference_mode()
-    def act(self, local_states: torch.Tensor, global_states: torch.Tensor | None = None, deterministic: bool = False):
-        """采样动作并（可选）返回 value 估计。
+    def act(
+        self,
+        local_states: torch.Tensor,
+        global_states: torch.Tensor | None = None,
+        deterministic: bool = False,
+        return_pre_squash: bool = False,
+    ):
+        """采样动作并（可选）返回 value 估计及原始 pre-squash 速度样本。
 
         Args:
             local_states: shape=(E, num_agents, STATE_DIM)。
             global_states: shape=(E, GLOBAL_STATE_DIM)；若为 None 则不计算 value。
             deterministic: 是否使用确定性动作。
+            return_pre_squash: 若为 True，额外返回第 4 个元素 `pre_squash_v`（shape=(E, F, 1)），
+                便于调用方显式传给 `store_rollout_step(..., pre_squash_v=...)`。
 
         Returns:
-            actions: shape=(E, num_followers, ACTION_DIM)
-            logp_joint: shape=(E, 1)
-            values: shape=(E, 1)；当 global_states 为 None 时填充 NaN。
+            - return_pre_squash=False: (actions, logp, values)
+            - return_pre_squash=True:  (actions, logp, values, pre_squash_v)
         """
         assert local_states.dim() == 3, "MAPPO 训练需要 batched local_states"
+        if tuple(local_states.shape[1:]) != (self.num_agents, STATE_DIM) or int(local_states.shape[0]) < 1:
+            raise ValueError(
+                f"local_states: expected shape (>=1, {self.num_agents}, {STATE_DIM}), got {tuple(local_states.shape)}"
+            )
         E = int(local_states.shape[0])
+        if global_states is not None:
+            if global_states.dim() != 2 or tuple(global_states.shape) != (E, self.expected_global_state_dim):
+                raise ValueError(
+                    f"global_states: expected shape {(E, self.expected_global_state_dim)}, "
+                    f"got {tuple(global_states.shape)}"
+                )
+        self._disable_actor_dropout()
 
         follower_states = local_states[:, 1:, :].reshape(-1, STATE_DIM)
-        act_flat, logp_flat = self.actor(follower_states, deterministic=deterministic)
+        act_flat, logp_flat, v_pre_flat = self.actor(
+            follower_states, deterministic=deterministic, return_pre_squash=True
+        )
         actions = act_flat.view(E, self.num_followers, ACTION_DIM).float()
+        v_pre = v_pre_flat.view(E, self.num_followers, 1).float().detach().clone()
+
+        if not deterministic:
+            # 绑定表独占一份独立快照，避免调用方复用 return_pre_squash 返回张量时改写绑定值
+            act_id = id(actions)
+            self._sampled_pre_squash_by_id[act_id] = (weakref.ref(actions), v_pre.clone())
+            weakref.finalize(actions, self._sampled_pre_squash_by_id.pop, act_id, None)
 
         if logp_flat is None:
-            logp_joint = torch.zeros((E, 1), device=DEVICE)
+            logp = torch.zeros((E, self.num_followers, 1), device=DEVICE)
         else:
-            logp_joint = logp_flat.view(E, self.num_followers, 1).sum(dim=1)
+            logp = logp_flat.view(E, self.num_followers, 1).float()
 
         if global_states is None:
             values = torch.full((E, 1), float("nan"), device=DEVICE)
         else:
             values = self.value_net(global_states).float()
 
-        return actions, logp_joint, values
+        if return_pre_squash:
+            return actions, logp, values, v_pre.clone()
+        return actions, logp, values
 
-    def store_rollout_step(self, local_states, global_states, actions, logp_joint, values, rewards, dones):
+    def store_rollout_step(
+        self,
+        local_states,
+        global_states,
+        actions,
+        logp=None,
+        values=None,
+        rewards=None,
+        dones=None,
+        truncated=None,
+        next_global_states=None,
+        truncated_next_values=None,
+        pre_squash_v=None,
+        *,
+        logp_joint=None,
+    ):
+        # 兼容旧关键字参数 `logp_joint=` 别名，并统一校验必需参数与 per-agent 形状
+        if logp is not None and logp_joint is not None:
+            raise TypeError("Specify only one of 'logp' or legacy alias 'logp_joint', not both.")
+        if logp is None:
+            logp = logp_joint
+        if logp is None or values is None or rewards is None or dones is None:
+            raise TypeError("store_rollout_step requires logp (or logp_joint), values, rewards, and dones.")
+
+        if local_states.dim() != 3 or tuple(local_states.shape[1:]) != (self.num_agents, STATE_DIM):
+            raise ValueError(
+                f"local_states: expected shape (>=1, {self.num_agents}, {STATE_DIM}), got {tuple(local_states.shape)}"
+            )
+        E = int(local_states.shape[0])
+        if E < 1:
+            raise ValueError(
+                f"local_states: expected shape (>=1, {self.num_agents}, {STATE_DIM}), got {tuple(local_states.shape)}"
+            )
+        if len(self.buffer) > 0:
+            expected_E = int(self.buffer.rewards[0].shape[0])
+            if E != expected_E:
+                raise ValueError(
+                    f"local_states: expected shape {(expected_E, self.num_agents, STATE_DIM)}, "
+                    f"got {tuple(local_states.shape)}"
+                )
+
+        expected_gs_dim = self.expected_global_state_dim
+        if tuple(global_states.shape) != (E, expected_gs_dim):
+            raise ValueError(
+                f"global_states: expected shape {(E, expected_gs_dim)}, got {tuple(global_states.shape)}"
+            )
+        expected_act_shape = (E, self.num_followers, ACTION_DIM)
+        if tuple(actions.shape) != expected_act_shape:
+            raise ValueError(f"actions: expected shape {expected_act_shape}, got {tuple(actions.shape)}")
+        expected_logp_shape = (E, self.num_followers, 1)
+        if tuple(logp.shape) != expected_logp_shape:
+            raise ValueError(f"logp: expected shape {expected_logp_shape}, got {tuple(logp.shape)}")
+        if tuple(values.shape) != (E, 1):
+            raise ValueError(f"values: expected shape {(E, 1)}, got {tuple(values.shape)}")
+        if tuple(rewards.shape) != (E,):
+            raise ValueError(f"rewards: expected shape {(E,)}, got {tuple(rewards.shape)}")
+        if tuple(dones.shape) != (E,):
+            raise ValueError(f"dones: expected shape {(E,)}, got {tuple(dones.shape)}")
+        if truncated is not None and tuple(truncated.shape) != (E,):
+            raise ValueError(f"truncated: expected shape {(E,)}, got {tuple(truncated.shape)}")
+        if next_global_states is not None and tuple(next_global_states.shape) != (E, expected_gs_dim):
+            raise ValueError(
+                f"next_global_states: expected shape {(E, expected_gs_dim)}, got {tuple(next_global_states.shape)}"
+            )
+        if truncated_next_values is not None and tuple(truncated_next_values.shape) not in ((E,), (E, 1)):
+            raise ValueError(
+                f"truncated_next_values: expected shape {(E,)} or {(E, 1)}, got {tuple(truncated_next_values.shape)}"
+            )
+        if pre_squash_v is not None and tuple(pre_squash_v.shape) not in (expected_logp_shape, (E, self.num_followers)):
+            raise ValueError(
+                f"pre_squash_v: expected shape {expected_logp_shape} or {(E, self.num_followers)}, "
+                f"got {tuple(pre_squash_v.shape)}"
+            )
+
         follower_states = local_states[:, 1:, :].detach()
+        actions_f = actions.detach().float()
+        dones_b = dones.detach().bool()
+        truncated_b = truncated.detach().bool() if truncated is not None else torch.zeros_like(dones_b, dtype=torch.bool)
+        rewards_f = rewards.detach().float()
+
+        # 先查询但不消费对象身份绑定；待 buffer.add 校验和快照全部成功后再消费
+        bound_entry = self._sampled_pre_squash_by_id.get(id(actions))
+        has_bound_entry = bound_entry is not None and bound_entry[0]() is actions
+
+        if pre_squash_v is not None:
+            pre_squash_v_f = pre_squash_v.detach().float().reshape(expected_logp_shape).clone()
+        elif has_bound_entry:
+            pre_squash_v_f = bound_entry[1].detach().float().clone()
+        else:
+            pre_squash_v_f = None
+
+        trunc_nv = torch.zeros_like(rewards_f)
+        has_trunc_nv = torch.zeros_like(dones_b, dtype=torch.bool)
+
+        if truncated_b.any():
+            if truncated_next_values is not None:
+                trunc_nv = truncated_next_values.detach().float().reshape(E).clone()
+                has_trunc_nv = truncated_b.clone()
+            elif next_global_states is not None:
+                with torch.no_grad():
+                    trunc_nv = self.value_net(next_global_states.detach().float()).squeeze(-1).float().clone()
+                has_trunc_nv = truncated_b.clone()
+
         self.buffer.add(
             follower_states.float(),
             global_states.detach().float(),
-            actions.detach().float(),
-            logp_joint.detach().float(),
+            actions_f,
+            logp.detach().float(),
             values.detach().float(),
-            rewards.detach().float(),
-            dones.detach(),
+            rewards_f,
+            dones_b,
+            truncated_b,
+            trunc_nv,
+            has_trunc_nv,
+            pre_squash_v=pre_squash_v_f,
         )
 
-    def _compute_gae(self, rewards, dones, values, last_value):
+        # 仅在原子入库成功后才消费该动作的对象身份绑定
+        if has_bound_entry:
+            self._sampled_pre_squash_by_id.pop(id(actions), None)
+
+    def _compute_gae(
+        self,
+        rewards,
+        dones,
+        values,
+        last_value,
+        truncated=None,
+        truncated_next_values=None,
+        has_truncated_next_values=None,
+    ):
+        """计算 GAE 与回报，正确区分真实终止 (dones) 与时间截断 (truncated)。
+
+        - 真实终止 (`dones[t]=True`，即使同时 `truncated[t]=True`)：不 bootstrap (`next_value * 0`)，且中断 GAE 递推。
+        - 时间截断 (`truncated[t]=True, dones[t]=False`)：中断跨 episode 的 GAE 递推，
+          并使用截断前真实的 `V(s_{t+1})`（`truncated_next_values[t]` 或末步 `last_value`）做 bootstrap，
+          避免跨 episode 错用下一 episode 初始状态价值或 `values[t]`。
+        """
         T, E = rewards.shape
+        if truncated is None:
+            truncated = torch.zeros_like(dones, dtype=torch.bool)
+        if truncated_next_values is None:
+            truncated_next_values = torch.zeros_like(rewards, dtype=torch.float32)
+        if has_truncated_next_values is None:
+            has_truncated_next_values = torch.zeros_like(dones, dtype=torch.bool)
+
         advantages = torch.zeros(T, E, device=DEVICE)
         gae = torch.zeros(E, device=DEVICE)
 
         for t in reversed(range(T)):
             nonterminal = (~dones[t]).float()
-            next_value = last_value if t == T - 1 else values[t + 1]
+            episode_continue = (~(dones[t] | truncated[t])).float()
+            need_trunc_bootstrap = truncated[t] & (~dones[t])
+
+            if t == T - 1:
+                use_stored = need_trunc_bootstrap & has_truncated_next_values[t]
+                next_value = torch.where(use_stored, truncated_next_values[t], last_value)
+            else:
+                if need_trunc_bootstrap.any() and not bool(has_truncated_next_values[t][need_trunc_bootstrap].all().item()):
+                    raise ValueError(
+                        "Truncated step before rollout end requires next_global_states or truncated_next_values "
+                        "to compute exact bootstrap V(s_{t+1})."
+                    )
+                next_value = torch.where(need_trunc_bootstrap, truncated_next_values[t], values[t + 1])
+
             delta = rewards[t] + GAMMA * next_value * nonterminal - values[t]
-            gae = delta + GAMMA * PPO_GAE_LAMBDA * nonterminal * gae
+            gae = delta + GAMMA * PPO_GAE_LAMBDA * episode_continue * gae
             advantages[t] = gae
 
         returns = advantages + values
@@ -628,26 +953,56 @@ class CTDEMAPPOAgent:
         if len(self.buffer) == 0:
             return {}
 
+        self._disable_actor_dropout()
+
         follower_states = torch.stack(self.buffer.follower_states, dim=0)  # (T,E,F,S)
         global_states = torch.stack(self.buffer.global_states, dim=0)  # (T,E,G)
         actions = torch.stack(self.buffer.actions, dim=0)  # (T,E,F,A)
-        old_logp_joint = torch.stack(self.buffer.logp_joint, dim=0)  # (T,E,1)
+        old_logp = torch.stack(self.buffer.logp, dim=0)  # (T,E,F,1)
         values = torch.stack(self.buffer.values, dim=0)  # (T,E,1)
         rewards = torch.stack(self.buffer.rewards, dim=0)  # (T,E)
         dones = torch.stack(self.buffer.dones, dim=0)  # (T,E)
+        truncated = torch.stack(self.buffer.truncated, dim=0)  # (T,E)
+        truncated_next_values = torch.stack(self.buffer.truncated_next_values, dim=0)  # (T,E)
+        has_truncated_next_values = torch.stack(self.buffer.has_truncated_next_values, dim=0)  # (T,E)
 
         T, E = rewards.shape
 
         with torch.no_grad():
             if next_global_states is None:
+                # 逐环境检查末步：若存在截断且非真实终止、同时既无已存后继价值又无传入后继状态，则显式报错
+                last_missing_trunc = truncated[-1] & (~dones[-1]) & (~has_truncated_next_values[-1])
+                if last_missing_trunc.any():
+                    raise ValueError(
+                        "Final truncated step requires next_global_states or truncated_next_values "
+                        "to compute exact bootstrap V(s_{t+1})."
+                    )
                 last_value = torch.zeros(E, device=DEVICE)
             else:
+                if next_global_states.dim() != 2 or tuple(next_global_states.shape) != (
+                    E,
+                    self.expected_global_state_dim,
+                ):
+                    raise ValueError(
+                        f"next_global_states: expected shape {(E, self.expected_global_state_dim)}, "
+                        f"got {tuple(next_global_states.shape)}"
+                    )
+                if next_dones is not None and tuple(next_dones.shape) != (E,):
+                    raise ValueError(f"next_dones: expected shape {(E,)}, got {tuple(next_dones.shape)}")
                 lv = self.value_net(next_global_states).squeeze(-1)
                 if next_dones is not None:
-                    lv = lv * (~next_dones).float()
+                    lv = lv * (~next_dones.bool()).float()
                 last_value = lv
 
-            adv, ret = self._compute_gae(rewards=rewards, dones=dones, values=values.squeeze(-1), last_value=last_value)
+            adv, ret = self._compute_gae(
+                rewards=rewards,
+                dones=dones,
+                values=values.squeeze(-1),
+                last_value=last_value,
+                truncated=truncated,
+                truncated_next_values=truncated_next_values,
+                has_truncated_next_values=has_truncated_next_values,
+            )
 
             adv_flat = adv.reshape(-1)
             adv = (adv - adv_flat.mean()) / (adv_flat.std(unbiased=False) + 1e-8)
@@ -656,7 +1011,10 @@ class CTDEMAPPOAgent:
         follower_states_env = follower_states.reshape(N, self.num_followers, STATE_DIM)
         global_states_env = global_states.reshape(N, -1)
         actions_env = actions.reshape(N, self.num_followers, ACTION_DIM)
-        old_logp_env = old_logp_joint.reshape(N, 1)
+        pre_squash_v_env = torch.stack(self.buffer.pre_squash_v, dim=0).reshape(N, self.num_followers, 1)
+        has_pre_squash_v_env = torch.stack(self.buffer.has_pre_squash_v, dim=0).reshape(N, self.num_followers, 1)
+        any_pre_squash = bool(has_pre_squash_v_env.any().item())
+        old_logp_env = old_logp.reshape(N, self.num_followers, 1)
         adv_env = adv.reshape(N, 1)
         ret_env = ret.reshape(N, 1)
 
@@ -668,6 +1026,7 @@ class CTDEMAPPOAgent:
         entropies = []
         kls = []
         clipfracs = []
+        early_stop = False
 
         for _ in range(int(PPO_EPOCHS)):
             perm = torch.randperm(N, device=DEVICE)
@@ -677,26 +1036,42 @@ class CTDEMAPPOAgent:
                 mb_gs = global_states_env[idx]
                 mb_fs = follower_states_env[idx]
                 mb_act = actions_env[idx]
-                mb_old_logp = old_logp_env[idx]
-                mb_adv = adv_env[idx]
-                mb_ret = ret_env[idx]
+                mb_pre_v = pre_squash_v_env[idx] if any_pre_squash else None
+                mb_has_pre_v = has_pre_squash_v_env[idx] if any_pre_squash else None
+                mb_old_logp = old_logp_env[idx]  # (mb, F, 1)
+                mb_adv = adv_env[idx]  # (mb, 1)
+                mb_ret = ret_env[idx]  # (mb, 1)
 
                 fs_flat = mb_fs.reshape(-1, STATE_DIM)
                 act_flat = mb_act.reshape(-1, ACTION_DIM)
+                pre_v_flat = mb_pre_v.reshape(-1, 1) if mb_pre_v is not None else None
+                has_pre_v_flat = mb_has_pre_v.reshape(-1, 1) if mb_has_pre_v is not None else None
 
-                new_logp_flat = self.actor.evaluate_actions(fs_flat, act_flat)
-                new_logp_joint = new_logp_flat.view(-1, self.num_followers, 1).sum(dim=1)
+                # 标准 MAPPO：逐智能体 (per-agent) 计算重要度比率与解析分布熵，按记录选择原始 pre-squash 速度
+                new_logp_flat, entropy_flat = self.actor.evaluate_actions(
+                    fs_flat,
+                    act_flat,
+                    return_entropy=True,
+                    pre_squash_v=pre_v_flat,
+                    has_pre_squash_v=has_pre_v_flat,
+                )
+                new_logp = new_logp_flat.view(-1, self.num_followers, 1)
+                entropy = entropy_flat.view(-1, self.num_followers, 1)
 
-                ratio = torch.exp(new_logp_joint - mb_old_logp)
-                surr1 = ratio * mb_adv
-                surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * mb_adv
+                log_ratio = new_logp - mb_old_logp
+                ratio = torch.exp(log_ratio)
+                mb_adv_expanded = mb_adv.unsqueeze(1)  # (mb, 1, 1) -> broadcast 到 (mb, F, 1)
+
+                surr1 = ratio * mb_adv_expanded
+                surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * mb_adv_expanded
                 policy_loss = -(torch.min(surr1, surr2)).mean()
 
-                entropy_joint = (-new_logp_joint).mean()
-                approx_kl = (mb_old_logp - new_logp_joint).mean()
+                entropy_mean = entropy.mean()
+                # Schulman k3 无偏非负 KL 近似（per-agent 均值）
+                approx_kl = ((ratio - 1.0) - log_ratio).mean()
                 clipfrac = (torch.abs(ratio - 1.0) > clip_eps).float().mean()
 
-                actor_loss = policy_loss - float(PPO_ENTROPY_COEF) * entropy_joint
+                actor_loss = policy_loss - float(PPO_ENTROPY_COEF) * entropy_mean
 
                 self.actor_optimizer.zero_grad(set_to_none=True)
                 actor_loss.backward()
@@ -713,21 +1088,30 @@ class CTDEMAPPOAgent:
 
                 pol_losses.append(float(policy_loss.detach().item()))
                 v_losses.append(float(value_loss.detach().item()))
-                entropies.append(float(entropy_joint.detach().item()))
-                kls.append(float(approx_kl.detach().item()))
+                entropies.append(float(entropy_mean.detach().item()))
+                kl_val = float(approx_kl.detach().item())
+                kls.append(kl_val)
                 clipfracs.append(float(clipfrac.detach().item()))
 
-                if float(PPO_TARGET_KL) > 0 and float(approx_kl.detach().item()) > 1.5 * float(PPO_TARGET_KL):
+                if float(PPO_TARGET_KL) > 0 and kl_val > 1.5 * float(PPO_TARGET_KL):
+                    early_stop = True
                     break
+
+            if early_stop:
+                break
 
         self.buffer.clear()
 
+        mean_entropy = float(np.mean(entropies)) if entropies else float("nan")
         self.last_losses = {
             "policy": float(np.mean(pol_losses)) if pol_losses else float("nan"),
             "value": float(np.mean(v_losses)) if v_losses else float("nan"),
-            "entropy_joint": float(np.mean(entropies)) if entropies else float("nan"),
+            "entropy": mean_entropy,
+            "entropy_joint": mean_entropy * float(self.num_followers) if entropies else float("nan"),
             "kl": float(np.mean(kls)) if kls else float("nan"),
             "clipfrac": float(np.mean(clipfracs)) if clipfracs else float("nan"),
+            "early_stopped": early_stop,
+            "update_minibatches": len(pol_losses),
         }
         return self.last_losses
 
