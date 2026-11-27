@@ -849,6 +849,42 @@ class TestAuditMicrobatchAndProfiler(unittest.TestCase):
         session3 = learner.start_episode(env)
         session3.abort()
 
+    def test_reentrant_abort_in_value_hook_is_atomic(self):
+        graph = CommunicationTopology(5, seed=11)
+        env = BatchedModelFreeEnv(graph, 1, max_steps=2, randomize_topology_on_reset=False)
+        learner = CTDEMAPPOAgent(graph)
+        session = learner.start_episode(env)
+        session.step_collect()
+        self.assertEqual(len(session.buffer), 1)
+
+        caught = []
+
+        def hook(module, args, out):
+            try:
+                session.abort()
+            except RuntimeError as exc:
+                caught.append(exc)
+            return out
+
+        handle = learner.value_net.register_forward_hook(hook)
+        try:
+            session.step_collect()
+        finally:
+            handle.remove()
+
+        self.assertEqual(len(caught), 1)
+        self.assertEqual(len(session.buffer), 2)
+        self.assertFalse(session._ended)
+        self.assertFalse(session._aborted)
+        self.assertEqual(graph._readers, 1)
+        session.flush_update(is_episode_end=True)
+        session.close()
+        self.assertIsNone(learner._session)
+        self.assertEqual(graph._readers, 0)
+        # 已正常 close 的 session 再调 abort() 不得翻转 _aborted 或影响状态
+        session.abort()
+        self.assertFalse(session._aborted)
+
     def test_manual_randomize_refreshes_cache_on_full_reset_without_auto_randomize(self):
         graph = CommunicationTopology(10, seed=19)
         env = BatchedModelFreeEnv(graph, 1, max_steps=2, randomize_topology_on_reset=False)

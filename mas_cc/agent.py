@@ -1346,12 +1346,12 @@ class MultiScaleEpisodeSession:
         不视作成功 flush；作废后须执行完整 env.reset() 才能绑定新会话。
         """
         with _try_lock(self._agent._session_lock):
-            self._buffer.clear()
-            self._ended = True
-            self._aborted = True
             if self._agent._session is not self:
                 return
             with self._env._session_operation(self):
+                self._buffer.clear()
+                self._ended = True
+                self._aborted = True
                 self._graph_lease.close()
                 self._agent._session = None
                 self._env._episode_session = None
