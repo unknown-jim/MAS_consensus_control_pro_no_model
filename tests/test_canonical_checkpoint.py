@@ -66,16 +66,16 @@ class CanonicalCheckpointTests(unittest.TestCase):
             self.assertFalse(r_none["updated"])
             self.assertEqual(r_none["reason"], "eval_signature_mismatch")
 
-            # 2) NumPy 标量 metrics 必须转为内建类型，weights_only=True 可加载
+            # 2) NumPy 标量（含 np.str_）metrics 必须转为内建类型，weights_only=True 可加载
             r_np = save_canonical_best_actor(
                 mappo_path, a2, "MAPPO", score=20.0, eval_signature="prod",
-                metrics={"np_f": np.float64(1.25), "np_i": np.int64(7), "np_b": np.bool_(True)},
+                metrics={"np_f": np.float64(1.25), "np_i": np.int64(7), "np_b": np.bool_(True), "np_s": np.str_("peak")},
             )
             self.assertTrue(r_np["updated"])
             loaded_ckpt = torch.load(mappo_path, map_location="cpu", weights_only=True)
-            self.assertEqual(loaded_ckpt["canonical_metrics"], {"np_f": 1.25, "np_i": 7, "np_b": True})
+            self.assertEqual(loaded_ckpt["canonical_metrics"], {"np_f": 1.25, "np_i": 7, "np_b": True, "np_s": "peak"})
 
-            # 3) 损坏权重（缺参数键）不得长期占位；临时读 PermissionError 必须抛错并保留原件
+            # 3) 损坏权重（缺参数键/截断字节 IndexError）可恢复；临时 PermissionError/OOM 必须抛错并保留原件
             bad_ckpt = torch.load(mappo_path, map_location="cpu", weights_only=True)
             del bad_ckpt["actor"]["v_mean.bias"]
             bad_ckpt["canonical_score"] = 500.0
@@ -84,13 +84,29 @@ class CanonicalCheckpointTests(unittest.TestCase):
             self.assertTrue(r_recover["updated"])
             self.assertEqual(r_recover["reason"], "schema_changed_or_unreadable")
             good_bytes = mappo_path.read_bytes()
-            with patch.object(agents, "_read_checkpoint", side_effect=PermissionError("denied")):
-                with self.assertRaises(PermissionError):
-                    save_canonical_best_actor(mappo_path, a1, "MAPPO", score=1.0, eval_signature="prod")
-            self.assertEqual(mappo_path.read_bytes(), good_bytes)
+            for transient_exc in (PermissionError("denied"), MemoryError("oom"), RuntimeError("CUDA out of memory")):
+                with patch.object(agents, "_read_checkpoint", side_effect=transient_exc):
+                    with self.assertRaises(type(transient_exc)):
+                        save_canonical_best_actor(mappo_path, a1, "MAPPO", score=1.0, eval_signature="prod")
+                self.assertEqual(mappo_path.read_bytes(), good_bytes)
+            mappo_path.write_bytes(bytes.fromhex("80024b"))
+            r_trunc = save_canonical_best_actor(mappo_path, a3, "MAPPO", score=40.0, eval_signature="prod")
+            self.assertTrue(r_trunc["updated"])
+            self.assertEqual(r_trunc["reason"], "schema_changed_or_unreadable")
 
-            # 4) KeyboardInterrupt 中断保存不得遗留临时文件
+            # 4) KeyboardInterrupt 在 os.close(fd) 或 torch.save 时中断均不得遗留临时文件
             with patch.object(torch, "save", side_effect=KeyboardInterrupt):
+                with self.assertRaises(KeyboardInterrupt):
+                    save_canonical_best_actor(mappo_path, a2, "MAPPO", score=999.0, eval_signature="prod")
+            self.assertEqual(list(Path(tmp).glob(".tmp_ckpt_*.pt")), [])
+            real_close = os.close
+            closed_once = {"hit": False}
+            def close_interrupt(fd):
+                real_close(fd)
+                if not closed_once["hit"]:
+                    closed_once["hit"] = True
+                    raise KeyboardInterrupt
+            with patch.object(os, "close", side_effect=close_interrupt):
                 with self.assertRaises(KeyboardInterrupt):
                     save_canonical_best_actor(mappo_path, a2, "MAPPO", score=999.0, eval_signature="prod")
             self.assertEqual(list(Path(tmp).glob(".tmp_ckpt_*.pt")), [])
@@ -111,12 +127,13 @@ class CanonicalCheckpointTests(unittest.TestCase):
             final_ckpt = torch.load(conc_path, map_location="cpu", weights_only=True)
             self.assertEqual(final_ckpt["canonical_score"], 30.0)
 
-            # 6) 奖励配置变化必须体现在 eval_signature 中
+            # 6) 奖励与边界配置（POS_LIMIT/VEL_LIMIT/微小浮点差）必须体现在 eval_signature 中
             policy = ActorOnlyPolicy(a1)
             sig1 = evaluate_canonical_score(policy, max_steps=2, cases=((5, "normal", "shallow", 1000),))["eval_signature"]
-            with patch.object(env_mod, "TRACKING_PENALTY_MAX", 0.0):
-                sig2 = evaluate_canonical_score(policy, max_steps=2, cases=((5, "normal", "shallow", 1000),))["eval_signature"]
-            self.assertNotEqual(sig1, sig2)
+            for attr, val in (("TRACKING_PENALTY_MAX", 0.0), ("POS_LIMIT", 5.0), ("VEL_LIMIT", 5.0), ("COMM_PENALTY", 0.15000001)):
+                with patch.object(env_mod, attr, val):
+                    sig_alt = evaluate_canonical_score(policy, max_steps=2, cases=((5, "normal", "shallow", 1000),))["eval_signature"]
+                self.assertNotEqual(sig1, sig_alt, f"{attr} change must alter eval_signature")
 
     def test_canonical_best_model_path_normalization(self):
         self.assertEqual(canonical_best_model_path("MAPPO", models_dir="models"), os.path.join("models", "best_mappo.pt"))

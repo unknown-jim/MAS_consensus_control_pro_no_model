@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from copy import deepcopy
+import hashlib
+import json
 import os
 
 import matplotlib.pyplot as plt
@@ -185,14 +187,31 @@ def evaluate_canonical_score(
             env = ModelFreeEnv(topo, max_steps=steps, auto_reset=False, randomize_topology_on_reset=False)
             if reward_cfg is None:
                 benv = env.batched_env
-                reward_cfg = (
-                    f"dt={DT:g},cp={benv.comm_penalty_base:g},tps={benv.tracking_penalty_scale:g},"
-                    f"tpm={benv.tracking_penalty_max:g},cwd={benv.comm_weight_decay:g},"
-                    f"imp={benv.improvement_scale:g}/{benv.improvement_clip:g},"
-                    f"ig={benv.info_gain_scale:g},soft={int(benv.use_soft_scaling)},"
-                    f"r=[{benv.reward_min:g},{benv.reward_max:g}],"
-                    f"th=[{benv._threshold_min:g},{benv._threshold_max:g}],layout={OBS_LAYOUT}"
-                )
+                sig_payload = {
+                    "dt": repr(float(DT)),
+                    "pos_limit": repr(float(benv.pos_limit)),
+                    "vel_limit": repr(float(benv.vel_limit)),
+                    "v_scale": repr(float(benv.v_scale)),
+                    "etc_vel_coef": repr(float(benv._etc_vel_coef)),
+                    "age_max_steps": int(benv._age_max_steps),
+                    "cooldown_steps": int(benv._cooldown_steps),
+                    "comm_penalty_base": repr(float(benv.comm_penalty_base)),
+                    "tracking_penalty_scale": repr(float(benv.tracking_penalty_scale)),
+                    "tracking_penalty_max": repr(float(benv.tracking_penalty_max)),
+                    "comm_weight_decay": repr(float(benv.comm_weight_decay)),
+                    "improvement_scale": repr(float(benv.improvement_scale)),
+                    "improvement_clip": repr(float(benv.improvement_clip)),
+                    "info_gain_scale": repr(float(benv.info_gain_scale)),
+                    "use_soft_scaling": bool(benv.use_soft_scaling),
+                    "reward_min": repr(float(benv.reward_min)),
+                    "reward_max": repr(float(benv.reward_max)),
+                    "threshold_min": repr(float(benv._threshold_min)),
+                    "threshold_max": repr(float(benv._threshold_max)),
+                    "obs_layout": str(OBS_LAYOUT),
+                }
+                reward_cfg = hashlib.sha256(
+                    json.dumps(sig_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                ).hexdigest()[:16]
             torch.random.default_generator.manual_seed(seed)
             if devices:
                 torch.cuda.manual_seed(seed)

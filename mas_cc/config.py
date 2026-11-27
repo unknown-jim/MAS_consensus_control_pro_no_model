@@ -312,7 +312,7 @@ WARMUP_STEPS = 3000
 POLICY_DELAY = 2
 TARGET_UPDATE_INTERVAL = 2
 
-_SAVE_TAG = "mappo" if str(ALGO).upper().strip() == "MAPPO" else "masac"
+_SAVE_TAG = normalize_algo_name(ALGO).lower()
 
 SAVE_MODEL_PATH = os.path.join(
     MODELS_DIR,

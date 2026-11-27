@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-import fcntl
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback
+    fcntl = None
 import math
 import os
 import pickle
@@ -86,6 +89,9 @@ def _canonical_file_lock(path_str: str):
         tlock = _CANONICAL_PATH_LOCKS.setdefault(abs_path, Lock())
     lock_path = abs_path + ".lock"
     with tlock:
+        if fcntl is None:
+            yield
+            return
         with open(lock_path, "a+") as lock_file:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
             try:
@@ -95,9 +101,11 @@ def _canonical_file_lock(path_str: str):
 
 
 def _to_builtin_primitive(value):
-    """将常见标量（含 NumPy 标量）显式转为 Python 内建类型，确保 weights_only=True 可加载。"""
-    if value is None or isinstance(value, str):
-        return value
+    """将常见标量（含 NumPy 标量/字符串）显式转为 Python 内建类型，确保 weights_only=True 可加载。"""
+    if value is None:
+        return None
+    if isinstance(value, (str, np.str_)):
+        return str(value)
     if isinstance(value, (bool, np.bool_)):
         return bool(value)
     if isinstance(value, (int, np.integer)):
@@ -115,13 +123,20 @@ def _atomic_save_checkpoint(path, actor, algorithm, **training_state):
     schema = _actor_schema(actor.local_encoder[0].out_features, algorithm)
     payload = {**schema, "actor": {k: v.detach().cpu() for k, v in actor.state_dict().items()}, **training_state}
     fd, tmp_path = tempfile.mkstemp(prefix=".tmp_ckpt_", suffix=".pt", dir=parent)
-    os.close(fd)
     replaced = False
+    fd_closed = False
     try:
+        os.close(fd)
+        fd_closed = True
         torch.save(payload, tmp_path)
         os.replace(tmp_path, path_str)
         replaced = True
     finally:
+        if not fd_closed:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         if not replaced and os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
@@ -170,10 +185,18 @@ def save_canonical_best_actor(
     previous_score = None
     reason = "created"
 
+    _oom_types = tuple(
+        exc for exc in (MemoryError, getattr(torch, "OutOfMemoryError", None),
+                        getattr(torch.cuda, "OutOfMemoryError", None))
+        if isinstance(exc, type) and issubclass(exc, BaseException)
+    )
+
     with _canonical_file_lock(path_str):
         if os.path.exists(path_str):
             try:
-                existing, existing_width = _read_checkpoint(path_str, algorithm=None, hidden_dim=width)
+                existing, existing_width = _read_checkpoint(
+                    path_str, algorithm=None, hidden_dim=width, map_location="cpu"
+                )
                 weights_ok = _actor_weights_complete(existing.get("actor"), actor)
                 same_schema = (
                     weights_ok
@@ -210,7 +233,13 @@ def save_canonical_best_actor(
                     reason = "improved"
                 else:
                     reason = "schema_changed_or_unreadable"
-            except (ValueError, EOFError, RuntimeError, pickle.UnpicklingError, zipfile.BadZipFile, KeyError, TypeError):
+            except _oom_types:
+                raise
+            except (ValueError, EOFError, IndexError, pickle.UnpicklingError, zipfile.BadZipFile, KeyError, TypeError):
+                reason = "schema_changed_or_unreadable"
+            except RuntimeError as exc:
+                if "out of memory" in str(exc).lower():
+                    raise
                 reason = "schema_changed_or_unreadable"
 
         clean_metrics = {}
@@ -238,9 +267,9 @@ def save_canonical_best_actor(
         }
 
 
-def _read_checkpoint(path, *, algorithm=None, hidden_dim=None):
+def _read_checkpoint(path, *, algorithm=None, hidden_dim=None, map_location=None):
     """先校验 v2 输入契约；只有推理入口接受带持久版本标记的裸权重。"""
-    checkpoint = torch.load(path, map_location=DEVICE, weights_only=True)
+    checkpoint = torch.load(path, map_location=DEVICE if map_location is None else map_location, weights_only=True)
     if not isinstance(checkpoint, dict):
         raise ValueError("Expected a v2 checkpoint dictionary")
     wrapped = "actor" in checkpoint
