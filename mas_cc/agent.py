@@ -501,6 +501,7 @@ class _PPOBuffer:
         self.follower_states = []
         self.global_states = []
         self.actions = []
+        self.pre_squash_v = []
         self.logp = []
         self.values = []
         self.rewards = []
@@ -521,10 +522,12 @@ class _PPOBuffer:
         truncated=None,
         truncated_next_values=None,
         has_truncated_next_values=None,
+        pre_squash_v=None,
     ):
         self.follower_states.append(follower_states)
         self.global_states.append(global_states)
         self.actions.append(actions)
+        self.pre_squash_v.append(pre_squash_v)
         self.logp.append(logp)
         self.values.append(values)
         self.rewards.append(rewards)
@@ -576,6 +579,9 @@ class CTDEMAPPOAgent:
 
         self.buffer = _PPOBuffer(rollout_steps=PPO_ROLLOUT_STEPS)
         self.last_losses = {}
+        # 缓存最近一次 act() 采样的原始 pre-squash 速度样本与对应动作，供紧随其后的 store_rollout_step 精确复用
+        self._last_sampled_actions: torch.Tensor | None = None
+        self._last_sampled_pre_squash_v: torch.Tensor | None = None
 
         print("📊 CTDE MAPPO Agent initialized:")
         print(f"   Actor input: Local state ({STATE_DIM})")
@@ -620,8 +626,13 @@ class CTDEMAPPOAgent:
         self._disable_actor_dropout()
 
         follower_states = local_states[:, 1:, :].reshape(-1, STATE_DIM)
-        act_flat, logp_flat = self.actor(follower_states, deterministic=deterministic)
+        act_flat, logp_flat, v_pre_flat = self.actor(
+            follower_states, deterministic=deterministic, return_pre_squash=True
+        )
         actions = act_flat.view(E, self.num_followers, ACTION_DIM).float()
+        v_pre = v_pre_flat.view(E, self.num_followers, 1).float()
+        self._last_sampled_actions = actions.detach().clone()
+        self._last_sampled_pre_squash_v = v_pre.detach().clone()
 
         if logp_flat is None:
             logp = torch.zeros((E, self.num_followers, 1), device=DEVICE)
@@ -647,11 +658,28 @@ class CTDEMAPPOAgent:
         truncated=None,
         next_global_states=None,
         truncated_next_values=None,
+        pre_squash_v=None,
     ):
         follower_states = local_states[:, 1:, :].detach()
+        actions_f = actions.detach().float()
         dones_b = dones.detach().bool()
         truncated_b = truncated.detach().bool() if truncated is not None else torch.zeros_like(dones_b, dtype=torch.bool)
         rewards_f = rewards.detach().float()
+
+        if pre_squash_v is not None:
+            pre_squash_v_f = pre_squash_v.detach().float()
+        elif (
+            self._last_sampled_pre_squash_v is not None
+            and self._last_sampled_actions is not None
+            and self._last_sampled_actions.shape == actions_f.shape
+            and torch.equal(self._last_sampled_actions, actions_f)
+        ):
+            pre_squash_v_f = self._last_sampled_pre_squash_v
+        else:
+            pre_squash_v_f = None
+        # 消费缓存，防止跨步误用
+        self._last_sampled_actions = None
+        self._last_sampled_pre_squash_v = None
 
         trunc_nv = torch.zeros_like(rewards_f)
         has_trunc_nv = torch.zeros_like(dones_b, dtype=torch.bool)
@@ -668,7 +696,7 @@ class CTDEMAPPOAgent:
         self.buffer.add(
             follower_states.float(),
             global_states.detach().float(),
-            actions.detach().float(),
+            actions_f,
             logp.detach().float(),
             values.detach().float(),
             rewards_f,
@@ -676,6 +704,7 @@ class CTDEMAPPOAgent:
             truncated_b,
             trunc_nv,
             has_trunc_nv,
+            pre_squash_v=pre_squash_v_f,
         )
 
     def _compute_gae(
@@ -750,6 +779,13 @@ class CTDEMAPPOAgent:
 
         with torch.no_grad():
             if next_global_states is None:
+                # 逐环境检查末步：若存在截断且非真实终止、同时既无已存后继价值又无传入后继状态，则显式报错
+                last_missing_trunc = truncated[-1] & (~dones[-1]) & (~has_truncated_next_values[-1])
+                if last_missing_trunc.any():
+                    raise ValueError(
+                        "Final truncated step requires next_global_states or truncated_next_values "
+                        "to compute exact bootstrap V(s_{t+1})."
+                    )
                 last_value = torch.zeros(E, device=DEVICE)
             else:
                 lv = self.value_net(next_global_states).squeeze(-1)
@@ -774,6 +810,12 @@ class CTDEMAPPOAgent:
         follower_states_env = follower_states.reshape(N, self.num_followers, STATE_DIM)
         global_states_env = global_states.reshape(N, -1)
         actions_env = actions.reshape(N, self.num_followers, ACTION_DIM)
+        has_all_pre_squash = all(p is not None for p in self.buffer.pre_squash_v)
+        pre_squash_v_env = (
+            torch.stack(self.buffer.pre_squash_v, dim=0).reshape(N, self.num_followers, 1)
+            if has_all_pre_squash
+            else None
+        )
         old_logp_env = old_logp.reshape(N, self.num_followers, 1)
         adv_env = adv.reshape(N, 1)
         ret_env = ret.reshape(N, 1)
@@ -796,15 +838,19 @@ class CTDEMAPPOAgent:
                 mb_gs = global_states_env[idx]
                 mb_fs = follower_states_env[idx]
                 mb_act = actions_env[idx]
+                mb_pre_v = pre_squash_v_env[idx] if pre_squash_v_env is not None else None
                 mb_old_logp = old_logp_env[idx]  # (mb, F, 1)
                 mb_adv = adv_env[idx]  # (mb, 1)
                 mb_ret = ret_env[idx]  # (mb, 1)
 
                 fs_flat = mb_fs.reshape(-1, STATE_DIM)
                 act_flat = mb_act.reshape(-1, ACTION_DIM)
+                pre_v_flat = mb_pre_v.reshape(-1, 1) if mb_pre_v is not None else None
 
                 # 标准 MAPPO：逐智能体 (per-agent) 计算重要度比率与解析分布熵，避免联合乘积随 N 爆炸
-                new_logp_flat, entropy_flat = self.actor.evaluate_actions(fs_flat, act_flat, return_entropy=True)
+                new_logp_flat, entropy_flat = self.actor.evaluate_actions(
+                    fs_flat, act_flat, return_entropy=True, pre_squash_v=pre_v_flat
+                )
                 new_logp = new_logp_flat.view(-1, self.num_followers, 1)
                 entropy = entropy_flat.view(-1, self.num_followers, 1)
 

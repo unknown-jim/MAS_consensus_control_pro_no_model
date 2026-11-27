@@ -75,40 +75,64 @@ class TestKnownFixes(unittest.TestCase):
         self.assertIsNotNone(actor.comm_beta.weight.grad)
         self.assertGreater(float(actor.comm_beta.weight.grad.norm().item()), 0.0)
 
-    def test_mappo_dropout_disabled_keeps_ratio_one_and_kl_zero(self):
-        """真实训练模式 + 非空邻居输入下，参数不变时 ratio==1 且 k3 KL==0。"""
-        topo = CommunicationTopology(NUM_FOLLOWERS, num_pinned=NUM_PINNED)
-        env = BatchedModelFreeEnv(topo, num_envs=4)
-        agent = CTDEMAPPOAgent(topo)
-        # 故意把 actor 切回 train()，验证 act() 与 update() 会一致关闭内部 Dropout
-        agent.actor.train()
+    def test_mappo_dropout_and_saturation_preserve_ratio_one_and_kl_zero(self):
+        """默认方差与高方差饱和(log_std=1.5)下，真实训练模式+非空邻居输入跑真实 update()，参数不变时 ratio==1、KL==0、ClipFrac==0。"""
+        for log_std_bias in (0.0, 1.5):
+            with self.subTest(log_std_bias=log_std_bias):
+                set_seed(42)
+                topo = CommunicationTopology(NUM_FOLLOWERS, num_pinned=NUM_PINNED)
+                env = BatchedModelFreeEnv(topo, num_envs=4)
+                agent = CTDEMAPPOAgent(topo)
+                if log_std_bias != 0.0:
+                    with torch.no_grad():
+                        agent.actor.v_log_std.bias.fill_(log_std_bias)
+                agent.actor.train()
 
-        local_s = env.reset()
-        global_s = env.get_global_state()
-        # 确认邻居特征非空（确保 attention + dropout 路径真正激活）
-        self.assertGreater(float(local_s[:, 1:, 9:].abs().sum().item()), 0.0)
+                local_s = env.reset()
+                global_s = env.get_global_state()
+                self.assertGreater(float(local_s[:, 1:, 9:].abs().sum().item()), 0.0)
 
-        actions, old_logp, _ = agent.act(local_s, global_s, deterministic=False)
-        fs_flat = local_s[:, 1:, :].reshape(-1, STATE_DIM)
-        act_flat = actions.reshape(-1, ACTION_DIM)
+                actions, old_logp, values = agent.act(local_s, global_s, deterministic=False)
+                pre_v = agent._last_sampled_pre_squash_v
+                self.assertIsNotNone(pre_v)
+                if log_std_bias > 0.0:
+                    # 确认高方差下确实产生了接近 tanh 饱和区的速度动作
+                    self.assertGreater(float((actions[:, :, 0].abs() > 0.999).float().mean().item()), 0.1)
 
-        # 参数未动时重评估（开启梯度，模拟 update 路径）
-        agent._disable_actor_dropout()
-        new_logp_flat, _ = agent.actor.evaluate_actions(fs_flat, act_flat, return_entropy=True)
-        new_logp = new_logp_flat.view(4, NUM_FOLLOWERS, 1)
+                next_local_s, rewards, dones, _ = env.step(actions)
+                next_global_s = env.get_global_state()
+                agent.store_rollout_step(local_s, global_s, actions, old_logp, values, rewards, dones)
 
-        log_ratio = new_logp - old_logp
-        ratio = torch.exp(log_ratio)
-        approx_kl = ((ratio - 1.0) - log_ratio).mean()
+                # 先直接核对逐元素 ratio 精度
+                fs_flat = local_s[:, 1:, :].reshape(-1, STATE_DIM)
+                act_flat = actions.reshape(-1, ACTION_DIM)
+                agent._disable_actor_dropout()
+                new_logp_flat, _ = agent.actor.evaluate_actions(
+                    fs_flat, act_flat, return_entropy=True, pre_squash_v=pre_v.reshape(-1, 1)
+                )
+                ratio = torch.exp(new_logp_flat.view(4, NUM_FOLLOWERS, 1) - old_logp)
+                self.assertTrue(torch.allclose(ratio, torch.ones_like(ratio), atol=1e-4))
 
-        self.assertTrue(torch.allclose(ratio, torch.ones_like(ratio), atol=1e-4))
-        self.assertLess(abs(float(approx_kl.item())), 1e-6)
+                # 再走真实 update() 公开入口（临时 lr=0 锁定参数不变，验证首 minibatch KL==0 且 ClipFrac==0）
+                orig_lr = agent.actor_optimizer.param_groups[0]["lr"]
+                agent.actor_optimizer.param_groups[0]["lr"] = 0.0
+                try:
+                    losses = agent.update(next_global_states=next_global_s, next_dones=dones)
+                finally:
+                    agent.actor_optimizer.param_groups[0]["lr"] = orig_lr
 
-        # 确认关闭 Dropout 不影响梯度反向传播
-        agent.actor_optimizer.zero_grad(set_to_none=True)
-        new_logp.mean().backward()
-        grad_norm = sum(p.grad.norm().item() for p in agent.actor.parameters() if p.grad is not None)
-        self.assertGreater(grad_norm, 0.0)
+                self.assertLess(abs(losses["kl"]), 1e-6)
+                self.assertEqual(losses["clipfrac"], 0.0)
+                self.assertFalse(losses["early_stopped"])
+
+                # 确认关闭 Dropout 后参数梯度仍正常回传
+                agent.actor_optimizer.zero_grad(set_to_none=True)
+                new_logp_flat2, _ = agent.actor.evaluate_actions(
+                    fs_flat, act_flat, return_entropy=True, pre_squash_v=pre_v.reshape(-1, 1)
+                )
+                new_logp_flat2.mean().backward()
+                grad_norm = sum(p.grad.norm().item() for p in agent.actor.parameters() if p.grad is not None)
+                self.assertGreater(grad_norm, 0.0)
 
     def test_mappo_per_agent_logp_and_update(self):
         topo = CommunicationTopology(NUM_FOLLOWERS, num_pinned=NUM_PINNED)
@@ -230,6 +254,70 @@ class TestKnownFixes(unittest.TestCase):
         _, ret1 = agent._compute_gae(r1, d1, v1, lv1, truncated=tr1)
         self.assertAlmostEqual(float(ret1[0, 0].item()), 1.5, places=5)
         self.assertAlmostEqual(float(ret1[0, 1].item()), 2.0 + GAMMA * 10.0, places=5)
+
+    def test_update_public_entry_final_truncation_missing_and_three_controls(self):
+        """公开入口 store_rollout_step() -> update()：末步截断缺后继价值必抛 ValueError；提供采集态或更新态后继状态均精确 bootstrap。"""
+        topo = CommunicationTopology(6, num_pinned=2)
+        env = BatchedModelFreeEnv(topo, num_envs=2)
+        agent = CTDEMAPPOAgent(topo)
+
+        # 将 value_net 固定为恒等输出 10.0，便于精确校验 return = r + GAMMA * 10.0
+        with torch.no_grad():
+            for p in agent.value_net.parameters():
+                p.zero_()
+            agent.value_net.v_net[-1].bias.fill_(10.0)
+
+        local_s = env.reset()
+        global_s = env.get_global_state()
+        actions, logp, values = agent.act(local_s, global_s, deterministic=False)
+        next_local_s, _, _, _ = env.step(actions)
+        next_global_s = env.get_global_state()
+        rewards = torch.full((2,), 2.0, device=DEVICE)
+        # env0: done & truncated 同真（真实终止优先）；env1: 仅 truncated（必须 bootstrap）
+        dones = torch.tensor([True, False], dtype=torch.bool, device=DEVICE)
+        truncated = torch.tensor([True, True], dtype=torch.bool, device=DEVICE)
+
+        # 对照 1：采集和更新均未提供后继状态/价值 -> 必须抛 ValueError
+        agent.store_rollout_step(local_s, global_s, actions, logp, values, rewards, dones, truncated=truncated)
+        with self.assertRaises(ValueError):
+            agent.update(next_global_states=None, next_dones=None)
+        agent.buffer.clear()
+
+        # 截获 _compute_gae 的 return 验证两个合法对照
+        captured_rets = []
+        orig_gae = agent._compute_gae
+
+        def _spy_gae(*args, **kwargs):
+            adv, ret = orig_gae(*args, **kwargs)
+            captured_rets.append(ret.detach().clone())
+            return adv, ret
+
+        agent._compute_gae = _spy_gae
+        try:
+            # 对照 2：采集时提供 next_global_states，update 不传
+            agent.store_rollout_step(
+                local_s, global_s, actions, logp, values, rewards, dones,
+                truncated=truncated, next_global_states=next_global_s,
+            )
+            agent.update(next_global_states=None, next_dones=None)
+            ret_store = captured_rets[-1]
+            self.assertAlmostEqual(float(ret_store[0, 0].item()), 2.0, places=4)
+            self.assertAlmostEqual(float(ret_store[0, 1].item()), 2.0 + GAMMA * 10.0, places=4)
+
+            # 重新锁定 value_net 输出为 10.0 再测对照 3
+            with torch.no_grad():
+                for p in agent.value_net.parameters():
+                    p.zero_()
+                agent.value_net.v_net[-1].bias.fill_(10.0)
+
+            # 对照 3：采集时不传，update 传入 next_global_states
+            agent.store_rollout_step(local_s, global_s, actions, logp, values, rewards, dones, truncated=truncated)
+            agent.update(next_global_states=next_global_s, next_dones=dones)
+            ret_upd = captured_rets[-1]
+            self.assertAlmostEqual(float(ret_upd[0, 0].item()), 2.0, places=4)
+            self.assertAlmostEqual(float(ret_upd[0, 1].item()), 2.0 + GAMMA * 10.0, places=4)
+        finally:
+            agent._compute_gae = orig_gae
 
     def test_deepsets_value_and_critic_dynamic_num_followers_and_errors(self):
         value_net = CentralizedValue().to(DEVICE)

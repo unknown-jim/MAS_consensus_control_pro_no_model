@@ -339,22 +339,23 @@ class DecentralizedActor(nn.Module):
 
         return v_mean, v_log_std, comm_alpha, comm_beta
 
-    def forward(self, state: torch.Tensor, deterministic: bool = False):
+    def forward(self, state: torch.Tensor, deterministic: bool = False, return_pre_squash: bool = False):
         v_mean, v_log_std, comm_alpha, comm_beta = self.compute_action_params(state)
 
         v_std = torch.exp(v_log_std)
 
         if deterministic:
             # 速度：tanh squash
-            v = torch.tanh(v_mean) * self.v_scale
+            v_pre = v_mean
+            v = torch.tanh(v_pre) * self.v_scale
             # 阈值归一化：Beta 分布的均值
             theta_norm = comm_alpha / (comm_alpha + comm_beta)
             log_prob = None
         else:
             # 速度采样
             v_dist = Normal(v_mean, v_std)
-            v_sample = v_dist.rsample()
-            v_tanh = torch.tanh(v_sample)
+            v_pre = v_dist.rsample()
+            v_tanh = torch.tanh(v_pre)
             v = v_tanh * self.v_scale
 
             # 阈值归一化采样：Beta 分布
@@ -363,18 +364,26 @@ class DecentralizedActor(nn.Module):
             theta_norm = comm_dist.rsample().clamp(self._eps, 1.0 - self._eps)
 
             # log_prob 计算
-            log_prob_v = v_dist.log_prob(v_sample) - torch.log(
+            log_prob_v = v_dist.log_prob(v_pre) - torch.log(
                 torch.clamp(1.0 - v_tanh.pow(2), min=self._eps, max=1.0)
-            ) - self._log_v_scale.to(v_sample.device)
+            ) - self._log_v_scale.to(v_pre.device)
 
             log_prob_comm = comm_dist.log_prob(theta_norm)
 
             log_prob = (log_prob_v + log_prob_comm).sum(dim=-1, keepdim=True)
 
         action = torch.cat([v, theta_norm], dim=-1)
+        if return_pre_squash:
+            return action, log_prob, v_pre
         return action, log_prob
 
-    def evaluate_actions(self, state: torch.Tensor, action: torch.Tensor, return_entropy: bool = False):
+    def evaluate_actions(
+        self,
+        state: torch.Tensor,
+        action: torch.Tensor,
+        return_entropy: bool = False,
+        pre_squash_v: torch.Tensor | None = None,
+    ):
         """给定动作计算 log_prob，以及（可选）解析分布熵（用于 PPO/MAPPO）。
 
         Args:
@@ -383,6 +392,9 @@ class DecentralizedActor(nn.Module):
                 - action[:, 0]: delta_v
                 - action[:, 1]: theta_norm
             return_entropy: 若为 True，额外返回 per-agent 解析熵 shape=(B, 1)。
+            pre_squash_v: 可选的采集时原始 pre-squash 速度样本，shape=(B, 1)。
+                提供时直接复用该样本与 `tanh(pre_squash_v)` 计算精确对数概率，避免
+                饱和区 `clamp + atanh` 反演带来的数值失真。
 
         Returns:
             - return_entropy=False: log_prob，shape=(B, 1)
@@ -392,12 +404,16 @@ class DecentralizedActor(nn.Module):
         v_mean, v_log_std, comm_alpha, comm_beta = self.compute_action_params(state)
         v_std = torch.exp(v_log_std)
 
-        v = action[:, 0:1]
         theta_norm = action[:, 1:2].clamp(self._eps, 1.0 - self._eps)
 
-        # 反向计算 pre-squash 值（仅速度需要）
-        v_tanh = (v / self.v_scale).clamp(-1.0 + self._eps, 1.0 - self._eps)
-        v_pre = _atanh(v_tanh, eps=self._eps)
+        if pre_squash_v is not None:
+            v_pre = pre_squash_v.view(-1, 1).to(device=v_mean.device, dtype=v_mean.dtype)
+            v_tanh = torch.tanh(v_pre)
+        else:
+            # 兼容未提供 pre_squash_v 的调用方：从 post-squash 动作反演
+            v = action[:, 0:1]
+            v_tanh = (v / self.v_scale).clamp(-1.0 + self._eps, 1.0 - self._eps)
+            v_pre = _atanh(v_tanh, eps=self._eps)
 
         v_dist = Normal(v_mean, v_std)
         comm_dist = Beta(comm_alpha, comm_beta)
