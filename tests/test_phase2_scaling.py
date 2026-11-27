@@ -772,12 +772,99 @@ class TestAuditMicrobatchAndProfiler(unittest.TestCase):
                                      (expected_kl, True, [1, 1]))
 
     def test_cap_must_fit_one_record_at_construction_and_scale_switch(self):
+        from mas_cc.agent import MultiScaleEpisodeSession
+
         graph = CommunicationTopology(5)
         with self.assertRaisesRegex(ValueError, "num_followers"):
             CTDEMAPPOAgent(graph, actor_microbatch_max_rows=2)
         learner = CTDEMAPPOAgent(CommunicationTopology(2), actor_microbatch_max_rows=2)
+        env5 = BatchedModelFreeEnv(graph, 1)
         with self.assertRaisesRegex(ValueError, "num_followers"):
-            learner.start_episode(BatchedModelFreeEnv(graph, 1))
+            learner.start_episode(env5)
+        with self.assertRaisesRegex(ValueError, "num_followers"):
+            MultiScaleEpisodeSession(learner, env5)
+        self.assertIsNone(learner._session)
+        self.assertIsNone(env5._episode_session)
+        self.assertEqual(graph._readers, 0)
+
+        # 绑定后即使外部改小 cap，也在产生更新副作用前拒绝。
+        learner_ok = CTDEMAPPOAgent(graph, actor_microbatch_max_rows=10)
+        session = learner_ok.start_episode(env5)
+        session.step_collect()
+        learner_ok.actor_microbatch_max_rows = 2
+        with self.assertRaisesRegex(ValueError, "num_followers"):
+            session.flush_update(is_episode_end=False)
+        self.assertEqual(len(session.buffer), 1)
+        session.abort()
+        self.assertIsNone(learner_ok._session)
+        self.assertEqual(graph._readers, 0)
+
+    def test_step_collect_precheck_and_abort_releases_leases(self):
+        graph = CommunicationTopology(5, seed=7)
+        env = BatchedModelFreeEnv(graph, 1, max_steps=2, randomize_topology_on_reset=False)
+        learner = CTDEMAPPOAgent(graph)
+        session = learner.start_episode(env)
+        start_frame = env.frame_rev
+
+        # 1) Value hook 把输出从 (1,1) 压成 (1,)：必须在 env.step() 前预检失败，不推进环境。
+        handle = learner.value_net.register_forward_hook(lambda m, a, out: out.squeeze(-1))
+        try:
+            with self.assertRaisesRegex(ValueError, "Unexpected act\\(\\) output shapes"):
+                session.step_collect()
+        finally:
+            handle.remove()
+        self.assertEqual((env.frame_rev, session._frame_rev, len(session.buffer), graph._readers),
+                         (start_frame, start_frame, 0, 1))
+        # 移除 hook 后原会话完整可恢复。
+        session.step_collect()
+        session.step_collect()
+        session.flush_update(is_episode_end=True)
+        session.close()
+        self.assertIsNone(learner._session)
+        self.assertIsNone(env._episode_session)
+        self.assertEqual(graph._readers, 0)
+
+        # 2) env.step() 之后才发生的异常：可通过 abort() 丢弃并释放全部租约，且须完整 reset 后才能重开。
+        env.reset()
+        session2 = learner.start_episode(env)
+        with patch.object(session2._buffer, "add", side_effect=RuntimeError("boom after step")):
+            with self.assertRaisesRegex(RuntimeError, "boom after step"):
+                session2.step_collect()
+        self.assertEqual(env.frame_rev, session2._frame_rev + 1)
+        with self.assertRaises(RuntimeError):
+            session2.close()
+        session2.abort()
+        self.assertIsNone(learner._session)
+        self.assertIsNone(env._episode_session)
+        self.assertEqual(graph._readers, 0)
+        self.assertEqual(len(session2.buffer), 0)
+        with self.assertRaisesRegex(RuntimeError, "aborted"):
+            session2.close()
+        # 未 reset 不得直接重新绑定
+        with self.assertRaisesRegex(ValueError, "full reset"):
+            learner.start_episode(env)
+        # 完整 reset 与 randomize 恢复可用
+        graph.randomize()
+        env.reset()
+        session3 = learner.start_episode(env)
+        session3.abort()
+
+    def test_manual_randomize_refreshes_cache_on_full_reset_without_auto_randomize(self):
+        graph = CommunicationTopology(10, seed=19)
+        env = BatchedModelFreeEnv(graph, 1, max_steps=2, randomize_topology_on_reset=False)
+        self.assertEqual((graph.revision, env._cached_topology_rev), (1, 1))
+        graph.randomize()
+        self.assertEqual(graph.revision, 2)
+        env.reset()
+        # 不额外再抽一次图，但必须刷新邻居缓存使其与 revision 2 对齐。
+        self.assertEqual((graph.revision, env._cached_topology_rev), (2, 2))
+        adj = graph.adj.cpu()
+        for node in range(env.num_agents):
+            expected = torch.where(adj[node] > 0)[0].tolist()
+            self.assertEqual(env._neighbor_indices_list[node].cpu().tolist(), expected)
+        learner = CTDEMAPPOAgent(graph)
+        session = learner.start_episode(env)
+        session.abort()
 
     def test_scale_switch_leak_fails_cli_and_preserves_measurements(self):
         import json

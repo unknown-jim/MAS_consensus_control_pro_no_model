@@ -513,8 +513,12 @@ class BatchedModelFreeEnv:
                 raise ValueError("Installing a scenario requires a full reset")
             self.install_scenario(scenario)
 
-        if full_reset and self.randomize_topology and not self.topology.fixed:
-            self._randomize_topology()
+        if full_reset:
+            if self.randomize_topology and not self.topology.fixed:
+                self._randomize_topology()
+            elif (self._precomputed_topology is not self.topology or
+                  self._cached_topology_rev != self.topology.revision):
+                self._precompute_neighbor_indices(verbose=False)
         fixed = self._fixed_scenario
         if fixed is not None:
             for name in ("leader_amplitude", "leader_omega", "leader_phase", "trajectory_type_ids"):

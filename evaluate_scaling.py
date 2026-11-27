@@ -587,7 +587,7 @@ def complete_benchmark_run(meta, rows, required_cells):
     per_cell = defaultdict(list)
     for row in rows.values():
         steps = row.get("steps", meta.get("steps"))
-        if not isinstance(steps, int) or steps < 300:
+        if isinstance(steps, bool) or not isinstance(steps, int) or steps < 300:
             return False
         per_cell[tuple(row[k] for k in CELL)].append(row)
     if per_cell.keys() != required_cells:
@@ -627,10 +627,19 @@ def compare(args):
                     raise ValueError(f"Scenario identity mismatch for {sid}")
     grouped = defaultdict(list)
     pairs = []
+    steps_match = True
     for seed in seeds:
+        left_meta, left_rows = left[seed]
+        right_meta, right_rows = right[seed]
         for sid in sorted(catalog):
-            a, b = left[seed][1].get(sid), right[seed][1].get(sid)
+            a, b = left_rows.get(sid), right_rows.get(sid)
             sample = catalog[sid]
+            steps_a = None if a is None else a.get("steps", left_meta.get("steps"))
+            steps_b = None if b is None else b.get("steps", right_meta.get("steps"))
+            if (isinstance(steps_a, bool) or isinstance(steps_b, bool) or
+                    not isinstance(steps_a, int) or not isinstance(steps_b, int) or
+                    steps_a != steps_b or steps_a < 300):
+                steps_match = False
             ok = all(r and r["status"] == "ok" and r["all_finite"] and
                      all(r.get(k) is None or np.isfinite(r[k]) for k in METRICS) for r in (a, b))
             pair = dict(training_seed=seed, scenario_id=sid, v1=a, v2=b, paired_ok=ok)
@@ -681,20 +690,25 @@ def compare(args):
                                 and all(c["n_ok"] == c["n_total"] for c in hard_cells)))
     required = set(itertools.product((5, 10, 20, 50, 100), ("normal", "low"), ("shallow", "deep")))
     missing = sorted(required - grouped.keys())
-    matrix_complete = complete and all(
+    matrix_complete = complete and steps_match and all(
         rows.keys() == catalog.keys() and complete_benchmark_run(meta, rows, required)
         for runs in (left, right) for meta, rows in runs.values())
     stable = complete and not missing and all(c["all_finite"] and c["stability_rate"] >= .95 for c in cells)
     small = len(small_cells) == 3 and all(c["small_passed"] for c in small_cells)
     failures = [p for p in pairs if not p["paired_ok"]]
+    if matrix_complete:
+        matrix_note = "满足正式验收矩阵。"
+    elif not steps_match:
+        matrix_note = "探索性对照，两侧每场有效步数不一致或不足 300 步，不满足正式 20×20×300 步验收矩阵。"
+    else:
+        matrix_note = ("探索性子集，不满足正式 20×20×300 步验收矩阵。每格须覆盖独立场景 "
+                       "seed 1000–1019，两侧每场至少运行 300 步且步数一致。")
     report = dict(manifest_sha256=hashes.pop(), training_seeds=seeds, bootstrap_seed=42, bootstrap_samples=len(seed_draws),
                   inputs=[dict(v1=left[s][0], v2=right[s][0]) for s in seeds], hard=hard, cells=cells,
                   acceptance=dict(hard=hard["passed"], small=small, stability=stable,
-                                  complete_manifests=complete, missing_cells=missing,
+                                  complete_manifests=complete, steps_match=steps_match, missing_cells=missing,
                                   complete_benchmark_matrix=matrix_complete,
-                                  matrix_note=("满足正式验收矩阵。" if matrix_complete else
-                                               "探索性子集，不满足正式 20×20×300 步验收矩阵。每格须覆盖独立场景 "
-                                               "seed 1000–1019，两侧每场至少运行 300 步。"),
+                                  matrix_note=matrix_note,
                                   passed=bool(matrix_complete and not failures and hard["passed"] and small and stable)),
                   failures=failures, pairs=pairs)
     write_json(args.output, report)

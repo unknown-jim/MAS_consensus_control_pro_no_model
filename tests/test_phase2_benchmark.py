@@ -453,3 +453,36 @@ with patch.object(profile_bottleneck, 'build_env', side_effect=RuntimeError('CUD
         (export_v1 / "mas_cc" / "config.py").write_text("# tampered\n", encoding="utf-8")
         with self.assertRaises(ValueError):
             es.resolve_repo_identity(export_v1, "v1")
+
+    def test_compare_rejects_mismatched_steps(self):
+        from evaluate_scaling import METRICS
+        paths = {}
+        for version, steps in (("v1", 300), ("v2", 600)):
+            rows = []
+            for n in (5, 10, 20, 50, 100):
+                hard = n >= 50
+                for seed in range(1000, 1020):
+                    for pin in ("normal", "low"):
+                        for depth in ("shallow", "deep"):
+                            err = (1.0 if n == 50 else 2.0) if hard else 0.2
+                            if version == "v2":
+                                err *= 0.5 if hard else 1.0
+                            rows.append(dict(
+                                dict.fromkeys(METRICS, 1.0), N=n, seed=seed, status="ok",
+                                steps=steps, scenario_id=f"{n}-{pin}-{depth}-{seed}",
+                                scenario_sha256=f"h-{n}-{pin}-{depth}-{seed}",
+                                pinned_ratio_coincident=n == 5, pinned_mode=pin, depth_mode=depth,
+                                actual_pinned=1, actual_H=4 if depth == "deep" else 2,
+                                stable=True, all_finite=True, converged=True,
+                                mean_tracking_error=err, mean_comm_rate=0.20))
+            p = self.dir / f"mismatch-{version}.json"
+            p.write_text(json.dumps(dict(
+                worker_version=version, training_seed=11, steps=steps,
+                manifest_sha256="same", manifest_scenario_count=len(rows), scenarios=rows)))
+            paths[version] = p
+        self.run_cli("evaluate_scaling.py", "--compare", paths["v1"], paths["v2"], "--output", self.out)
+        report = json.loads(self.out.read_text())
+        self.assertFalse(report["acceptance"]["steps_match"])
+        self.assertFalse(report["acceptance"]["complete_benchmark_matrix"])
+        self.assertFalse(report["acceptance"]["passed"])
+        self.assertEqual(len(report["cells"]), 20)

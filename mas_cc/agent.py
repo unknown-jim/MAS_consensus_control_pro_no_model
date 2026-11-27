@@ -1043,6 +1043,7 @@ class CTDEMAPPOAgent:
     def _update_buffer(self, buffer, next_global_states, next_dones, *, episode_end=False):
         if len(buffer) == 0:
             return {}
+        self._validate_microbatch_cap(buffer.num_followers)
 
         self._disable_actor_dropout()
 
@@ -1243,6 +1244,7 @@ class MultiScaleEpisodeSession:
     """在一次完整 reset 与末帧更新之间持有环境、当前帧以及专用 rollout。"""
 
     def __init__(self, agent, env):
+        agent._validate_microbatch_cap(env.num_followers)
         with _try_lock(agent._session_lock), env._session_operation(self), ExitStack() as lease:
             if agent._session is not None or len(agent._fixed_buffer):
                 raise RuntimeError("Close the active session and flush pending rollout records first")
@@ -1277,6 +1279,7 @@ class MultiScaleEpisodeSession:
                                   global_state_dim=expected_g, action_dim=ACTION_DIM)
         self.buffer = _RolloutProgress(self._buffer)
         self._ended = False
+        self._aborted = False
 
     def _check_frame(self, expected_frame):
         env = self._env
@@ -1300,6 +1303,20 @@ class MultiScaleEpisodeSession:
             actions, logp, values, pre = self._agent._act_for_buffer(
                 self._local, self._global, self._buffer, False, True, bind_sample=False
             )
+            expected_actions = (self._num_envs, self._buffer.num_followers, ACTION_DIM)
+            expected_logp = (self._num_envs, self._buffer.num_followers, 1)
+            expected_values = (self._num_envs, 1)
+            if (not isinstance(actions, torch.Tensor) or tuple(actions.shape) != expected_actions or
+                    not isinstance(logp, torch.Tensor) or tuple(logp.shape) != expected_logp or
+                    not isinstance(values, torch.Tensor) or tuple(values.shape) != expected_values or
+                    not isinstance(pre, torch.Tensor) or tuple(pre.shape) != expected_logp):
+                raise ValueError(
+                    f"Unexpected act() output shapes before env.step: "
+                    f"actions={getattr(actions, 'shape', type(actions))}, "
+                    f"logp={getattr(logp, 'shape', type(logp))}, "
+                    f"values={getattr(values, 'shape', type(values))}, "
+                    f"pre={getattr(pre, 'shape', type(pre))}"
+                )
             self._check_frame(self._frame_rev)
             next_local, rewards, dones, infos = self._env.step(actions, _session=token)
             next_global = self._env.get_global_state()
@@ -1323,8 +1340,27 @@ class MultiScaleEpisodeSession:
             self._ended = bool(is_episode_end)
             return losses
 
+    def abort(self):
+        """作废未完成或异常中断的采集会话，丢弃未刷新数据并释放 agent、环境与图租约。
+
+        不视作成功 flush；作废后须执行完整 env.reset() 才能绑定新会话。
+        """
+        with _try_lock(self._agent._session_lock):
+            self._buffer.clear()
+            self._ended = True
+            self._aborted = True
+            if self._agent._session is not self:
+                return
+            with self._env._session_operation(self):
+                self._graph_lease.close()
+                self._agent._session = None
+                self._env._episode_session = None
+                self._env._episode_start_frame = None
+
     def close(self):
         with _try_lock(self._agent._session_lock), self._env._session_operation(self):
+            if self._aborted:
+                raise RuntimeError("Episode session was aborted; do not treat it as a flushed close()")
             if not self._ended or len(self._buffer):
                 raise RuntimeError("Flush the final rollout with is_episode_end=True before close()")
             if self._agent._session is self:
