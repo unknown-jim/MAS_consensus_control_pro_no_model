@@ -277,7 +277,7 @@ class TestKnownFixes(unittest.TestCase):
         self.assertLess(abs(losses["kl"]), 1e-6)
         self.assertEqual(losses["clipfrac"], 0.0)
 
-        # --- (2) 入库参数错误时不损坏已有 buffer 且不消费绑定，修正后可直接重试并 update ---
+        # --- (2) 任意字段形状错误或跨步环境数不匹配均抛 ValueError，不损坏已有 12 列且不消费绑定，修正后可直接重试并 update ---
         s_ok = env.reset()
         g_ok = env.get_global_state()
         a_ok, lp_ok, v_ok = agent.act(s_ok, g_ok, deterministic=False)
@@ -285,26 +285,83 @@ class TestKnownFixes(unittest.TestCase):
         ng_ok = env.get_global_state()
         agent.store_rollout_step(s_ok, g_ok, a_ok, lp_ok, v_ok, r_ok, d_ok)
 
+        first_snapshot = {
+            "fs": agent.buffer.follower_states[0].clone(),
+            "gs": agent.buffer.global_states[0].clone(),
+            "act": agent.buffer.actions[0].clone(),
+            "pre": agent.buffer.pre_squash_v[0].clone(),
+            "rew": agent.buffer.rewards[0].clone(),
+        }
+
         a_retry, lp_retry, v_retry = agent.act(ns_ok, ng_ok, deterministic=False)
         ns_retry, r_retry, d_retry, _ = env.step(a_retry)
         ng_retry = env.get_global_state()
 
-        # 故意传错形状的 pre_squash_v（少一个 env 维度）
-        bad_pre = torch.zeros(3, NUM_FOLLOWERS, 1, device=DEVICE)
-        with self.assertRaises(ValueError):
-            agent.store_rollout_step(ns_ok, ng_ok, a_retry, lp_retry, v_retry, r_retry, d_retry, pre_squash_v=bad_pre)
+        bad_cases = [
+            ("pre_squash_v", dict(pre_squash_v=torch.zeros(3, NUM_FOLLOWERS, 1, device=DEVICE))),
+            ("rewards", dict(rewards=r_retry[:3])),
+            ("values", dict(values=v_retry[:3])),
+            ("dones", dict(dones=d_retry[:3])),
+            ("global_states", dict(global_states=ng_ok[:3])),
+            ("local_states_agents", dict(local_states=ns_ok[:, :-1, :])),
+            ("truncated", dict(truncated=torch.zeros(3, dtype=torch.bool, device=DEVICE))),
+            ("next_global_states", dict(next_global_states=ng_retry[:3])),
+            ("truncated_next_values", dict(truncated_next_values=torch.zeros(3, device=DEVICE))),
+            (
+                "cross_step_E",
+                dict(
+                    local_states=ns_ok[:3],
+                    global_states=ng_ok[:3],
+                    actions=a_retry[:3],
+                    logp=lp_retry[:3],
+                    values=v_retry[:3],
+                    rewards=r_retry[:3],
+                    dones=d_retry[:3],
+                ),
+            ),
+        ]
+        all_buf_cols = (
+            agent.buffer.follower_states,
+            agent.buffer.global_states,
+            agent.buffer.actions,
+            agent.buffer.pre_squash_v,
+            agent.buffer.has_pre_squash_v,
+            agent.buffer.logp,
+            agent.buffer.values,
+            agent.buffer.rewards,
+            agent.buffer.dones,
+            agent.buffer.truncated,
+            agent.buffer.truncated_next_values,
+            agent.buffer.has_truncated_next_values,
+        )
 
-        # 验证 buffer 各列长度仍保持一致为 1，且 a_retry 的对象身份绑定未被消费
-        self.assertEqual(len(agent.buffer.follower_states), 1)
-        self.assertEqual(len(agent.buffer.actions), 1)
-        self.assertEqual(len(agent.buffer.pre_squash_v), 1)
-        self.assertEqual(len(agent.buffer.rewards), 1)
-        self.assertIn(id(a_retry), agent._sampled_pre_squash_by_id)
+        for case_name, overrides in bad_cases:
+            with self.subTest(bad_case=case_name):
+                call_kwargs = dict(
+                    local_states=ns_ok,
+                    global_states=ng_ok,
+                    actions=a_retry,
+                    logp=lp_retry,
+                    values=v_retry,
+                    rewards=r_retry,
+                    dones=d_retry,
+                )
+                call_kwargs.update(overrides)
+                with self.assertRaises(ValueError):
+                    agent.store_rollout_step(**call_kwargs)
+                for col in all_buf_cols:
+                    self.assertEqual(len(col), 1)
+                self.assertTrue(torch.equal(agent.buffer.follower_states[0], first_snapshot["fs"]))
+                self.assertTrue(torch.equal(agent.buffer.global_states[0], first_snapshot["gs"]))
+                self.assertTrue(torch.equal(agent.buffer.actions[0], first_snapshot["act"]))
+                self.assertTrue(torch.equal(agent.buffer.pre_squash_v[0], first_snapshot["pre"]))
+                self.assertTrue(torch.equal(agent.buffer.rewards[0], first_snapshot["rew"]))
+                self.assertIn(id(a_retry), agent._sampled_pre_squash_by_id)
 
         # 修正后直接重试（不传 pre_squash_v，依赖未丢失的对象身份绑定）并成功 update
         agent.store_rollout_step(ns_ok, ng_ok, a_retry, lp_retry, v_retry, r_retry, d_retry)
-        self.assertEqual(len(agent.buffer.follower_states), 2)
-        self.assertEqual(len(agent.buffer.pre_squash_v), 2)
+        for col in all_buf_cols:
+            self.assertEqual(len(col), 2)
         self.assertTrue(bool(agent.buffer.has_pre_squash_v[1].all().item()))
         losses_retry = agent.update(next_global_states=ng_retry, next_dones=d_retry)
         self.assertTrue(math.isfinite(losses_retry["policy"]))

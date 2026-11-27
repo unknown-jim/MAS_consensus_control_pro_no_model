@@ -527,6 +527,53 @@ class _PPOBuffer:
         pre_squash_v=None,
     ):
         # 先完成全部形状校验与独立快照准备，全部成功后才原子追加各列，防止异常留下半写入脏状态
+        if follower_states.dim() != 3:
+            raise ValueError(f"follower_states: expected 3D tensor (E, F, S), got shape {tuple(follower_states.shape)}")
+        E, F_dim, S_dim = follower_states.shape
+
+        if len(self.rewards) > 0:
+            prev_E = int(self.rewards[0].shape[0])
+            if E != prev_E:
+                raise ValueError(f"env batch size mismatch: expected E={prev_E}, got E={E}")
+            prev_F, prev_S = int(self.follower_states[0].shape[1]), int(self.follower_states[0].shape[2])
+            if (F_dim, S_dim) != (prev_F, prev_S):
+                raise ValueError(
+                    f"follower_states: expected shape ({prev_E}, {prev_F}, {prev_S}), got {tuple(follower_states.shape)}"
+                )
+            prev_G = int(self.global_states[0].shape[1])
+            if tuple(global_states.shape) != (prev_E, prev_G):
+                raise ValueError(
+                    f"global_states: expected shape ({prev_E}, {prev_G}), got {tuple(global_states.shape)}"
+                )
+        elif global_states.dim() != 2 or int(global_states.shape[0]) != E:
+            raise ValueError(f"global_states: expected shape ({E}, G), got {tuple(global_states.shape)}")
+
+        if actions.dim() != 3 or int(actions.shape[0]) != E or int(actions.shape[1]) != F_dim:
+            raise ValueError(f"actions: expected shape ({E}, {F_dim}, A), got {tuple(actions.shape)}")
+        if tuple(logp.shape) != (E, F_dim, 1):
+            raise ValueError(f"logp: expected shape ({E}, {F_dim}, 1), got {tuple(logp.shape)}")
+        if tuple(values.shape) != (E, 1):
+            raise ValueError(f"values: expected shape ({E}, 1), got {tuple(values.shape)}")
+        if tuple(rewards.shape) != (E,):
+            raise ValueError(f"rewards: expected shape ({E},), got {tuple(rewards.shape)}")
+        if tuple(dones.shape) != (E,):
+            raise ValueError(f"dones: expected shape ({E},), got {tuple(dones.shape)}")
+
+        if truncated is not None and tuple(truncated.shape) != (E,):
+            raise ValueError(f"truncated: expected shape ({E},), got {tuple(truncated.shape)}")
+        if truncated_next_values is not None and tuple(truncated_next_values.shape) != (E,):
+            raise ValueError(
+                f"truncated_next_values: expected shape ({E},), got {tuple(truncated_next_values.shape)}"
+            )
+        if has_truncated_next_values is not None and tuple(has_truncated_next_values.shape) != (E,):
+            raise ValueError(
+                f"has_truncated_next_values: expected shape ({E},), got {tuple(has_truncated_next_values.shape)}"
+            )
+        if pre_squash_v is not None and tuple(pre_squash_v.shape) not in ((E, F_dim, 1), (E, F_dim)):
+            raise ValueError(
+                f"pre_squash_v: expected shape ({E}, {F_dim}, 1) or ({E}, {F_dim}), got {tuple(pre_squash_v.shape)}"
+            )
+
         fs_c = follower_states.detach().float().clone()
         gs_c = global_states.detach().float().clone()
         act_c = actions.detach().float().clone()
@@ -535,29 +582,22 @@ class _PPOBuffer:
         rew_c = rewards.detach().float().clone()
         done_c = dones.detach().bool().clone()
 
-        if truncated is None:
-            trunc_c = torch.zeros_like(done_c, dtype=torch.bool)
-        else:
-            trunc_c = truncated.detach().bool().reshape_as(done_c).clone()
-
-        if truncated_next_values is None:
-            trunc_nv_c = torch.zeros_like(rew_c, dtype=torch.float32)
-        else:
-            trunc_nv_c = truncated_next_values.detach().float().reshape_as(rew_c).clone()
-
-        if has_truncated_next_values is None:
-            has_trunc_nv_c = torch.zeros_like(done_c, dtype=torch.bool)
-        else:
-            has_trunc_nv_c = has_truncated_next_values.detach().bool().reshape_as(done_c).clone()
+        trunc_c = torch.zeros_like(done_c, dtype=torch.bool) if truncated is None else truncated.detach().bool().clone()
+        trunc_nv_c = (
+            torch.zeros_like(rew_c, dtype=torch.float32)
+            if truncated_next_values is None
+            else truncated_next_values.detach().float().clone()
+        )
+        has_trunc_nv_c = (
+            torch.zeros_like(done_c, dtype=torch.bool)
+            if has_truncated_next_values is None
+            else has_truncated_next_values.detach().bool().clone()
+        )
 
         if pre_squash_v is None:
             pre_v_c = torch.zeros_like(logp_c, dtype=torch.float32)
             has_pre_v_c = torch.zeros_like(logp_c, dtype=torch.bool)
         else:
-            if pre_squash_v.numel() != logp_c.numel():
-                raise ValueError(
-                    f"pre_squash_v shape {tuple(pre_squash_v.shape)} does not match logp shape {tuple(logp_c.shape)}"
-                )
             pre_v_c = pre_squash_v.detach().float().reshape_as(logp_c).clone()
             has_pre_v_c = torch.ones_like(logp_c, dtype=torch.bool)
 
@@ -716,17 +756,47 @@ class CTDEMAPPOAgent:
         if logp is None or values is None or rewards is None or dones is None:
             raise TypeError("store_rollout_step requires logp (or logp_joint), values, rewards, and dones.")
 
-        if local_states.dim() != 3:
-            raise ValueError(f"Expected local_states dim=3 (E, A, S), got shape={tuple(local_states.shape)}")
+        if local_states.dim() != 3 or tuple(local_states.shape[1:]) != (self.num_agents, STATE_DIM):
+            raise ValueError(
+                f"local_states: expected shape (E, {self.num_agents}, {STATE_DIM}), got {tuple(local_states.shape)}"
+            )
         E = int(local_states.shape[0])
+        if len(self.buffer) > 0:
+            expected_E = int(self.buffer.rewards[0].shape[0])
+            if E != expected_E:
+                raise ValueError(f"local_states: expected rollout batch E={expected_E}, got E={E}")
+
+        expected_gs_dim = int(self.value_net.ctx_dim + self.num_agents * self.value_net.agent_feat_dim)
+        if tuple(global_states.shape) != (E, expected_gs_dim):
+            raise ValueError(
+                f"global_states: expected shape {(E, expected_gs_dim)}, got {tuple(global_states.shape)}"
+            )
+        expected_act_shape = (E, self.num_followers, ACTION_DIM)
+        if tuple(actions.shape) != expected_act_shape:
+            raise ValueError(f"actions: expected shape {expected_act_shape}, got {tuple(actions.shape)}")
         expected_logp_shape = (E, self.num_followers, 1)
         if tuple(logp.shape) != expected_logp_shape:
+            raise ValueError(f"logp: expected shape {expected_logp_shape}, got {tuple(logp.shape)}")
+        if tuple(values.shape) != (E, 1):
+            raise ValueError(f"values: expected shape {(E, 1)}, got {tuple(values.shape)}")
+        if tuple(rewards.shape) != (E,):
+            raise ValueError(f"rewards: expected shape {(E,)}, got {tuple(rewards.shape)}")
+        if tuple(dones.shape) != (E,):
+            raise ValueError(f"dones: expected shape {(E,)}, got {tuple(dones.shape)}")
+        if truncated is not None and tuple(truncated.shape) != (E,):
+            raise ValueError(f"truncated: expected shape {(E,)}, got {tuple(truncated.shape)}")
+        if next_global_states is not None and tuple(next_global_states.shape) != (E, expected_gs_dim):
             raise ValueError(
-                f"Expected per-agent logp with shape {expected_logp_shape}, got {tuple(logp.shape)}"
+                f"next_global_states: expected shape {(E, expected_gs_dim)}, got {tuple(next_global_states.shape)}"
             )
-        if tuple(actions.shape) != (E, self.num_followers, ACTION_DIM):
+        if truncated_next_values is not None and tuple(truncated_next_values.shape) not in ((E,), (E, 1)):
             raise ValueError(
-                f"Expected actions with shape {(E, self.num_followers, ACTION_DIM)}, got {tuple(actions.shape)}"
+                f"truncated_next_values: expected shape {(E,)} or {(E, 1)}, got {tuple(truncated_next_values.shape)}"
+            )
+        if pre_squash_v is not None and tuple(pre_squash_v.shape) not in (expected_logp_shape, (E, self.num_followers)):
+            raise ValueError(
+                f"pre_squash_v: expected shape {expected_logp_shape} or {(E, self.num_followers)}, "
+                f"got {tuple(pre_squash_v.shape)}"
             )
 
         follower_states = local_states[:, 1:, :].detach()
@@ -740,11 +810,6 @@ class CTDEMAPPOAgent:
         has_bound_entry = bound_entry is not None and bound_entry[0]() is actions
 
         if pre_squash_v is not None:
-            if tuple(pre_squash_v.shape) != expected_logp_shape and tuple(pre_squash_v.shape) != (E, self.num_followers):
-                raise ValueError(
-                    f"Expected pre_squash_v with shape {expected_logp_shape} or {(E, self.num_followers)}, "
-                    f"got {tuple(pre_squash_v.shape)}"
-                )
             pre_squash_v_f = pre_squash_v.detach().float().reshape(expected_logp_shape).clone()
         elif has_bound_entry:
             pre_squash_v_f = bound_entry[1].detach().float().clone()
@@ -756,12 +821,7 @@ class CTDEMAPPOAgent:
 
         if truncated_b.any():
             if truncated_next_values is not None:
-                if truncated_next_values.numel() != rewards_f.numel():
-                    raise ValueError(
-                        f"Expected truncated_next_values with {rewards_f.numel()} elements, "
-                        f"got shape {tuple(truncated_next_values.shape)}"
-                    )
-                trunc_nv = truncated_next_values.detach().float().reshape_as(rewards_f).clone()
+                trunc_nv = truncated_next_values.detach().float().reshape(E).clone()
                 has_trunc_nv = truncated_b.clone()
             elif next_global_states is not None:
                 with torch.no_grad():
