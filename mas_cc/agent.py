@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import fcntl
 import math
 import os
+import pickle
 import tempfile
 import weakref
-from contextlib import ExitStack
+import zipfile
+from contextlib import ExitStack, contextmanager
 from threading import Lock
 
 import numpy as np
@@ -31,6 +34,7 @@ from .config import (
     NUM_TRANSFORMER_LAYERS,
     OBS_LAYOUT,
     OBS_VERSION,
+    normalize_algo_name,
     TOP_K,
     POLICY_DELAY,
     PPO_CLIP_EPS,
@@ -68,6 +72,42 @@ def _save_checkpoint(path, actor, algorithm, **training_state):
     torch.save({**schema, "actor": actor.state_dict(), **training_state}, path)
 
 
+_CANONICAL_LOCKS_GUARD = Lock()
+_CANONICAL_PATH_LOCKS: dict[str, Lock] = {}
+
+
+@contextmanager
+def _canonical_file_lock(path_str: str):
+    """对同一目标最优权重路径加进程内线程锁 + 跨进程文件锁。"""
+    abs_path = os.path.abspath(path_str)
+    parent = os.path.dirname(abs_path) or "."
+    os.makedirs(parent, exist_ok=True)
+    with _CANONICAL_LOCKS_GUARD:
+        tlock = _CANONICAL_PATH_LOCKS.setdefault(abs_path, Lock())
+    lock_path = abs_path + ".lock"
+    with tlock:
+        with open(lock_path, "a+") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _to_builtin_primitive(value):
+    """将常见标量（含 NumPy 标量）显式转为 Python 内建类型，确保 weights_only=True 可加载。"""
+    if value is None or isinstance(value, str):
+        return value
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, (float, np.floating)):
+        v = float(value)
+        return v if math.isfinite(v) else None
+    return None
+
+
 def _atomic_save_checkpoint(path, actor, algorithm, **training_state):
     path_str = str(path)
     parent = os.path.dirname(path_str) or "."
@@ -76,13 +116,28 @@ def _atomic_save_checkpoint(path, actor, algorithm, **training_state):
     payload = {**schema, "actor": {k: v.detach().cpu() for k, v in actor.state_dict().items()}, **training_state}
     fd, tmp_path = tempfile.mkstemp(prefix=".tmp_ckpt_", suffix=".pt", dir=parent)
     os.close(fd)
+    replaced = False
     try:
         torch.save(payload, tmp_path)
         os.replace(tmp_path, path_str)
-    except Exception:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-        raise
+        replaced = True
+    finally:
+        if not replaced and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
+def _actor_weights_complete(weights: dict, actor) -> bool:
+    expected = actor.state_dict()
+    if not isinstance(weights, dict) or weights.keys() != expected.keys():
+        return False
+    for key, param in expected.items():
+        tensor = weights.get(key)
+        if not isinstance(tensor, torch.Tensor) or tensor.shape != param.shape:
+            return False
+    return True
 
 
 def save_canonical_best_actor(
@@ -96,88 +151,91 @@ def save_canonical_best_actor(
     eval_signature: str | None = None,
     allow_eval_signature_replace: bool = False,
 ) -> dict:
-    """按单算法唯一路径维护仓库最优 Actor 权重。
+    """按单算法唯一路径维护仓库最优 Actor 权重（带跨进程锁与原子替换）。
 
     规则：
-    - 同算法、同观测/网络协议且同评估口径下，仅当 `score > existing_score` 时才原子替换；
-    - 同算法、同协议但评估口径不同（如短步数 smoke）默认不覆盖已有最优权重；
-    - 协议变化或文件缺失/损坏时直接写入新最优文件。
+    - 同算法、同观测/网络协议且评估签名完全一致时，仅当 `score > existing_score` 才替换；
+    - 评估签名不一致（含一侧缺失）时默认保留原件不覆盖；
+    - 已有文件确实损坏、缺少参数或协议变化时可替换恢复；临时读写权限/IO 失败则保留原件并抛错。
     """
-    algo = str(algorithm).upper().strip()
-    if algo not in ("MAPPO", "MASAC"):
-        raise ValueError(f"Unknown algorithm {algorithm!r}; expected MAPPO or MASAC")
-    if isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(float(score)):
+    algo = normalize_algo_name(algorithm)
+    if isinstance(score, (bool, np.bool_)) or not isinstance(score, (int, float, np.number)) or not math.isfinite(float(score)):
         raise ValueError(f"Canonical score must be a finite number, got {score!r}")
     score_val = float(score)
     width = int(actor.local_encoder[0].out_features)
     expected_schema = _actor_schema(width, algo)
+    cur_sig = "" if eval_signature is None else str(eval_signature)
 
     path_str = str(path)
     previous_score = None
     reason = "created"
 
-    if os.path.exists(path_str):
-        try:
-            existing, existing_width = _read_checkpoint(path_str, algorithm=None, hidden_dim=width)
-            same_schema = (
-                existing_width == width
-                and all(existing.get(k) == v for k, v in expected_schema.items())
-                and existing.get("obs_layout", obs_layout) == obs_layout
-            )
-            raw_prev = existing.get("canonical_score")
-            valid_prev = (
-                not isinstance(raw_prev, bool)
-                and isinstance(raw_prev, (int, float))
-                and math.isfinite(float(raw_prev))
-            )
-            if same_schema and valid_prev:
-                previous_score = float(raw_prev)
-                prev_sig = existing.get("eval_signature") or ""
-                cur_sig = "" if eval_signature is None else str(eval_signature)
-                if cur_sig and prev_sig and cur_sig != prev_sig and not allow_eval_signature_replace:
-                    return {
-                        "updated": False,
-                        "reason": "eval_signature_mismatch",
-                        "path": path_str,
-                        "new_score": score_val,
-                        "previous_score": previous_score,
-                    }
-                if score_val <= previous_score:
-                    return {
-                        "updated": False,
-                        "reason": "existing_better_or_equal",
-                        "path": path_str,
-                        "new_score": score_val,
-                        "previous_score": previous_score,
-                    }
-                reason = "improved"
-            else:
+    with _canonical_file_lock(path_str):
+        if os.path.exists(path_str):
+            try:
+                existing, existing_width = _read_checkpoint(path_str, algorithm=None, hidden_dim=width)
+                weights_ok = _actor_weights_complete(existing.get("actor"), actor)
+                same_schema = (
+                    weights_ok
+                    and existing_width == width
+                    and all(existing.get(k) == v for k, v in expected_schema.items())
+                    and existing.get("obs_layout") == str(obs_layout)
+                )
+                raw_prev = existing.get("canonical_score")
+                valid_prev = (
+                    not isinstance(raw_prev, (bool, np.bool_))
+                    and isinstance(raw_prev, (int, float, np.number))
+                    and math.isfinite(float(raw_prev))
+                )
+                if same_schema and valid_prev:
+                    previous_score = float(raw_prev)
+                    prev_sig = existing.get("eval_signature")
+                    prev_sig = "" if prev_sig is None else str(prev_sig)
+                    if cur_sig != prev_sig and not allow_eval_signature_replace:
+                        return {
+                            "updated": False,
+                            "reason": "eval_signature_mismatch",
+                            "path": path_str,
+                            "new_score": score_val,
+                            "previous_score": previous_score,
+                        }
+                    if score_val <= previous_score:
+                        return {
+                            "updated": False,
+                            "reason": "existing_better_or_equal",
+                            "path": path_str,
+                            "new_score": score_val,
+                            "previous_score": previous_score,
+                        }
+                    reason = "improved"
+                else:
+                    reason = "schema_changed_or_unreadable"
+            except (ValueError, EOFError, RuntimeError, pickle.UnpicklingError, zipfile.BadZipFile, KeyError, TypeError):
                 reason = "schema_changed_or_unreadable"
-        except Exception:
-            reason = "schema_changed_or_unreadable"
 
-    clean_metrics = {}
-    if isinstance(metrics, dict):
-        for k, v in metrics.items():
-            if isinstance(v, (bool, int, float, str)) or v is None:
-                clean_metrics[str(k)] = v
+        clean_metrics = {}
+        if isinstance(metrics, dict):
+            for k, v in metrics.items():
+                coerced = _to_builtin_primitive(v)
+                if coerced is not None or v is None:
+                    clean_metrics[str(k)] = coerced
 
-    _atomic_save_checkpoint(
-        path_str,
-        actor,
-        algo,
-        obs_layout=str(obs_layout),
-        canonical_score=score_val,
-        eval_signature="" if eval_signature is None else str(eval_signature),
-        canonical_metrics=clean_metrics,
-    )
-    return {
-        "updated": True,
-        "reason": reason,
-        "path": path_str,
-        "new_score": score_val,
-        "previous_score": previous_score,
-    }
+        _atomic_save_checkpoint(
+            path_str,
+            actor,
+            algo,
+            obs_layout=str(obs_layout),
+            canonical_score=score_val,
+            eval_signature=cur_sig,
+            canonical_metrics=clean_metrics,
+        )
+        return {
+            "updated": True,
+            "reason": reason,
+            "path": path_str,
+            "new_score": score_val,
+            "previous_score": previous_score,
+        }
 
 
 def _read_checkpoint(path, *, algorithm=None, hidden_dim=None):

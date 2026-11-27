@@ -84,19 +84,28 @@ if not RUN_DIR:
     RUN_DIR = _RUN_DIR_DEFAULT
 MODELS_DIR = os.path.join(RUN_DIR, "models")
 FIGS_DIR = os.path.join(RUN_DIR, "figs")
-CANONICAL_MODELS_DIR = os.getenv("CANONICAL_MODELS_DIR", "models").strip() or "models"
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CANONICAL_MODELS_DIR = os.getenv("CANONICAL_MODELS_DIR", "").strip() or os.path.join(REPO_ROOT, "models")
+
+
+def normalize_algo_name(algo: str = ALGO) -> str:
+    """将算法名或常见别名规范化为标准大写名（MAPPO / MASAC）。"""
+    tag = str(algo).lower().strip()
+    if tag in ("mappo", "ppo", "ctdemappo", "ctde_mappo"):
+        return "MAPPO"
+    if tag in ("masac", "sac", "ctdesac", "ctde_sac"):
+        return "MASAC"
+    raise ValueError(f"Unsupported algorithm: {algo!r}; expected MAPPO or MASAC")
 
 
 def canonical_best_model_path(algo: str = ALGO, models_dir: str | None = None) -> str:
-    """返回仓库内单算法唯一最优权重路径（如 models/best_mappo.pt）。"""
-    tag = str(algo).lower().strip()
-    if tag in ("mappo", "ppo", "ctdemappo", "ctde_mappo"):
-        tag = "mappo"
-    elif tag in ("masac", "sac", "ctdesac", "ctde_sac"):
-        tag = "masac"
+    """返回仓库内单算法唯一最优权重路径（如 <repo>/models/best_mappo.pt）。"""
+    tag = normalize_algo_name(algo).lower()
+    if models_dir is None:
+        env_dir = os.getenv("CANONICAL_MODELS_DIR", "").strip()
+        root = env_dir or CANONICAL_MODELS_DIR
     else:
-        raise ValueError(f"Unsupported algorithm for canonical checkpoint: {algo!r}")
-    root = CANONICAL_MODELS_DIR if models_dir is None else str(models_dir)
+        root = str(models_dir)
     return os.path.join(root, f"best_{tag}.pt")
 
 

@@ -34,8 +34,89 @@ class CanonicalCheckpointTests(unittest.TestCase):
 
         self.assertFalse(ignored("models/best_mappo.pt"))
         self.assertFalse(ignored("models/best_masac.pt"))
+        self.assertTrue(ignored("models/best_mappo_copy.pt"))
+        self.assertTrue(ignored("models/best_mappo.pt.lock"))
+        self.assertTrue(ignored("results/run/metrics.json"))
         self.assertTrue(ignored("results/mappo/20261127/models/best_model.pt"))
         self.assertTrue(ignored("scratch_actor.pt"))
+
+    def test_canonical_best_model_path_anchored_to_repo_root(self):
+        with patch.dict(os.environ, {"CANONICAL_MODELS_DIR": ""}):
+            p = canonical_best_model_path("ppo")
+            self.assertEqual(Path(p).resolve(), (REPO / "models" / "best_mappo.pt").resolve())
+
+    def test_r1_audit_regressions(self):
+        import threading
+        import numpy as np
+        from mas_cc import environment as env_mod
+
+        with TemporaryDirectory() as tmp:
+            mappo_path = Path(tmp) / "best_mappo.pt"
+            a1 = DecentralizedActor(hidden_dim=16)
+            a2 = DecentralizedActor(hidden_dim=16)
+            a3 = DecentralizedActor(hidden_dim=16)
+            with torch.no_grad():
+                for a, v in ((a1, 0.1), (a2, 0.2), (a3, 0.3)):
+                    for p in a.parameters():
+                        p.fill_(v)
+
+            # 1) 缺失签名(None) 不得覆盖已有非空签名
+            save_canonical_best_actor(mappo_path, a1, "MAPPO", score=10.0, eval_signature="prod")
+            r_none = save_canonical_best_actor(mappo_path, a2, "MAPPO", score=99.0, eval_signature=None)
+            self.assertFalse(r_none["updated"])
+            self.assertEqual(r_none["reason"], "eval_signature_mismatch")
+
+            # 2) NumPy 标量 metrics 必须转为内建类型，weights_only=True 可加载
+            r_np = save_canonical_best_actor(
+                mappo_path, a2, "MAPPO", score=20.0, eval_signature="prod",
+                metrics={"np_f": np.float64(1.25), "np_i": np.int64(7), "np_b": np.bool_(True)},
+            )
+            self.assertTrue(r_np["updated"])
+            loaded_ckpt = torch.load(mappo_path, map_location="cpu", weights_only=True)
+            self.assertEqual(loaded_ckpt["canonical_metrics"], {"np_f": 1.25, "np_i": 7, "np_b": True})
+
+            # 3) 损坏权重（缺参数键）不得长期占位；临时读 PermissionError 必须抛错并保留原件
+            bad_ckpt = torch.load(mappo_path, map_location="cpu", weights_only=True)
+            del bad_ckpt["actor"]["v_mean.bias"]
+            bad_ckpt["canonical_score"] = 500.0
+            torch.save(bad_ckpt, mappo_path)
+            r_recover = save_canonical_best_actor(mappo_path, a3, "MAPPO", score=40.0, eval_signature="prod")
+            self.assertTrue(r_recover["updated"])
+            self.assertEqual(r_recover["reason"], "schema_changed_or_unreadable")
+            good_bytes = mappo_path.read_bytes()
+            with patch.object(agents, "_read_checkpoint", side_effect=PermissionError("denied")):
+                with self.assertRaises(PermissionError):
+                    save_canonical_best_actor(mappo_path, a1, "MAPPO", score=1.0, eval_signature="prod")
+            self.assertEqual(mappo_path.read_bytes(), good_bytes)
+
+            # 4) KeyboardInterrupt 中断保存不得遗留临时文件
+            with patch.object(torch, "save", side_effect=KeyboardInterrupt):
+                with self.assertRaises(KeyboardInterrupt):
+                    save_canonical_best_actor(mappo_path, a2, "MAPPO", score=999.0, eval_signature="prod")
+            self.assertEqual(list(Path(tmp).glob(".tmp_ckpt_*.pt")), [])
+
+            # 5) 并发保存（20 vs 30 竞争已有 10）最终必须保留 30
+            conc_path = Path(tmp) / "conc_mappo.pt"
+            save_canonical_best_actor(conc_path, a1, "MAPPO", score=10.0, eval_signature="prod")
+            errors = []
+            def worker(actor, sc):
+                try:
+                    save_canonical_best_actor(conc_path, actor, "MAPPO", score=sc, eval_signature="prod")
+                except BaseException as exc:
+                    errors.append(exc)
+            t1 = threading.Thread(target=worker, args=(a2, 20.0))
+            t2 = threading.Thread(target=worker, args=(a3, 30.0))
+            t1.start(); t2.start(); t1.join(); t2.join()
+            self.assertEqual(errors, [])
+            final_ckpt = torch.load(conc_path, map_location="cpu", weights_only=True)
+            self.assertEqual(final_ckpt["canonical_score"], 30.0)
+
+            # 6) 奖励配置变化必须体现在 eval_signature 中
+            policy = ActorOnlyPolicy(a1)
+            sig1 = evaluate_canonical_score(policy, max_steps=2, cases=((5, "normal", "shallow", 1000),))["eval_signature"]
+            with patch.object(env_mod, "TRACKING_PENALTY_MAX", 0.0):
+                sig2 = evaluate_canonical_score(policy, max_steps=2, cases=((5, "normal", "shallow", 1000),))["eval_signature"]
+            self.assertNotEqual(sig1, sig2)
 
     def test_canonical_best_model_path_normalization(self):
         self.assertEqual(canonical_best_model_path("MAPPO", models_dir="models"), os.path.join("models", "best_mappo.pt"))

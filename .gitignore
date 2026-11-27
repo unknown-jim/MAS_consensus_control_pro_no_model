@@ -3,8 +3,11 @@
 *.txt
 *.png
 *.pt
-!models/
-!models/best_*.pt
+*.lock
+!/models/
+!/models/best_mappo.pt
+!/models/best_masac.pt
+/results/
 __pycache__/
 .ipynb_checkpoints/
 .Trash-0/

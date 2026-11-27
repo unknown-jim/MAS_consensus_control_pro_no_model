@@ -19,7 +19,7 @@ import numpy as np
 import torch
 
 from .agent import ActorOnlyPolicy, CTDEMAPPOAgent, CTDESACAgent
-from .config import DEVICE, MAX_STEPS
+from .config import DEVICE, DT, MAX_STEPS, OBS_LAYOUT
 from .environment import ModelFreeEnv
 from .topology import CommunicationTopology
 
@@ -178,10 +178,21 @@ def evaluate_canonical_score(
     comms = []
     devices = [torch.cuda.current_device()] if DEVICE.type == "cuda" else []
 
+    reward_cfg = None
     with torch.random.fork_rng(devices=devices), actor_only_inference(agent) as policy:
         for n, pin_mode, depth_mode, seed in case_list:
             topo = CommunicationTopology(n, seed=seed, pinned_mode=pin_mode, depth_mode=depth_mode)
             env = ModelFreeEnv(topo, max_steps=steps, auto_reset=False, randomize_topology_on_reset=False)
+            if reward_cfg is None:
+                benv = env.batched_env
+                reward_cfg = (
+                    f"dt={DT:g},cp={benv.comm_penalty_base:g},tps={benv.tracking_penalty_scale:g},"
+                    f"tpm={benv.tracking_penalty_max:g},cwd={benv.comm_weight_decay:g},"
+                    f"imp={benv.improvement_scale:g}/{benv.improvement_clip:g},"
+                    f"ig={benv.info_gain_scale:g},soft={int(benv.use_soft_scaling)},"
+                    f"r=[{benv.reward_min:g},{benv.reward_max:g}],"
+                    f"th=[{benv._threshold_min:g},{benv._threshold_max:g}],layout={OBS_LAYOUT}"
+                )
             torch.random.default_generator.manual_seed(seed)
             if devices:
                 torch.cuda.manual_seed(seed)
@@ -200,7 +211,7 @@ def evaluate_canonical_score(
             comms.append(ep_comm / steps)
 
     sig_parts = [f"n{n}-{pin}-{dep}-s{s}" for n, pin, dep, s in case_list]
-    eval_signature = f"canonical_v1:steps={steps}:" + ",".join(sig_parts)
+    eval_signature = f"canonical_v2:steps={steps}:{reward_cfg}:" + ",".join(sig_parts)
     return {
         "score": float(np.mean(rewards)),
         "mean_reward": float(np.mean(rewards)),

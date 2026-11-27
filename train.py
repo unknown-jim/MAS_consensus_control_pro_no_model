@@ -6,6 +6,7 @@
 
 注意：`show_dashboard=True` 时会在运行期导入 `mas_cc.dashboard`，需要在 Jupyter 环境下使用。
 """
+from copy import deepcopy
 import os
 import time
 from numbers import Integral
@@ -15,7 +16,7 @@ import torch
 
 from mas_cc.config import (
     NUM_FOLLOWERS, TRAIN_FOLLOWER_SCALES, MAX_STEPS, BATCH_SIZE,
-    NUM_EPISODES, VIS_INTERVAL, SAVE_MODEL_PATH, canonical_best_model_path,
+    NUM_EPISODES, VIS_INTERVAL, SAVE_MODEL_PATH, canonical_best_model_path, normalize_algo_name,
     print_config, set_seed, SEED,
     NUM_PARALLEL_ENVS, UPDATE_FREQUENCY, GRADIENT_STEPS,
     USE_AMP, DEVICE, COMM_PENALTY, THRESHOLD_MIN, THRESHOLD_MAX,
@@ -26,7 +27,6 @@ from mas_cc.config import (
 from mas_cc.topology import CommunicationTopology
 from mas_cc.environment import BatchedModelFreeEnv, ModelFreeEnv
 from mas_cc.agent import ActorOnlyPolicy, CTDESACAgent, CTDEMAPPOAgent, save_canonical_best_actor
-from mas_cc.networks import DecentralizedActor
 from mas_cc.utils import actor_only_inference, collect_trajectory, evaluate_canonical_score, plot_evaluation
 
 
@@ -77,7 +77,8 @@ def train(
     if num_episodes < 1:
         raise ValueError("num_episodes must be positive")
 
-    is_mappo = str(ALGO).upper().strip() == "MAPPO"
+    algo_name = normalize_algo_name(ALGO)
+    is_mappo = algo_name == "MAPPO"
     if not is_mappo and len(scales) > 1:
         raise ValueError("MASAC replay requires a single fixed follower scale")
 
@@ -254,20 +255,18 @@ def train(
     final_topology = CommunicationTopology.from_frozen(topology.adj, topology.pinned_ids)
 
     target_canonical = (
-        canonical_best_model_path(ALGO, models_dir=os.getenv("CANONICAL_MODELS_DIR") or None)
+        canonical_best_model_path(algo_name)
         if canonical_model_path is None
         else str(canonical_model_path).strip()
     )
     if target_canonical:
-        algo_name = "MAPPO" if is_mappo else "MASAC"
         final_eval = evaluate_canonical_score(agent, max_steps=MAX_STEPS)
         chosen_actor = agent.actor
         chosen_eval = final_eval
         chosen_source = "final"
 
         if best_actor_state is not None:
-            width = int(agent.actor.local_encoder[0].out_features)
-            peak_actor = DecentralizedActor(hidden_dim=width).to(DEVICE)
+            peak_actor = deepcopy(agent.actor)
             peak_actor.load_state_dict(best_actor_state, strict=True)
             peak_policy = ActorOnlyPolicy(peak_actor, use_amp=agent.use_amp)
             peak_eval = evaluate_canonical_score(peak_policy, max_steps=MAX_STEPS)
@@ -296,8 +295,13 @@ def train(
                   f"({canon_res['reason']}, score={canon_res['new_score']:.2f}, "
                   f"err={chosen_eval['mean_tracking_error']:.4f}, source={chosen_source})")
         else:
+            cmp_note = (
+                f"existing={canon_res['previous_score']:.2f}, new={canon_res['new_score']:.2f}"
+                if canon_res["reason"] != "existing_better_or_equal"
+                else f"existing={canon_res['previous_score']:.2f} >= new={canon_res['new_score']:.2f}"
+            )
             print(f"ℹ️  Canonical best {algo_name} kept at {canon_res['path']} "
-                  f"({canon_res['reason']}, existing={canon_res['previous_score']:.2f} >= new={canon_res['new_score']:.2f})")
+                  f"({canon_res['reason']}, {cmp_note})")
 
     elapsed = time.time() - start_time
     print(f"\n{'='*60}")
